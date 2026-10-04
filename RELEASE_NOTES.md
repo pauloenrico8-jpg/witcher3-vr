@@ -1,5 +1,8 @@
 # Witcher 3 VR v0.9.8
 
+> [!NOTE]
+> **0.9.8v2 hotfix (mod V1581):** Fixed missing subtitles and dialogue text during Full VR cutscenes.
+
 > [!WARNING]
 > Intermittent crashes may occur when using DLSS 5 Neural Rendering.
 > This development release includes fixes, but does not resolve every case.

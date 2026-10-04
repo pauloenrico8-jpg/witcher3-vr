@@ -1,4 +1,5 @@
 #include "mode3_transport_policy.h"
+#include "mode3_hud_ownership.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -240,9 +241,37 @@ int main() {
     assert(hud_scene_only_source_pair_id(true, false, 700, 1400) == 700);
     assert(hud_scene_only_source_pair_id(false, false, 0, 1400) == 1400);
 
-    // Strict gameplay and Cinema consume the completed proof of their exact
-    // retained predecessor. The delayed identity never leaks into AER,
-    // Full VR, another generation, or a malformed relation.
+    // Reproduce PID39228: scene N advances before its HUD draw proof has
+    // completed, while the exact same-generation predecessor is publishable.
+    // All strict projections share this submission cadence, including Full VR.
+    for (const auto route : {HudProjectionRoute::Gameplay,
+                            HudProjectionRoute::Cinema,
+                            HudProjectionRoute::FullVr}) {
+        w3vr::mode3_transport::HudSceneOwnership ownership{};
+        ownership.reset(9);
+        for (uint64_t scene = 42; scene != 50; ++scene) {
+            const uint64_t predecessor = scene - 1;
+            ownership.record(9, predecessor, 0, true);
+            ownership.record(9, predecessor, 1, true);
+            assert(!ownership.ready_for_composite(9, scene));
+            const uint64_t proof = strict_stereo_late_hud_proof_pair_id(
+                true, route, 9, 9, scene, predecessor);
+            assert(ownership.ready_for_composite(9, proof));
+            // A native HUD draw revokes admission; another projection or an
+            // old generation must never turn missing/negative proof positive.
+            ownership.record(9, predecessor, 1, false);
+            assert(!ownership.ready_for_composite(9, proof));
+            assert(!ownership.ready_for_composite(9,
+                strict_stereo_late_hud_proof_pair_id(
+                    false, route, 9, 9, scene, predecessor)));
+            assert(!ownership.ready_for_composite(9,
+                strict_stereo_late_hud_proof_pair_id(
+                    true, route, 9, 8, scene, predecessor)));
+        }
+    }
+
+    // The delayed identity never leaks into AER, another generation, or a
+    // malformed relation.
     assert(strict_stereo_late_hud_proof_pair_id(
         true, HudProjectionRoute::Gameplay, 9, 9, 42, 41) == 41);
     assert(strict_stereo_late_hud_proof_pair_id(
@@ -254,7 +283,11 @@ int main() {
     assert(strict_stereo_late_hud_proof_pair_id(
         true, HudProjectionRoute::Cinema, 9, 8, 42, 41) == 42);
     assert(strict_stereo_late_hud_proof_pair_id(
-        true, HudProjectionRoute::FullVr, 9, 9, 42, 41) == 42);
+        true, HudProjectionRoute::FullVr, 9, 9, 42, 41) == 41);
+    assert(strict_stereo_late_hud_proof_pair_id(
+        false, HudProjectionRoute::FullVr, 9, 9, 42, 41) == 42);
+    assert(strict_stereo_late_hud_proof_pair_id(
+        true, HudProjectionRoute::FullVr, 9, 8, 42, 41) == 42);
     assert(strict_stereo_late_hud_proof_pair_id(
         true, HudProjectionRoute::Gameplay, 9, 8, 42, 41) == 42);
     assert(strict_stereo_late_hud_proof_pair_id(

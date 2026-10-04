@@ -43829,6 +43829,9 @@ void ensure_initialized() {
                 "record_to_signal_reservation=1 cross_queue_reuse=retired_only "
                 "aer_afw=1 strict_stereo=1 logging_timing_independent=1");
             log_line(
+                "V1581 strict_full_vr_hud_proof=exact_same_generation_predecessor "
+                "aer_final_source_identity=unchanged");
+            log_line(
                 "V1552 cinema_hud_suppression=exact_route_predecessor "
                 "weak_any_pair_fallback=removed menu_hud_family_restore=V1551 "
                 "optiscaler_ofxr_fsr=unchanged base=V1551");
@@ -48879,9 +48882,11 @@ void render_openxr_test_frame(
     // completes one accepted stereo pair after the packed scene identity has
     // advanced.  V1556 therefore always queried N while the ledger had just
     // completed exact predecessor H, permanently blocking the late composite
-    // after the native HUD had already been removed.  Apply that cadence only
-    // to strict gameplay or Cinema with an exact same-generation predecessor;
-    // Full VR and final-source/AFW routes retain their existing identities.
+    // after the native HUD had already been removed. [FIX:FULL-VR-HUD-PROOF-
+    // CADENCE V1581] Apply the same exact same-generation predecessor cadence
+    // to every strict projection. PID39228 Full VR passed gates 1-32 but
+    // repeatedly queried an unpublished scene-N proof. Final-source/AFW
+    // routes retain their existing identities.
     const uint32_t hud_generation =
         g_streamline_capture_generation.load(std::memory_order_acquire);
     const uint32_t strict_hud_target_generation =
