@@ -1,4 +1,5 @@
 #include "modern_dlss_ownership.h"
+#include "modern_dlss_recording.h"
 #include <dxgi1_6.h>
 #include <cstdio>
 #include <cstring>
@@ -6,6 +7,7 @@
 
 namespace m = w3vr::modern_dlss_ownership;
 namespace r = w3vr::engine_dlss_resources;
+namespace recording = w3vr::modern_dlss_recording;
 using Microsoft::WRL::ComPtr;
 
 void require(bool value, const char* step) {
@@ -84,8 +86,13 @@ int main() try {
     ComPtr<ID3D12GraphicsCommandList> command;
     check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(),
         nullptr, IID_PPV_ARGS(&command)), "command list");
+    ComPtr<ID3D12CommandAllocator> alternate_allocator;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(&alternate_allocator)), "alternate allocator");
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "fence");
+    ComPtr<ID3D12Fence> gate;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "submission gate");
     const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     require(event != nullptr, "event");
     // All four lab textures are real. The receipt is manufactured for this
@@ -129,15 +136,53 @@ int main() try {
     }
     auto upload = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto initial = m::acquire(receipt, classify);
+    recording::Ledger ledger(initial);
+    initial = {};
+    require(!ledger.open_stamp() && ledger.epoch() == 0, "unknown initial recording admitted");
+    check(command->Close(), "close initial unobserved recording");
+    auto result = command->Reset(allocator.Get(), nullptr);
+    check(result, "initial observed reset");
+    require(ledger.after_reset(result), "initial reset observation");
+    // Real failing Close and Reset on a separate native command list must not
+    // supply a usable recording. No failure is injected into the main queue.
+    {
+        ComPtr<ID3D12CommandAllocator> failure_allocator;
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&failure_allocator)), "failure allocator");
+        ComPtr<ID3D12GraphicsCommandList> failure_command;
+        check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            failure_allocator.Get(), nullptr, IID_PPV_ARGS(&failure_command)), "failure list");
+        auto other_receipt = receipt; other_receipt.command = failure_command.Get();
+        auto other = m::acquire(other_receipt, classify);
+        require(bool(other), "second command acquisition");
+        auto wrong = m::acquire(other_receipt, classify);
+        require(!ledger.record(std::move(wrong), ledger.open_stamp()) && bool(wrong),
+            "foreign command recording admitted or consumed");
+        recording::Ledger failed(other);
+        check(failure_command->Close(), "failure list initial close");
+        result = failure_command->Reset(failure_allocator.Get(), nullptr);
+        check(result, "failure list first reset"); require(failed.after_reset(result), "failure epoch");
+        const auto old_epoch = failed.epoch();
+        result = failure_command->Reset(failure_allocator.Get(), nullptr); // Still open.
+        require(FAILED(result) && !failed.after_reset(result) && failed.epoch() == old_epoch &&
+            !failed.open_stamp(), "failed native Reset became a new epoch");
+        check(failure_command->Close(), "failure list close");
+        result = failure_command->Close(); // Already closed.
+        require(FAILED(result) && !failed.after_close(result) && !failed.open_stamp(),
+            "failed native Close admitted a batch");
+        result = failure_command->Reset(failure_allocator.Get(), nullptr);
+        require(!failed.after_reset(result), "broken observer ledger reopened");
+        std::puts("PASS real failed Reset/Close and foreign native command rejection");
+    }
     auto* original_output = textures[3].Get();
     for (unsigned iteration = 0; iteration < 24; ++iteration) {
-        if (iteration != 0) {
-            check(allocator->Reset(), "allocator reset after fence");
-            check(command->Reset(allocator.Get(), nullptr), "new command recording");
-        }
+        const auto stamp = ledger.open_stamp();
+        require(bool(stamp) && stamp.epoch == iteration + 1ull, "current recording stamp");
         receipt.identity = {iteration + 1ull, 1, static_cast<int>(iteration & 1)};
         auto owned = m::acquire(receipt, classify);
         require(bool(owned), "per-recording acquisition");
+        require(owned.command_identity.Get() == stamp.command, "canonical command mismatch");
         void* data{}; D3D12_RANGE no_read{0, 0};
         check(upload->Map(0, &no_read, &data), "upload map");
         const auto pattern = static_cast<unsigned char>(0x31 + iteration);
@@ -153,18 +198,50 @@ int main() try {
         transition(command.Get(), target.pResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
         source.pResource = readback.Get();
         command->CopyTextureRegion(&source, 0, 0, 0, &target, nullptr);
-        check(command->Close(), "close command list");
+        require(ledger.record(std::move(owned), stamp), "record ownership transfer");
+        auto duplicate = m::acquire(receipt, classify);
+        require(!ledger.record(std::move(duplicate), stamp) && bool(duplicate), "duplicate evaluation admitted");
+        duplicate = {};
+        require(!ledger.take_closed(stamp), "open list admitted for submission");
+        result = command->Close(); check(result, "close command list");
+        require(ledger.after_close(result), "close observation");
+        auto batch = ledger.take_closed(stamp);
+        require(bool(batch) && batch.evaluations.size() == 1 && !batch.gpu_completion_verified,
+            "closed batch is not GPU completion");
+        require(!ledger.take_closed(stamp), "batch taken twice");
+        auto& submitted = batch.evaluations[0];
         if (iteration == 0) {
             // Release all caller-held texture refs. The acquired record alone
             // must keep these real GPU objects alive through execution/fence.
             for (auto& object : textures) object.Reset();
         }
-        require(owned.resources[3].Get() == original_output, "output identity changed");
-        ID3D12CommandList* lists[]{owned.command.Get()};
+        require(submitted.resources[3].Get() == original_output, "output identity changed");
+        ID3D12CommandList* lists[]{submitted.command.Get()};
         const std::uint64_t value = iteration + 1;
         require(!m::fence_reached(fence->GetCompletedValue(), value), "future fence incorrectly completed");
+        // Hold actual GPU execution behind a CPU-signalled gate. Reset uses a
+        // DIFFERENT allocator while this exact old batch is still in flight.
+        // Always unblock on exceptions so an assertion cannot hang the GPU.
+        struct Unblock {
+            ID3D12Fence* gate; std::uint64_t value;
+            ~Unblock() { gate->Signal(value); }
+        } unblock{gate.Get(), value};
+        check(queue->Wait(gate.Get(), value), "queue wait before submission");
         queue->ExecuteCommandLists(1, lists);
         check(queue->Signal(fence.Get(), value), "signal after real submission");
+        require(!m::fence_reached(fence->GetCompletedValue(), value), "gate did not delay GPU work");
+        auto* next_allocator = iteration & 1 ? allocator.Get() : alternate_allocator.Get();
+        check(next_allocator->Reset(), "unused allocator reset");
+        result = command->Reset(next_allocator, nullptr); check(result, "Reset while old batch pending");
+        require(ledger.after_reset(result) && ledger.epoch() == stamp.epoch + 1,
+            "new recording epoch after early Reset");
+        auto stale = m::acquire(receipt, classify);
+        require(!ledger.record(std::move(stale), stamp) && bool(stale) && ledger.pending() == 0,
+            "stale producer crossed real Reset");
+        stale = {};
+        require(bool(batch) && batch.stamp == stamp && submitted.resources[3].Get() == original_output,
+            "Reset discarded submitted ownership");
+        check(gate->Signal(value), "CPU release submission gate");
         check(fence->SetEventOnCompletion(value, event), "completion event");
         require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "GPU fence timeout");
         const auto completed = fence->GetCompletedValue();
@@ -179,10 +256,10 @@ int main() try {
         readback->Unmap(0, &no_read);
         // Reacquire the caller refs before the record retires; the next Reset
         // reuses the command object but starts a different recording.
-        textures = owned.resources;
+        textures = submitted.resources;
     }
     CloseHandle(event);
-    std::puts("PASS 24 real GPU texture copies, owned lifetime, recording reuse and fence/readback");
+    std::puts("PASS 24 real GPU copies: closed batches, early Reset, stale rejection, exact fence and readback");
     std::puts("GAME=false HEADSET=false NATIVE_DLSS=false NOVIGRAD_FPS_MEASURED=false");
     return 0;
 } catch (const std::exception& error) {

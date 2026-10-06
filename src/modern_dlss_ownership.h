@@ -52,6 +52,7 @@ struct OwnedEvaluation {
     engine_dlss::Identity identity{};
     std::uint32_t viewport{UINT32_MAX};
     ComPtr<ID3D12GraphicsCommandList> command;
+    ComPtr<IUnknown> command_identity;
     ComPtr<ID3D12Device> device;
     ComPtr<IUnknown> device_identity;
     std::array<ComPtr<ID3D12Resource>, 4> resources;

@@ -846,3 +846,48 @@ DLL compilada e107/107CTest em11,13s: resultados finais em
 `../artifacts/modern-dlss-ownership-port-validation.json`. Gate5c fechado.
 Próximo: recording epochs/Close/Execute/fence por endpoint, retenção até
 GPU retirement e lifecycle do plugin antes de isolar ids/históricos por olho.
+
+## Gravações modernas: identidade canônica e Reset antecipado
+
+`acquire` agora também possui a identidade IUnknown canônica da command list.
+`modern_dlss_recording.h` mantém essa referência e a do device, evitando
+reaproveitamento do endereço enquanto o ledger existe. Não reutiliza as
+chaves emprestadas do rastreador legado. A integração desse ledger aos hooks
+reais permanece pendente; o diagnóstico moderno continua temporário.
+
+Ledger começa desconhecido: requer observar Reset bem-sucedido antes de
+admitir dados. Stamp deve ser capturado ANTES do produtor/SDK e comparado
+depois; capturá-lo somente depois não detecta Reset durante a chamada.
+Admissão exige stamp atual, Open, objeto/dispositivo iguais, identidade de
+olho/par/geração válida e viewport nativo. Duplicatas e mais de64observações
+são recusadas sem consumir a posse do chamador. Close bem-sucedido permite
+take_closed uma única vez. ClosedRecording é móvel, não copiável e NÃO
+significa execução ou conclusão GPU. Reset só abandona observações ainda
+pendentes no ledger; pacotes já retirados mantêm suas próprias referências.
+Reset falho não avança epoch e suspende admissão; Close falho torna o ledger
+inválido permanentemente. Epoch não dá volta em UINT64_MAX.
+
+O futuro adaptador precisa serializar produtor/Reset/Close/Execute e manter
+os pacotes ANTES do Execute até a fence exata da queue/device. Destruição ou
+atribuição de um pacote em voo, Signal falho, reenvio da mesma lista,
+shutdown/reinit e perda do dispositivo ainda requerem política de retirement.
+O ledger não chama nem intercepta essas APIs, não marca GPU completion e
+não prova imutabilidade das texturas, estados de barreiras ou históricos.
+
+Probe físico atualizado:24cópias, queue Wait numa fence de teste, Execute,
+Signal e Reset imediato com allocator alternado ANTES de liberar a fence
+pela CPU. O pacote anterior mantém texturas; stamp anterior é recusado.
+Depois de Event/GetCompletedValue, readback confere todos os pixels úteis.
+Refs das aquisições recusadas são soltas antes de testar a duração da posse.
+Reset e Close inválidos são chamados em outra lista nativa e seus HRESULTs
+reais recusados. Receipt/olho/par são fabricados, não resultam de DLSS.
+
+A distinção entre Reset da lista e Reset do allocator segue a
+[documentação oficial de Reset](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-reset):
+a lista pode ser reaberta durante execução, mas o allocator em uso não pode
+ser reutilizado antes do término. Falhas de
+[Close](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-close)
+não atestam uma gravação executável. DLL compilada e107/107CTest em11,81s.
+Evidência nova LOCAL `../artifacts/modern-dlss-recording-port-validation.json`.
+Nada instalado; gate5c fechado. Próximo: adaptador real de submissão e
+retenção por queue/fence, incluindo falhas e ciclo de vida do plugin.
