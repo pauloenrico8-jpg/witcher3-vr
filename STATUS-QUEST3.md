@@ -151,6 +151,29 @@ Registro: `../artifacts/test-frame-submission-20261006.log`. Esse resultado
 verifica o código no PC, incluindo as funções simuladas; não demonstra VR
 jogável nem desempenho no save de Novigrad.
 
+## Condições para criar uma cena
+
+O código novo de `src/engine_scene_factory.h` corrige uma diferença nos
+argumentos usados pela fábrica de cenas. A fábrica é a função do jogo que
+monta os dados de uma imagem. No 5.00c, um argumento que o mod antigo exigia
+vem vazio; as configurações estão dentro dos dados da cena.
+
+Agora o código escolhe a condição da versão: mantém a regra antiga em 4.04;
+para 5.00c, confere a presença do renderizador e da cena, lê largura/altura e
+recusa dimensões inválidas. Quatro decisões de início ou identificação da
+cena usam essa verificação. O endereço da fábrica também vem da versão
+escolhida. Isso prepara a passagem para aceitar a chamada real do Remastered.
+
+**5.00c continua sem ativação.** A cópia completa dos dados da cena ainda
+precisa de revisão, incluindo os objetos que esses dados apontam. Uma segunda
+construção de frame foi identificada, mas ela não basta para confirmar o
+tamanho e a duração de todos esses dados. Esta rodada está somente local.
+
+A DLL compilou e a suíte completa passou em **100/100 testes do PC**.
+Registro: `../artifacts/test-factory-admission-20261006.log`. O teste novo
+confere as condições por versão com dados simulados; não executa a fábrica
+real do jogo nem comprova imagens no headset.
+
 ## O que o código novo faz, passo a passo
 
 1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede

@@ -203,6 +203,35 @@ Essa rota isolada não substitui essas etapas nem comprova VR em execução.
 A DLL compilou e a suíte completa passou em 99/99, com log em
 `../artifacts/test-frame-submission-20261006.log`.
 
+## Argumentos e admissão da fábrica
+
+`src/engine_scene_factory.h` separa o endereço da fábrica e suas condições de
+entrada por versão. A rotina 5.00c usa `0x01B80550`; lê largura e altura no
+descritor, em `+0xBDC` e `+0xBE0`, e devolve nulo se alguma for zero.
+Carrega configurações do campo `+0` do descritor e admite esse campo nulo.
+O segundo argumento recebido do produtor é nulo em `0x0227589D/0x022758AF`.
+
+Quatro decisões de início/identificação de cena na DLL agora usam a condição
+da versão escolhida. 4.04 conserva a exigência antiga do segundo argumento.
+5.00c exige renderizador e descritor presentes, dimensões legíveis e não nulas;
+não exige o segundo argumento preenchido. A leitura nova se limita aos oito
+bytes de largura/altura. Uma versão desconhecida não instala a fábrica.
+Apenas 4.04 continua selecionado após o preflight; o bloqueio de 5.00c permanece.
+
+Outra construção de frame, `0x022C65B0`, chama a cópia nativa do descritor em
+`0x022C65E7` e grava dimensões em frame `+0xF760` em `0x022C65F7`. Junto com a
+fábrica, isso sustenta a região inferida de `0xF750` bytes a partir de `+0x10`.
+**Não comprova o tamanho completo, acessos indiretos ou a vida útil dos objetos
+apontados.** A procura por um tamanho imediato `0xF750` não encontrou uma
+instrução alcançada que confirmasse esse tamanho. A cópia antiga permanece
+inadequada para a versão nova e ainda não foi liberada ou substituída por
+um tamanho presumido.
+
+Evidência local: `../artifacts/remastered-factory-admission-evidence.json`.
+O teste de admissão usa dimensões/argumentos simulados, sem execução do jogo.
+A DLL compilou; suíte completa 100/100 em
+`../artifacts/test-factory-admission-20261006.log`.
+
 ## Limites que continuam abertos
 
 - As tabelas identificam classes, mas não provam todos os campos, argumentos,

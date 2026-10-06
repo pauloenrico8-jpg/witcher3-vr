@@ -28,6 +28,7 @@
 #include "legacy_engine_preflight.h"
 #include "engine_camera_temporal.h"
 #include "engine_frame_submission.h"
+#include "engine_scene_factory.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
@@ -40352,6 +40353,38 @@ size_t copy_readable_scene_descriptor(
     return copied_bytes;
 }
 
+w3vr::scene_factory::Version selected_scene_factory_version() {
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == &w3vr::engine_camera::legacy_404) {
+        return w3vr::scene_factory::Version::legacy_404;
+    }
+    if (contract == &w3vr::engine_camera::remastered_500c) {
+        return w3vr::scene_factory::Version::remastered_500c;
+    }
+    return w3vr::scene_factory::Version::unknown;
+}
+
+bool engine_scene_factory_inputs_ready(void* renderer, void* settings,
+    const void* descriptor) {
+    const auto version = selected_scene_factory_version();
+    std::array<uint32_t, 2> extent{};
+    bool extent_readable{};
+    if (version == w3vr::scene_factory::Version::remastered_500c &&
+        descriptor != nullptr) {
+        __try {
+            memcpy(extent.data(), static_cast<const uint8_t*>(descriptor) +
+                w3vr::scene_factory::remastered_extent_offset, sizeof(extent));
+            extent_readable = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            extent_readable = false;
+        }
+    }
+    return w3vr::scene_factory::inputs_ready(version, renderer != nullptr,
+        settings != nullptr, descriptor != nullptr, extent_readable,
+        extent[0], extent[1]);
+}
+
 bool remastered_command_renderer_ready(uintptr_t module) {
     if (module == 0) return false;
     __try {
@@ -40423,6 +40456,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const auto present = g_present_count.load();
     const bool asymmetric_factory_audit =
         asymmetric_authority_audit_active();
+    const bool factory_inputs_ready = engine_scene_factory_inputs_ready(
+        render_context, render_settings, scene_descriptor);
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     constexpr size_t kSceneDescriptorBytes = 0xC000;
@@ -40470,8 +40505,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         automatic_full_vr_bootstrap &&
         !native_loading_video &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
-        render_context != nullptr && render_settings != nullptr &&
-        scene_descriptor != nullptr;
+        factory_inputs_ready;
     if (automatic_full_vr_frame_camera_bootstrap &&
         !g_automatic_full_vr_camera_active.exchange(
             true, std::memory_order_acq_rel)) {
@@ -40484,8 +40518,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         !native_loading_video &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
         (hmd_camera_recent || automatic_full_vr_bootstrap) &&
-        render_context != nullptr && render_settings != nullptr &&
-        scene_descriptor != nullptr;
+        factory_inputs_ready;
     if (g_config.engine_dual_render_probe && !g_engine_dual_render_active.load() &&
         dual_render_auto_ready && !g_dual_render_auto_start_consumed.exchange(true)) {
         g_engine_dual_render_requested.store(1);
@@ -40595,10 +40628,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         hmd_camera_recent &&
         !g_cinema_mode_active.load(std::memory_order_relaxed) &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
-        render_context != nullptr && render_settings != nullptr &&
-        scene_descriptor != nullptr;
-    const bool tag_mode3_aer_frame = mode3_aer_single_render &&
-        render_context != nullptr && render_settings != nullptr;
+        factory_inputs_ready;
+    const bool tag_mode3_aer_frame = mode3_aer_single_render && factory_inputs_ready;
     const bool tag_aer_frame = tag_mode3_aer_frame;
     // [FIX:PUREDARK-AFW-MODE3-TAAU-NATURAL-CLOCK V12122 2/4] Seed from the
     // current Present only at a route boundary. Until the canonical gameplay
@@ -40917,7 +40948,9 @@ void install_engine_frame_factory_probe() {
         return;
     }
 
-    constexpr uintptr_t kEngineFrameDataFactoryRva = 0x016214C0;
+    const uintptr_t kEngineFrameDataFactoryRva =
+        w3vr::scene_factory::factory_rva(selected_scene_factory_version());
+    if (kEngineFrameDataFactoryRva == 0) return;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameDataFactoryRva : nullptr;
     if (target != nullptr &&
