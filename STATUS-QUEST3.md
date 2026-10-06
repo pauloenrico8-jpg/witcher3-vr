@@ -10,7 +10,8 @@ O ponto de partida é [Witcher3VR](https://github.com/tig3rmast3r/witcher3-vr),
 do tig3rmast3r, versão v0.9.8v2, commit
 `79293dd5f523af11579e061aa0b777d65225911c`. O autor informa que o projeto não
 oferece controles de movimento. A cópia local foi separada na linha de trabalho
-`quest3-motion-controls`. O fork na conta do GitHub ainda não foi criado.
+`quest3-motion-controls`. O fork foi criado na conta
+[pauloenrico8-jpg/witcher3-vr](https://github.com/pauloenrico8-jpg/witcher3-vr).
 
 Seu jogo Steam está instalado em
 `E:\SteamLibrary\steamapps\common\The Witcher 3`. O executável DX12 informa
@@ -33,7 +34,9 @@ fixos no mesmo código. A discussão sobre suporte ao Remastered está na
 [issue 27](https://github.com/tig3rmast3r/witcher3-vr/issues/27).
 
 Uma busca no executável encontrou os mesmos inícios de duas funções em outros
-endereços: `0x02102690` e `0x02251A40`. São candidatos para investigação.
+endereços: `0x02102690` e `0x02251A40`. A análise das instruções confirmou que
+esses endereços são registrados junto aos nomes `GetHeadBoneIndex` e
+`GetBoneWorldMatrixByIndex`. São evidências para a adaptação.
 Isso não confirma o funcionamento completo dessas funções, seus parâmetros,
 as estruturas do personagem ou os demais recursos do motor. Nenhum endereço
 foi substituído por tentativa.
@@ -45,7 +48,26 @@ Ela não adapta o mod ao Remastered. Mesmo uma correspondência futura não
 comprova, sozinha, a compatibilidade de todos os recursos.
 
 Evidências locais: [checagem dos endereços](diagnostics/game-compatibility.json)
-e [candidatos encontrados](diagnostics/legacy-pattern-candidates.json).
+e [candidatos encontrados](diagnostics/legacy-pattern-candidates.json), além da
+[análise dos registros de funções](diagnostics/remastered-callback-evidence.json).
+
+O programa `scripts/analyze-remastered-callbacks.py` lê o executável sem
+executá-lo ou alterá-lo. Primeiro identifica suas regiões de código; depois
+procura os nomes das funções e confere as instruções que apontam para eles.
+Por fim, grava um relatório para comparar as evidências. Foi usado Capstone
+5.0.6, uma biblioteca que traduz instruções do processador para texto legível.
+O relatório ajuda a evitar a escolha de um endereço apenas porque seus bytes
+parecem semelhantes. Ele não libera o mod para executar no Remastered.
+Também foram identificados registros para cenas, câmera manual, câmera ativa,
+telas de carregamento, projeção e menus. `GetCameraDirection` aparece em duas
+classes; o relatório conserva ambos os candidatos para análise, sem escolher
+um deles automaticamente. Algumas funções pequenas não têm registro de
+recuperação de pilha no executável; essa diferença também é anotada.
+
+Além dessas funções, o código base depende de funções internas de renderização,
+endereços de retorno, tabelas globais e posições de campos dentro dos objetos.
+Esses pontos ainda precisam ser comparados. Substituir apenas os endereços da
+câmera não seria uma adaptação completa e poderia corromper a memória do jogo.
 
 ## O que o código novo faz, passo a passo
 
@@ -92,14 +114,36 @@ Foram movidos 11 itens, contendo 18 arquivos e 83.680.651 bytes. Cada arquivo
 foi conferido por SHA-256 antes e depois da movimentação. O arquivo
 `manifest.json` registra todos os caminhos e as verificações.
 
-Isso conclui a retirada dos restos identificados, não a reinstalação.
+Isso conclui a retirada dos restos identificados.
 Os saves, as configurações pessoais e os carregadores compartilhados ficaram
 intactos. O GFP antigo não foi reinstalado no Remastered.
 
-Há uma alternativa anunciada para 5.0 DX12:
+Foi instalado o pacote original anunciado para 5.0 DX12:
 [Remastered First Person View Toggle](https://www.nexusmods.com/witcher3/mods/13072),
-versão 2.0. O site exige login para baixar. Ela não foi baixada nem instalada.
-Sua integração com este projeto não foi testada. É um mod de câmera de primeira
+versão 2.0, baixado em 5 de outubro. O ZIP tem SHA-256
+`1FFC8745C0CA4B116BC5500368142B680427E96A7B9158BE4F8AC3DC35C8E3D9`.
+Foram copiados sete arquivos originais e configurados os atalhos F8 (alternar
+primeira/terceira pessoa) e F9 (mira). Não foi adicionada a combinação com a roda
+do mouse, evitando sobreposição aos controles já usados pelo jogo.
+O carregador `dinput8.dll` e o ReShade `dxgi.dll` permaneceram iguais, conferidos
+por SHA-256. Os saves não foram alterados. Os controles anteriores e o registro
+da instalação estão em
+`E:\GAMES\mod VR witcher 3\backups\fpv-toggle-2.0-20261005-2207\manifest.json`.
+
+O instalador próprio `scripts/install-fpv-original.ps1` faz, nesta ordem:
+confere que o jogo está fechado e que o pacote está completo; compara os
+controles novos com os antigos para impedir mudanças não relacionadas; guarda
+as cópias de segurança; copia os arquivos; compara seus identificadores
+de conteúdo e registra o resultado. Esses identificadores, chamados SHA-256,
+permitem conferir que o arquivo copiado é exatamente igual ao original.
+O instalador não contém nem publica os arquivos de terceiros.
+
+Os arquivos estão instalados, mas ainda não houve teste de abertura ou
+compilação dos scripts dentro do jogo. A opção de habilitar mods no REDlauncher
+também não foi confirmada pela interface. O autor recomenda o
+[Snappy Stop](https://www.nexusmods.com/witcher3/mods/13592); esse complemento
+ainda não foi instalado. Sua integração com este projeto não foi testada.
+É um mod de câmera de primeira
 pessoa, sem o sistema de mãos e combate físico solicitado. Sua licença também
 exige autorização do autor para modificar ou incorporar seus arquivos; o
 projeto local não contém esses arquivos.
@@ -126,8 +170,9 @@ separadamente. Ainda não há resultados para nenhum desses critérios.
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.
 - Integrar as posições das mãos à aparência das mãos e armas do personagem.
 - Integrar trajetória, contato, dano e bloqueio ao combate do jogo.
-- Completar a instalação limpa de primeira pessoa compatível e testar conflitos.
-- Criar o fork na conta GitHub e guardar o histórico das mudanças.
+- Confirmar a ativação de mods e a abertura do jogo com a instalação limpa;
+  conferir o complemento recomendado e possíveis conflitos.
+- Publicar as mudanças na linha de desenvolvimento do fork e conferir a cópia.
 - Validar no Quest 3 e medir Novigrad na máquina identificada.
 
 O objetivo completo do pedido continua pendente. Não há garantia de 60 FPS nem
