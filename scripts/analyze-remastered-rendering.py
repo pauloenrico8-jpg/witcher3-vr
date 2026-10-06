@@ -170,6 +170,100 @@ def function_facts(image, rva):
         "RuntimeVerified": False, "ObjectLayoutVerified": False}
 
 
+def direct_call_leaf_facts(image, call_rva, max_bytes=4096, max_instructions=2048):
+    """Inspect a reached direct-call target that has no unwind record.
+
+    Windows x64 leaf routines need not have .pdata, but arbitrary neighbouring
+    bytes are not an entry. Require a decoded CALL in a checked caller first.
+    Follow conditional paths in a bounded executable window; stop at jumps
+    instead of assuming a tail target belongs to the same routine. Refuse
+    calls, stack/nonvolatile register changes and overlapping instructions.
+    This is static evidence only, never permission to execute a new game hook.
+    """
+    caller = image.primary_function_rva(call_rva)
+    if caller is None or not 1 <= max_bytes <= 65536 or not 1 <= max_instructions <= 16384:
+        raise ValueError("Leaf inspection requires a checked caller and bounded budgets")
+    call = next((i for i in image.reachable_instructions(caller)["Instructions"]
+                 if i.address == call_rva), None)
+    if (call is None or call.mnemonic != "call" or not call.operands
+            or call.operands[0].type != X86_OP_IMM):
+        raise ValueError("Requested address is not a reached direct CALL")
+    entry = call.operands[0].imm
+    if not image.executable(entry) or image.function(entry) is not None:
+        raise ValueError("Target must be executable and have no unwind record")
+    section = next((s for s in image.sections if s[1] <= entry < s[1] + s[2]), None)
+    end = min(entry + max_bytes, section[1] + section[2])
+    # Never cross a recorded function, even if it happens to be in the budget.
+    end = min([end] + [begin for begin in image.starts if entry < begin < end])
+    pending, decoded, occupied = [entry], {}, {}
+    problems, jumps, returns, offsets = [], [], [], set()
+    preserved = {"rbx", "ebx", "bx", "bl", "bh", "rbp", "ebp", "bp", "bpl",
+                 "rdi", "edi", "di", "dil", "rsi", "esi", "si", "sil",
+                 "rsp", "esp", "sp", "spl"}
+    preserved.update(f"r{n}{suffix}" for n in range(12, 16) for suffix in ["", "d", "w", "b"])
+    preserved.update(f"{kind}{n}" for kind in ["xmm", "ymm", "zmm"] for n in range(6, 16))
+    while pending:
+        address = pending.pop()
+        while address not in decoded:
+            if not entry <= address < end:
+                problems.append({"Rva": hx(address), "Reason": "Outside bounded leaf window"})
+                break
+            if address in occupied:
+                problems.append({"Rva": hx(address), "Reason": "Branch into instruction bytes"})
+                break
+            if len(decoded) >= max_instructions:
+                problems.append({"Rva": hx(address), "Reason": "Instruction budget exhausted"})
+                break
+            try:
+                insn = next(image.decoder.disasm(image.read(address, min(15, end - address)),
+                                                 address, count=1), None)
+            except ValueError:
+                insn = None
+            if insn is None:
+                problems.append({"Rva": hx(address), "Reason": "Cannot decode file-backed instruction"})
+                break
+            if any(byte in occupied for byte in range(address, address + insn.size)):
+                problems.append({"Rva": hx(address), "Reason": "Overlapping instruction paths"})
+                break
+            decoded[address] = insn
+            occupied.update((byte, address) for byte in range(address, address + insn.size))
+            if insn.mnemonic == "ret" and not insn.operands:
+                returns.append(hx(address))
+                break
+            written = {insn.reg_name(reg) for reg in insn.regs_access()[1]}
+            if (written & preserved or insn.mnemonic in
+                    {"call", "enter", "leave", "push", "pop", "ret", "retf", "iret", "iretd", "iretq"}):
+                problems.append({"Rva": hx(address), "Reason": "Not a stack-preserving x64 leaf"})
+                break
+            if insn.mnemonic in {"int3", "ud2", "hlt", "syscall", "sysenter", "int"}:
+                problems.append({"Rva": hx(address), "Reason": "Non-returning or unsupported terminator"})
+                break
+            for operand in insn.operands:
+                if operand.type == X86_OP_MEM and operand.mem.base:
+                    offsets.add((insn.reg_name(operand.mem.base), operand.mem.disp, operand.size))
+            if insn.mnemonic == "jmp":
+                jumps.append({"Rva": hx(address), "TargetRva": hx(insn.operands[0].imm)
+                              if insn.operands[0].type == X86_OP_IMM else None})
+                break
+            if insn.group(_callbacks.CS_GRP_JUMP):
+                if not insn.operands or insn.operands[0].type != X86_OP_IMM:
+                    problems.append({"Rva": hx(address), "Reason": "Unresolved conditional target"})
+                    break
+                pending.append(insn.operands[0].imm)
+            address += insn.size
+    return {"CallInstructionRva": hx(call_rva), "CallerPrimaryEntryRva": hx(caller),
+        "ValidatedDirectCallTargetRva": hx(entry), "PrimaryEntryRva": None,
+        "BoundedWindowEndRva": hx(end), "ReachedInstructionBytes": sum(i.size for i in decoded.values()),
+        "Instructions": [{"Rva": hx(i.address), "Operation": i.mnemonic,
+                          "Operands": i.op_str} for i in sorted(decoded.values(), key=lambda i: i.address)],
+        "ReturnSites": sorted(returns), "StoppedJumps": jumps, "Problems": problems,
+        "CompleteLeafControlFlow": bool(returns) and not problems and not jumps,
+        "ObservedRegisterOffsets": [{"Register": reg, "Offset": offset, "Bytes": size}
+                                    for reg, offset, size in sorted(offsets)],
+        "RuntimeVerified": False, "ObjectLayoutVerified": False,
+        "Note": "Reached direct-call entry only; no unwind range or semantic object layout inferred."}
+
+
 def build_report(image, callback_report, inspect_rvas, call_depth=1):
     digest = hashlib.sha256(image.data).hexdigest().upper()
     if callback_report["ExecutableSha256"].upper() != digest:
@@ -225,11 +319,15 @@ def main():
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--inspect-rva", type=lambda value: int(value, 0), action="append", default=[])
     parser.add_argument("--call-depth", type=int, choices=range(3), default=1)
+    parser.add_argument("--inspect-leaf-call", type=lambda value: int(value, 0), action="append", default=[],
+                        help="Reached direct CALL to an executable target without unwind metadata")
     args = parser.parse_args()
     _callbacks.ensure_report_destination(args.report, args.exe, args.callbacks)
     image = Image(args.exe)
     callback_report = json.loads(args.callbacks.read_text(encoding="utf-8-sig"))
     report = build_report(image, callback_report, args.inspect_rva, args.call_depth)
+    report["DirectCallLeafFunctions"] = [direct_call_leaf_facts(image, rva)
+                                         for rva in args.inspect_leaf_call]
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"RttiTables": len(report["RttiTables"]),
         "Functions": len(report["Functions"]), "VtableReferences": len(report["VtableCodeReferences"]),
