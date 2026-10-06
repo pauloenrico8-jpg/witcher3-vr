@@ -70,6 +70,26 @@ int main() {
     require(c::selected(&copied_contract) == nullptr);
     require(c::selected(&e::legacy_404) == nullptr && c::selected(nullptr) == nullptr);
     require(!c::stereo_reentry_verified);
+    c::StateConnection connection{reinterpret_cast<void*>(0x100000010ull),
+        reinterpret_cast<void*>(0x100000020ull), reinterpret_cast<void*>(0x100000020ull),
+        c::renderer_vtable, c::shared_state_getter, c::constructed_viewport, 1};
+    require(c::known_state_connection(&e::remastered_500c, connection));
+    require(!c::known_state_connection(&copied_contract, connection));
+    require(!c::known_state_connection(&e::legacy_404, connection));
+    for (int mutation = 0; mutation < 8; ++mutation) {
+        auto bad = connection;
+        switch (mutation) {
+        case 0: bad.renderer = nullptr; break;
+        case 1: bad.global_state = nullptr; break;
+        case 2: bad.observed_state = bad.renderer; break;
+        case 3: bad.vtable_rva += 8; break;
+        case 4: bad.getter_rva += 1; break;
+        case 5: bad.viewport |= 1u << 31; break;
+        case 6: bad.sdk_initialized = 0; break;
+        case 7: bad.sdk_initialized = 2; break;
+        }
+        require(!c::known_state_connection(&e::remastered_500c, bad));
+    }
 
     // Deliberately distinct adjacent values catch C40/C44 and 120/124/128
     // substitution: those substitutions would silently skip or repeat work.
