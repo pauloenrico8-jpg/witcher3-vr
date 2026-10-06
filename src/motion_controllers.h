@@ -2,7 +2,9 @@
 
 #include <openxr/openxr.h>
 #include <array>
+#include <cstdint>
 #include <mutex>
+#include <vector>
 
 namespace w3vr::motion {
 
@@ -24,6 +26,8 @@ struct HandState {
 
 struct Frame {
     XrTime display_time{};
+    uint64_t tracking_epoch{};
+    XrSpace reference_space{XR_NULL_HANDLE};
     std::array<HandState, 2> hands{}; // left, right; metres in LOCAL space
     bool focused{};
     bool ready{};
@@ -38,6 +42,7 @@ public:
                         PFN_xrGetInstanceProcAddr get_proc);
     void update(XrSpace base_space, XrTime display_time, bool focused);
     void invalidate();
+    void reference_space_change(const XrEventDataReferenceSpaceChangePending& event);
     void shutdown(); // before destroying the owning XR session/instance
     Frame snapshot() const;
     XrResult vibrate(unsigned hand, float amplitude, XrDuration duration);
@@ -58,6 +63,11 @@ private:
     bool attached_{};
     mutable std::mutex mutex_;
     Frame frame_{};
+    uint64_t tracking_epoch_{1};
+    XrSpace last_reference_space_{XR_NULL_HANDLE};
+    XrTime last_sample_time_{};
+    std::vector<XrTime> space_change_times_;
+    size_t last_space_change_count_{};
 
     PFN_xrGetInstanceProcAddr get_proc_{};
     PFN_xrStringToPath string_to_path_{};

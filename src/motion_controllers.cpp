@@ -148,15 +148,33 @@ XrResult Controllers::initialize(XrInstance instance, XrSession session,
     result = attach_sets_(session_, &attach);
     if (XR_FAILED(result)) return checked(result);
     attached_ = true;
+    ++tracking_epoch_;
     frame_ = {};
     frame_.ready = true;
+    frame_.tracking_epoch = tracking_epoch_;
     return result;
 }
 
 void Controllers::update(XrSpace base_space, XrTime time, bool focused) {
     std::lock_guard lock(mutex_);
+    const auto prior_hands = frame_.hands;
+    if (frame_.focused && (!focused || base_space == XR_NULL_HANDLE || time <= 0)) ++tracking_epoch_;
+    if (base_space != last_reference_space_ || time < last_sample_time_) ++tracking_epoch_;
+    last_reference_space_ = base_space;
+    last_sample_time_ = time;
+    // The change applies to locate calls at/after changeTime, even if the
+    // XrSpace handle stays the same. Never join poses across that boundary.
+    // Keep boundaries for the whole session: the renderer can locate a future
+    // pair then request an earlier time. Crossing the same boundary again must
+    // still break continuity, even after its first application.
+    const auto changes = static_cast<size_t>(std::upper_bound(
+        space_change_times_.begin(),space_change_times_.end(),time)-space_change_times_.begin());
+    if (changes != last_space_change_count_) ++tracking_epoch_;
+    last_space_change_count_ = changes;
     frame_ = {};
     frame_.display_time = time;
+    frame_.tracking_epoch = tracking_epoch_;
+    frame_.reference_space = base_space;
     frame_.ready = attached_;
     frame_.focused = attached_ && focused;
     if (!attached_ || !focused || base_space == XR_NULL_HANDLE || time <= 0) return;
@@ -166,7 +184,11 @@ void Controllers::update(XrSpace base_space, XrTime time, bool focused) {
     sync_info.activeActionSets = &active;
     frame_.result = sync_(session_, &sync_info);
     // XR_SESSION_NOT_FOCUSED is a positive result, but is not usable input.
-    if (frame_.result != XR_SUCCESS) { frame_.focused = false; return; }
+    if (frame_.result != XR_SUCCESS) {
+        frame_.focused = false;
+        frame_.tracking_epoch = ++tracking_epoch_;
+        return;
+    }
     for (unsigned hand = 0; hand < 2; ++hand) {
         auto& output = frame_.hands[hand];
         XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -223,12 +245,29 @@ void Controllers::update(XrSpace base_space, XrTime time, bool focused) {
     // A failed action query invalidates the whole publication instead of
     // mixing samples from a partially failing runtime.
     if (frame_.result != XR_SUCCESS) frame_.hands = {};
+    for (unsigned hand=0; hand<2; ++hand) {
+        if (prior_hands[hand].grip_tracked && !frame_.hands[hand].grip_tracked) {
+            frame_.tracking_epoch = ++tracking_epoch_;
+            break;
+        }
+    }
 }
 
 void Controllers::invalidate() {
     std::lock_guard lock(mutex_);
+    ++tracking_epoch_;
     frame_ = {};
     frame_.ready = attached_;
+    frame_.tracking_epoch = tracking_epoch_;
+}
+
+void Controllers::reference_space_change(const XrEventDataReferenceSpaceChangePending& event) {
+    std::lock_guard lock(mutex_);
+    if (!attached_ || event.type != XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING || event.session != session_ ||
+        event.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL || event.changeTime <= 0) return;
+    const auto where = std::lower_bound(space_change_times_.begin(),space_change_times_.end(),event.changeTime);
+    if (where == space_change_times_.end() || *where != event.changeTime)
+        space_change_times_.insert(where,event.changeTime);
 }
 
 Frame Controllers::snapshot() const {
@@ -265,6 +304,12 @@ void Controllers::clear_resources() {
     action_set_ = XR_NULL_HANDLE;
     grip_ = aim_ = trigger_ = squeeze_ = stick_ = primary_ = secondary_ = haptic_ = XR_NULL_HANDLE;
     frame_ = {};
+    ++tracking_epoch_;
+    frame_.tracking_epoch = tracking_epoch_;
+    last_reference_space_ = XR_NULL_HANDLE;
+    last_sample_time_ = 0;
+    space_change_times_.clear();
+    last_space_change_count_ = 0;
 }
 
 void Controllers::shutdown() {
