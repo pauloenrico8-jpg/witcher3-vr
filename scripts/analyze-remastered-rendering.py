@@ -99,7 +99,8 @@ def direct_references(image, targets):
 
     A matching displacement inside other instruction data is not a call.
     Lookahead permits overlapping byte candidates; only decoded boundaries
-    decide. Call sites without unwind metadata are not guessed.
+    decide, including validated bounded switch cases. Call sites without
+    unwind metadata are not guessed. Unresolved switches make this incomplete.
     """
     ranges = set()
     for _, va, size, raw, flags in image.sections:
@@ -163,6 +164,10 @@ def function_facts(image, rva):
         "TotalChunkBytes": total_bytes, "ReachedInstructionBytes": decoded_bytes,
         "UnreachedChunkBytes": total_bytes - decoded_bytes,
         "UnresolvedIndirectJumps": [hx(address) for address in flow["UnresolvedIndirectJumps"]],
+        "ResolvedJumpTables": [{"JumpRva": hx(s["JumpRva"]),
+            "TableRva": hx(s["TableRva"]), "EntryCount": s["EntryCount"],
+            "DefaultRva": hx(s["DefaultRva"]), "Targets": [hx(t) for t in s["Targets"]]}
+            for s in flow["ResolvedJumpTables"]],
         "DecodeFailures": [hx(address) for address in flow["DecodeFailures"]],
         "DirectControlTransfers": calls, "RipReferences": rip,
         "ObservedRegisterOffsets": [{"Register": reg, "Offset": offset, "Bytes": size}

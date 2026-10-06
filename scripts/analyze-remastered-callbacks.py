@@ -157,12 +157,68 @@ class Image:
             self._function_chunks = chunks
         return self._function_chunks[primary]
 
+    def _bounded_switch(self, history, chunks):
+        """Recognize only the checked unsigned, image-relative MSVC table form.
+
+        cmp index32,N; ja default; lea base,[rip->image base];
+        mov target32,[base+index64*4+table]; add target64,base; jmp target64.
+        Unknown shapes remain unresolved. A raw table/offset match never seeds
+        code. Targets must stay in this exact unwind owner, outside table data.
+        """
+        if len(history) < 6:
+            return None
+        compare, above, base, load, add, jump = history[-6:]
+        if [x.mnemonic for x in history[-6:]] != ["cmp", "ja", "lea", "mov", "add", "jmp"]:
+            return None
+        def reg64(insn, operand):
+            if operand.type != X86_OP_REG:
+                return None
+            name = insn.reg_name(operand.reg)
+            aliases = {"eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+                       "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp"}
+            return aliases.get(name, name[:-1] if re.fullmatch(r"r(?:[89]|1[0-5])d", name) else name)
+        if any(len(x.operands) != n for x, n in zip(history[-6:], [2, 1, 2, 2, 2, 1])):
+            return None
+        index, maximum = compare.operands
+        if index.type != X86_OP_REG or index.size != 4 or maximum.type != X86_OP_IMM or not 0 <= maximum.imm <= 255:
+            return None
+        if above.operands[0].type != X86_OP_IMM:
+            return None
+        base_reg, image_base = base.operands
+        if base_reg.type != X86_OP_REG or base_reg.size != 8 or image_base.type != X86_OP_MEM or image_base.mem.base != X86_REG_RIP or image_base.mem.index or base.address + base.size + image_base.mem.disp != 0:
+            return None
+        dest, source = load.operands
+        if dest.type != X86_OP_REG or dest.size != 4 or source.type != X86_OP_MEM or source.size != 4:
+            return None
+        memory = source.mem
+        if memory.base != base_reg.reg or memory.scale != 4 or reg64(compare, index) != load.reg_name(memory.index):
+            return None
+        dest64 = reg64(load, dest)
+        if dest64 == reg64(base, base_reg) or reg64(compare, index) == reg64(base, base_reg):
+            return None
+        if add.operands[0].size != 8 or add.operands[1].size != 8 or reg64(add, add.operands[0]) != dest64 or add.operands[1].type != X86_OP_REG or add.operands[1].reg != base_reg.reg or jump.operands[0].size != 8 or reg64(jump, jump.operands[0]) != dest64:
+            return None
+        table, count = memory.disp, maximum.imm + 1
+        if table < 0 or table % 4:
+            return None
+        try:
+            targets = struct.unpack(f"<{count}I", self.read(table, count * 4))
+        except ValueError:
+            return None
+        table_end = table + count * 4
+        def owned(address):
+            return any(begin <= address < end for begin, end in chunks)
+        if not owned(above.operands[0].imm) or any(not owned(t) or table <= t < table_end for t in targets):
+            return None
+        return {"JumpRva": jump.address, "TableRva": table, "EntryCount": count,
+                "DefaultRva": above.operands[0].imm, "Targets": list(targets)}
+
     def reachable_instructions(self, rva: int):
         """Bounded control-flow decode; never decode data after a return as code.
 
         Seed primary and checked unwind fragment entries, follow direct branches
-        inside those ranges, but don't guess targets of indirect jumps. This is
-        deliberately incomplete when a jump table hasn't been resolved.
+        inside those ranges and the one bounded switch form checked above.
+        All other indirect jumps remain explicitly unresolved.
         """
         chunks = self.function_chunks(rva)
         starts = [begin for begin, _ in chunks]
@@ -170,8 +226,10 @@ class Image:
         decoded = {}
         indirect = set()
         failures = set()
+        switches = {}
         while pending:
             address = pending.pop()
+            history = []
             while address not in decoded:
                 index = bisect.bisect_right(starts, address) - 1
                 if index < 0 or not chunks[index][0] <= address < chunks[index][1]:
@@ -183,6 +241,8 @@ class Image:
                     failures.add(address)
                     break
                 decoded[address] = instruction
+                history.append(instruction)
+                history = history[-6:]
                 if instruction.mnemonic in {"ret", "retf", "iret", "iretd", "iretq", "int3", "ud2", "hlt"}:
                     break
                 if instruction.group(CS_GRP_JUMP):
@@ -190,12 +250,29 @@ class Image:
                     if operand.type == X86_OP_IMM:
                         pending.append(operand.imm)
                     else:
-                        indirect.add(address)
+                        switch = self._bounded_switch(history, chunks)
+                        if switch is None:
+                            indirect.add(address)
+                        else:
+                            switches[address] = switch
+                            pending.extend(switch["Targets"])
                     if instruction.mnemonic == "jmp":
                         break
                 address += instruction.size
-        return {"Instructions": [decoded[address] for address in sorted(decoded)],
-                "UnresolvedIndirectJumps": sorted(indirect), "DecodeFailures": sorted(failures)}
+        ordered = [decoded[address] for address in sorted(decoded)]
+        # Refuse targets in the middle of another instruction, and never turn
+        # table bytes into code even if an unwind fragment spans that data.
+        if switches:
+            for before, after in zip(ordered, ordered[1:]):
+                if before.address + before.size > after.address:
+                    raise ValueError("Switch target overlaps an instruction")
+            for switch in switches.values():
+                start, end = switch["TableRva"], switch["TableRva"] + 4 * switch["EntryCount"]
+                if any(x.address < end and x.address + x.size > start for x in ordered):
+                    raise ValueError("Switch table overlaps decoded code")
+        return {"Instructions": ordered, "UnresolvedIndirectJumps": sorted(indirect),
+                "ResolvedJumpTables": [switches[a] for a in sorted(switches)],
+                "DecodeFailures": sorted(failures)}
 
     def occurrences(self, value: bytes):
         start = 0
