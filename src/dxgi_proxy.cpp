@@ -26,6 +26,10 @@
 #include "motion_controllers.h"
 #include "hand_pose_history.h"
 #include "legacy_engine_preflight.h"
+#include "engine_camera_temporal.h"
+#include "engine_frame_submission.h"
+#include "engine_scene_factory.h"
+#include "engine_scene_descriptor.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
@@ -495,6 +499,10 @@ IDxcCompiler3* g_dxc_compiler{};
 std::mutex g_log_mutex{};
 std::once_flag g_init_once{};
 std::atomic<bool> g_legacy_engine_layout_accepted{};
+// Published only after the legacy preflight. The statically examined 5.00c
+// camera contract does not authorize the rest of the engine hook graph.
+std::atomic<const w3vr::engine_camera::TemporalContract*>
+    g_engine_camera_temporal_contract{};
 std::once_flag g_openxr_once{};
 std::once_flag g_performance_cpu_sets_once{};
 std::atomic<uint64_t> g_present_count{};
@@ -2309,8 +2317,7 @@ EngineViewCopyRebuildFn g_engine_view_copy_rebuild{};
 // that independent authority at the native CCustomCamera boundary instead.
 std::atomic<float> g_native_world_fov_degrees{60.0f};
 std::atomic<bool> g_native_world_fov_valid{};
-using EngineTemporalCameraBuildFn = void*(__fastcall*)(
-    void*, float, const void*, const void*, float, float, float, float, float);
+using EngineTemporalCameraBuildFn = w3vr::engine_camera::NativeBuilder;
 EngineTemporalCameraBuildFn g_engine_temporal_camera_build{};
 using EngineCameraDirectionFn = void(__fastcall*)(void*, void*, float*);
 EngineCameraDirectionFn g_engine_camera_direction{};
@@ -2838,7 +2845,8 @@ thread_local uint64_t g_engine_render_pair_id{};
 // AER tag is a safe camera fallback, but only a frame-data registry hit
 // proves which deferred REDengine task owns the emitted DLSS command.
 thread_local bool g_engine_render_tag_frame_lookup_exact{};
-constexpr size_t kEngineTemporalCameraRecordBytes = 0xB0;
+constexpr size_t kEngineTemporalCameraRecordBytes =
+    w3vr::engine_camera::record_bytes;
 struct EnginePerEyeTemporalCameraHistory {
     std::array<uint8_t, kEngineTemporalCameraRecordBytes> record{};
     uint64_t pair_id{};
@@ -30075,6 +30083,40 @@ void install_engine_temporal_writer_hook() {
     }
 }
 
+bool build_engine_camera_temporal_record(float* view, float time,
+    w3vr::engine_camera::TemporalRecord& record) {
+    if (view == nullptr || g_engine_camera_temporal_contract.load(
+            std::memory_order_acquire) == nullptr) {
+        return false;
+    }
+    // Read only the common input prefix, not a legacy-sized whole camera.
+    std::array<uint8_t, w3vr::engine_camera::source_prefix_bytes> prefix{};
+    __try {
+        memcpy(prefix.data(), view, prefix.size());
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return w3vr::engine_camera::build_record(prefix, time,
+        g_engine_temporal_camera_build, record);
+}
+
+bool write_engine_previous_camera_record(float* view,
+    const w3vr::engine_camera::TemporalRecord& record) {
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (view == nullptr || contract == nullptr) return false;
+    // The native camera hook owns this range; the version contract provides
+    // its record offset. The span alone cannot validate the native allocation.
+    __try {
+        return w3vr::engine_camera::write_previous_record(
+            {reinterpret_cast<uint8_t*>(view),
+                contract->previous_record_offset +
+                    w3vr::engine_camera::record_bytes}, *contract, record);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // [FIX:MODE3-FALLBACK-DLSS-HISTORY V1256 1/2] Reused-camera cutscenes do
 // not reach hook_engine_view_rebuild(), so V9416/V14003 cannot install the
 // previous corrected camera before REDengine derives native motion vectors.
@@ -30097,21 +30139,9 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
 
     const float engine_time = g_engine_temporal_camera_build_time.load(
         std::memory_order_relaxed);
-    if (!std::isfinite(engine_time) ||
-        !std::isfinite(view[7]) || view[7] <= 0.1f ||
-        !std::isfinite(view[10]) || view[10] <= 0.1f ||
-        !std::isfinite(view[11]) ||
-        !std::isfinite(view[12]) || view[12] <= 0.0f ||
-        !std::isfinite(view[13]) || view[13] <= view[12]) {
-        return false;
-    }
-
-    alignas(16) std::array<uint8_t, kEngineTemporalCameraRecordBytes>
-        current_record{};
-    void* built = g_engine_temporal_camera_build(
-        current_record.data(), engine_time, view, view + 4,
-        view[7], view[10], view[12], view[13], view[11]);
-    if (built != current_record.data() || current_record[0] == 0) {
+    w3vr::engine_camera::TemporalRecord current_record{};
+    if (!build_engine_camera_temporal_record(view, engine_time,
+            current_record)) {
         return false;
     }
 
@@ -30130,8 +30160,10 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
         const auto& previous_record = continued
             ? slot.record
             : current_record;
-        memcpy(reinterpret_cast<uint8_t*>(view) + 0x460,
-            previous_record.data(), previous_record.size());
+        if (!write_engine_previous_camera_record(view, previous_record)) {
+            continued = false;
+            return false;
+        }
         slot.record = current_record;
         slot.pair_id = pair_id;
         slot.valid = true;
@@ -36680,21 +36712,13 @@ bool prepare_engine_per_eye_native_temporal_history(
     const float engine_time = g_engine_temporal_camera_build_time.load(
         std::memory_order_relaxed);
     if (eye < 0 || eye > 1 || pair_id == 0 || pair_id == UINT64_MAX ||
-        !time_valid || !std::isfinite(engine_time) ||
-        !std::isfinite(view[7]) || view[7] <= 0.1f ||
-        !std::isfinite(view[10]) || view[10] <= 0.1f ||
-        !std::isfinite(view[11]) ||
-        !std::isfinite(view[12]) || view[12] <= 0.0f ||
-        !std::isfinite(view[13]) || view[13] <= view[12]) {
+        !time_valid) {
         return false;
     }
 
-    alignas(16) std::array<uint8_t, kEngineTemporalCameraRecordBytes>
-        current_record{};
-    void* built = g_engine_temporal_camera_build(
-        current_record.data(), engine_time, view, view + 4,
-        view[7], view[10], view[12], view[13], view[11]);
-    if (built != current_record.data() || current_record[0] == 0) {
+    w3vr::engine_camera::TemporalRecord current_record{};
+    if (!build_engine_camera_temporal_record(view, engine_time,
+            current_record)) {
         return false;
     }
 
@@ -36708,8 +36732,9 @@ bool prepare_engine_per_eye_native_temporal_history(
         const auto& previous_record = continued
             ? slot.record
             : current_record;
-        memcpy(reinterpret_cast<uint8_t*>(view) + 0x460,
-            previous_record.data(), previous_record.size());
+        if (!write_engine_previous_camera_record(view, previous_record)) {
+            return false;
+        }
         slot.record = current_record;
         slot.pair_id = pair_id;
         slot.valid = true;
@@ -39810,7 +39835,10 @@ void install_engine_temporal_camera_builder_hook() {
         return;
     }
 
-    constexpr uintptr_t kEngineTemporalCameraBuildRva = 0x015FE010;
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == nullptr) return;
+    const uintptr_t kEngineTemporalCameraBuildRva = contract->builder_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr
         ? module + kEngineTemporalCameraBuildRva
@@ -39847,7 +39875,10 @@ void install_engine_view_factory_probe() {
         return;
     }
 
-    constexpr uintptr_t kEngineViewRebuildRva = 0x015FE550;
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == nullptr) return;
+    const uintptr_t kEngineViewRebuildRva = contract->rebuild_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineViewRebuildRva : nullptr;
     if (target != nullptr &&
@@ -39983,7 +40014,10 @@ void install_engine_render_proxy_distance_scale_hook() {
         return;
     }
 
-    constexpr uintptr_t kEngineViewCopyRebuildRva = 0x015FF640;
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == nullptr) return;
+    const uintptr_t kEngineViewCopyRebuildRva = contract->copy_rebuild_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr
         ? module + kEngineViewCopyRebuildRva : nullptr;
@@ -40320,6 +40354,88 @@ size_t copy_readable_scene_descriptor(
     return copied_bytes;
 }
 
+w3vr::scene_factory::Version selected_scene_factory_version() {
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == &w3vr::engine_camera::legacy_404) {
+        return w3vr::scene_factory::Version::legacy_404;
+    }
+    if (contract == &w3vr::engine_camera::remastered_500c) {
+        return w3vr::scene_factory::Version::remastered_500c;
+    }
+    return w3vr::scene_factory::Version::unknown;
+}
+
+bool engine_scene_factory_inputs_ready(void* renderer, void* settings,
+    const void* descriptor) {
+    const auto version = selected_scene_factory_version();
+    std::array<uint32_t, 2> extent{};
+    bool extent_readable{};
+    if (version == w3vr::scene_factory::Version::remastered_500c &&
+        descriptor != nullptr) {
+        __try {
+            memcpy(extent.data(), static_cast<const uint8_t*>(descriptor) +
+                w3vr::scene_factory::remastered_extent_offset, sizeof(extent));
+            extent_readable = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            extent_readable = false;
+        }
+    }
+    return w3vr::scene_factory::inputs_ready(version, renderer != nullptr,
+        settings != nullptr, descriptor != nullptr, extent_readable,
+        extent[0], extent[1]);
+}
+
+bool remastered_command_renderer_ready(uintptr_t module) {
+    if (module == 0) return false;
+    __try {
+        const auto renderer = *reinterpret_cast<const uintptr_t*>(module +
+            w3vr::frame_submission::renderer_global_rva);
+        return renderer != 0 && *reinterpret_cast<const uintptr_t*>(renderer) ==
+            module + w3vr::frame_submission::renderer_vtable_rva;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Called only for the separately owned duplicate frame. Selection follows the
+// camera contract already published by initialization, which still authorizes
+// ONLY legacy 4.04. This new command branch must not bypass the full port gate.
+bool submit_engine_duplicate_frame(uintptr_t module, void* render_context,
+    void* frame) {
+    if (frame == nullptr) return false;
+    const auto* vtable = *reinterpret_cast<void***>(frame);
+    const auto release = reinterpret_cast<w3vr::frame_submission::ReleaseFrame>(
+        vtable[2]);
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (module != 0 && contract == &w3vr::engine_camera::legacy_404 &&
+        render_context != nullptr) {
+        constexpr uintptr_t kLegacySceneEnqueueRva = 0x01621FC0;
+        const auto enqueue = reinterpret_cast<EngineSceneEnqueueFn>(
+            module + kLegacySceneEnqueueRva);
+        enqueue(render_context, frame);
+        release(frame);
+        return true;
+    }
+    if (module != 0 && contract == &w3vr::engine_camera::remastered_500c) {
+        w3vr::frame_submission::NativeCommandRoute route{};
+        route.allocate = reinterpret_cast<w3vr::frame_submission::AllocateCommand>(
+            module + w3vr::frame_submission::command_allocator_rva);
+        route.construct = reinterpret_cast<w3vr::frame_submission::ConstructCommand>(
+            module + w3vr::frame_submission::command_constructor_rva);
+        route.dispatch = reinterpret_cast<w3vr::frame_submission::DispatchCommand>(
+            module + w3vr::frame_submission::command_dispatch_rva);
+        route.unavailable_command = reinterpret_cast<void*>(
+            module + w3vr::frame_submission::unavailable_command_rva);
+        route.renderer_ready = remastered_command_renderer_ready(module);
+        return w3vr::frame_submission::submit_owned_frame(route, frame, release) ==
+            w3vr::frame_submission::Result::dispatched;
+    }
+    release(frame);
+    return false;
+}
+
 void* __fastcall hook_engine_frame_data_factory(void* render_context, void* render_settings, void* scene_descriptor) {
     w3vr::pipeline_flight::CpuScope flight_cpu{
         w3vr::pipeline_flight::Phase::FrameFactory};
@@ -40341,10 +40457,10 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const auto present = g_present_count.load();
     const bool asymmetric_factory_audit =
         asymmetric_authority_audit_active();
+    const bool factory_inputs_ready = engine_scene_factory_inputs_ready(
+        render_context, render_settings, scene_descriptor);
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
-    constexpr size_t kSceneDescriptorBytes = 0xC000;
-    constexpr size_t kSceneDescriptorMinimumBytes = 0xB000;
     // [FIX:ASYMMETRIC-TAAU-SCENE-DESCRIPTOR-HARDENING V1207 1/1]
     // The REDengine scene descriptor is stack-backed. Its readable range to
     // the next VM boundary varies with address placement, so the old clone
@@ -40353,10 +40469,14 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // TAAU then receives zero jitter/extent CBs, skips pairs and replays stale
     // histories. Every observed safe bounded prefix is at least 0xBD00. Copy
     // exactly that stable prefix and zero the rest only for asymmetric TAAU;
-    // every other backend/projection route retains V1206 behavior.
-    constexpr size_t kAsymmetricTaauSceneDescriptorPrefixBytes = 0xBD00;
-    static_assert(kAsymmetricTaauSceneDescriptorPrefixBytes >=
-        kSceneDescriptorMinimumBytes);
+    // every other backend/projection route retains V1206 behavior on 4.04.
+    // Remastered uses its separate full-copy contract; this legacy prefix
+    // must never zero the newer descriptor's live tail. Neither contract
+    // activates compatibility or extends the original producer's lifetime.
+    // Newer descriptors contain borrowed pointers into the current producer.
+    // Keep their byte snapshot local to this synchronous factory hook. Its
+    // C++ byte-buffer destructor must never destroy native game resources.
+    std::vector<uint8_t> remastered_borrowed_descriptor;
     std::vector<uint8_t>* right_scene_descriptor{};
     const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
         std::memory_order_relaxed);
@@ -40388,8 +40508,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         automatic_full_vr_bootstrap &&
         !native_loading_video &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
-        render_context != nullptr && render_settings != nullptr &&
-        scene_descriptor != nullptr;
+        factory_inputs_ready;
     if (automatic_full_vr_frame_camera_bootstrap &&
         !g_automatic_full_vr_camera_active.exchange(
             true, std::memory_order_acq_rel)) {
@@ -40402,8 +40521,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         !native_loading_video &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
         (hmd_camera_recent || automatic_full_vr_bootstrap) &&
-        render_context != nullptr && render_settings != nullptr &&
-        scene_descriptor != nullptr;
+        factory_inputs_ready;
     if (g_config.engine_dual_render_probe && !g_engine_dual_render_active.load() &&
         dual_render_auto_ready && !g_dual_render_auto_start_consumed.exchange(true)) {
         g_engine_dual_render_requested.store(1);
@@ -40469,15 +40587,19 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // generation} duplication and temporal-history route active in cinema;
     // only fullscreen menus remain single-view.
     if (duplicate_render) {
-        right_scene_descriptor = &g_engine_dual_scene_descriptors[
-            present % g_engine_dual_scene_descriptors.size()];
+        const auto descriptor_version = selected_scene_factory_version();
+        right_scene_descriptor = descriptor_version ==
+                w3vr::scene_factory::Version::remastered_500c
+            ? &remastered_borrowed_descriptor
+            : &g_engine_dual_scene_descriptors[
+                present % g_engine_dual_scene_descriptors.size()];
         const bool asymmetric_taau_descriptor_hardening =
             native_asymmetric_noaa_route_active() &&
             temporal_backend_is_taau();
-        const size_t requested_copy_bytes =
-            asymmetric_taau_descriptor_hardening
-            ? kAsymmetricTaauSceneDescriptorPrefixBytes
-            : kSceneDescriptorBytes;
+        const auto descriptor_policy = w3vr::scene_descriptor::copy_policy(
+            descriptor_version, asymmetric_taau_descriptor_hardening);
+        const size_t requested_copy_bytes = descriptor_policy.requested_bytes;
+        const size_t kSceneDescriptorBytes = descriptor_policy.storage_bytes;
         const auto copied_bytes = copy_readable_scene_descriptor(
             *right_scene_descriptor, scene_descriptor, requested_copy_bytes);
         if (right_scene_descriptor->size() < kSceneDescriptorBytes) {
@@ -40487,10 +40609,13 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             log_line("Engine dual render skipped unreadable scene descriptor=%p present=%llu",
                 scene_descriptor, static_cast<unsigned long long>(present));
             right_scene_descriptor = nullptr;
-        } else if (copied_bytes < kSceneDescriptorMinimumBytes) {
+        } else if (!w3vr::scene_descriptor::copy_accepted(
+                descriptor_version, descriptor_policy,
+                std::span<const uint8_t>{right_scene_descriptor->data(),
+                    right_scene_descriptor->size()}, copied_bytes)) {
             static std::atomic<uint32_t> truncated_copy_log_count{};
             if (truncated_copy_log_count.fetch_add(1) < 8) {
-                log_line("Engine dual render skipped truncated scene descriptor source=%p copied=0x%zX requested=0x%zX present=%llu",
+                log_line("Engine dual render skipped incomplete or invalid borrowed scene descriptor source=%p copied=0x%zX requested=0x%zX present=%llu",
                     scene_descriptor, copied_bytes, requested_copy_bytes,
                     static_cast<unsigned long long>(present));
             }
@@ -40513,10 +40638,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         hmd_camera_recent &&
         !g_cinema_mode_active.load(std::memory_order_relaxed) &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
-        render_context != nullptr && render_settings != nullptr &&
-        scene_descriptor != nullptr;
-    const bool tag_mode3_aer_frame = mode3_aer_single_render &&
-        render_context != nullptr && render_settings != nullptr;
+        factory_inputs_ready;
+    const bool tag_mode3_aer_frame = mode3_aer_single_render && factory_inputs_ready;
     const bool tag_aer_frame = tag_mode3_aer_frame;
     // [FIX:PUREDARK-AFW-MODE3-TAAU-NATURAL-CLOCK V12122 2/4] Seed from the
     // current Present only at a route boundary. Until the canonical gameplay
@@ -40753,14 +40876,21 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                     duplicate_asymmetric_tag,
                     *duplicate_factory_capture);
             }
-            constexpr uintptr_t kEngineSceneEnqueueRva = 0x01621FC0;
-            auto enqueue = reinterpret_cast<EngineSceneEnqueueFn>(module + kEngineSceneEnqueueRva);
-            enqueue(render_context, right_frame_data);
-
-            using ReleaseFrameDataFn = void(__fastcall*)(void*);
-            auto* vtable = *reinterpret_cast<void***>(right_frame_data);
-            auto release = reinterpret_cast<ReleaseFrameDataFn>(vtable[2]);
-            release(right_frame_data);
+            const bool duplicate_dispatched = submit_engine_duplicate_frame(
+                module, render_context, right_frame_data);
+            if (!duplicate_dispatched) {
+                // Remove incomplete eye identities after the helper consumed
+                // the private reference. Never expose this pair as complete.
+                {
+                    std::scoped_lock lock{g_engine_dual_frame_mutex};
+                    g_engine_dual_frame_eyes.erase(right_frame_data);
+                    g_engine_dual_frame_eyes.erase(result);
+                }
+                g_engine_pair_retry_present.store(present + 2,
+                    std::memory_order_relaxed);
+                log_line("Engine duplicate command unavailable; pair=%llu skipped",
+                    static_cast<unsigned long long>(pair_id));
+            }
 
             // Snapshot copies were taken after both originals and before
             // enqueue. Formatting is deferred until the duplicate is enqueued
@@ -40772,7 +40902,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 emit_asymmetric_frame_factory(*duplicate_factory_capture);
             }
 
-            if (g_config.runtime_diagnostics &&
+            if (duplicate_dispatched && g_config.runtime_diagnostics &&
                 g_engine_dual_render_log_count.fetch_add(1) < 2) {
                 log_line("Engine dual render queued present=%llu left=%p right=%p descriptor=%p",
                     static_cast<unsigned long long>(present),
@@ -40828,7 +40958,9 @@ void install_engine_frame_factory_probe() {
         return;
     }
 
-    constexpr uintptr_t kEngineFrameDataFactoryRva = 0x016214C0;
+    const uintptr_t kEngineFrameDataFactoryRva =
+        w3vr::scene_factory::factory_rva(selected_scene_factory_version());
+    if (kEngineFrameDataFactoryRva == 0) return;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameDataFactoryRva : nullptr;
     if (target != nullptr &&
@@ -43678,6 +43810,8 @@ void ensure_initialized() {
                 "Remastered requires a verified port.");
             return;
         }
+        g_engine_camera_temporal_contract.store(
+            &w3vr::engine_camera::legacy_404, std::memory_order_release);
         g_legacy_engine_layout_accepted.store(true, std::memory_order_release);
         if (g_config.renderdoc_capture_enabled &&
             g_config.renderdoc_streamline_device_bridge) {
