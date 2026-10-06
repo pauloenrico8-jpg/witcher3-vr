@@ -36,13 +36,15 @@ inline const Layout* selected(const engine_camera::TemporalContract* contract) {
     return nullptr;
 }
 
+// Both native camera records belong to ONE scene/frame. They are not the
+// left/right HMD images, which require separate rendered frames.
 enum class Origin { descriptor, frame };
 
 inline bool camera_offset(const Layout& layout, Origin origin,
-    std::size_t eye, std::size_t& result) {
-    if (eye >= layout.descriptor_cameras.size() ||
+    std::size_t camera_index, std::size_t& result) {
+    if (camera_index >= layout.descriptor_cameras.size() ||
         (origin != Origin::descriptor && origin != Origin::frame)) return false;
-    result = layout.descriptor_cameras[eye] +
+    result = layout.descriptor_cameras[camera_index] +
         (origin == Origin::frame ? layout.frame_descriptor : 0);
     return true;
 }
