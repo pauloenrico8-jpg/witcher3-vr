@@ -616,6 +616,54 @@ chamador conhecido. Um salto do chamador continua sem resolução; isso não
 Nenhum relatório nativo novo foi publicado. Nada foi instalado no jogo.
 O bloqueio global do Remastered 5.00c e o bloqueio de repetição permanecem.
 
+## Texturas reais do DLSS: 6 de outubro, continuação
+
+Adaptei a leitura das quatro texturas que o DLSS recebe no Remastered 5.00c.
+Uma textura é uma imagem guardada na memória da placa de vídeo. Neste caso,
+elas representam profundidade, movimento dos objetos, cor antes da melhoria
+de imagem e cor depois dela. Identificar as quatro permite preparar históricos
+separados para os olhos sem interpretar esses dados com o formato antigo.
+
+O código funciona nesta ordem:
+
+1. Confere que o estado recebido é o mesmo criado pelo jogo. A tabela de
+   funções do renderizador, o acesso ao estado e o indicador de inicialização
+   do componente precisam corresponder aos pontos examinados no executável.
+2. Lê o cabeçalho de cada pacote e recusa um formato, versão ou extensão que
+   não reconhece. Copia os endereços e tamanhos enquanto a chamada original
+   ainda tem os dados disponíveis. Não modifica os pacotes do jogo.
+3. Começa uma lista vazia a cada avaliação reconhecida. Reúne profundidade,
+   movimento, entrada e saída somente para o mesmo olho, quadro, estado,
+   identificador de área e lista de comandos da placa de vídeo.
+4. Recusa a lista se faltar uma textura, houver remoção, repetição, erro,
+   mudança de olho/quadro ou uso de uma mesma textura em dois desses papéis.
+   Uma chamada intermediária ou aninhada também impede aproveitar a prova.
+5. Confere os tamanhos usados pelo jogo e associa a resposta original do
+   DLSS à lista. Consome a lista depois da tentativa; uma segunda avaliação
+   não aproveita dados antigos. O identificador nativo ímpar fica intacto.
+6. Registra apenas o que foi observado durante as chamadas no processador.
+   Endereços copiados não dão ao mod a posse das texturas. Ainda falta
+   acompanhar a lista de comandos até sua execução e término na placa de
+   vídeo antes de guardar, substituir ou liberar históricos de cada olho.
+
+Escolhi essas verificações para impedir que a imagem de um olho receba
+profundidade, movimento ou histórico do outro. Não criei novos identificadores
+nem ativei repetição de renderização com essas observações incompletas.
+
+A DLL compilou e passaram **106/106 CTest em 11,72s**. Os testes novos exercitam
+trocas de olho/quadro/estado, remoção, formatos desconhecidos, texturas repetidas,
+falhas do componente e atividade intermediária. São testes do código fora do
+jogo; não comprovam imagens no Quest, combate físico nem os 60 FPS.
+
+Evidência nova exclusivamente local:
+`../artifacts/remastered-modern-dlss-resource-layout-evidence.json`.
+Nenhum relatório novo, binário de terceiro ou save foi publicado. Nenhum
+arquivo foi instalado no jogo; o bloqueio do Remastered e da repetição moderna
+continua. O próximo passo é verificar posse e tempo de uso dessas texturas,
+identidade da lista de comandos após reutilização e conclusão na placa de vídeo,
+além de tratar reinicialização/desligamento do componente antes de separar os
+históricos. Os demais requisitos do mod permanecem pendentes.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.

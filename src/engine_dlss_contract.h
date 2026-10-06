@@ -183,6 +183,30 @@ inline bool read_state_viewport(std::span<const std::uint8_t> state,
     return true;
 }
 
+// Static chain verified from allocator -> constructor -> global -> the
+// CRenderInterface primary vtable's C0 getter. Runtime validation compares
+// that chain at the callback; it does not call the getter or claim ownership.
+inline constexpr std::uintptr_t renderer_global = 0x05A51950;
+inline constexpr std::uintptr_t shared_state_global = 0x0584DE48;
+inline constexpr std::uintptr_t renderer_vtable = 0x036E03C8;
+inline constexpr std::uintptr_t shared_state_getter = 0x01BD9700;
+inline constexpr std::uint32_t constructed_viewport = 0x5531D;
+struct StateConnection {
+    const void* renderer{};
+    const void* global_state{};
+    const void* observed_state{};
+    std::uintptr_t vtable_rva{}, getter_rva{};
+    std::uint32_t viewport{UINT32_MAX};
+    std::uint8_t sdk_initialized{};
+};
+inline bool known_state_connection(const engine_camera::TemporalContract* contract,
+    const StateConnection& connection) {
+    return contract == &engine_camera::remastered_500c && connection.renderer != nullptr &&
+        connection.global_state != nullptr && connection.global_state == connection.observed_state &&
+        connection.vtable_rva == renderer_vtable && connection.getter_rva == shared_state_getter &&
+        connection.viewport == constructed_viewport && connection.sdk_initialized == 1;
+}
+
 struct Identity {
     std::uint64_t pair_id{};
     std::uint32_t generation{};

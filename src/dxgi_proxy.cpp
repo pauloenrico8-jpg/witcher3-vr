@@ -30,6 +30,7 @@
 #include "engine_camera_layout.h"
 #include "engine_view_constants_contract.h"
 #include "engine_dlss_contract.h"
+#include "engine_dlss_resources.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
 #include "engine_scene_factory.h"
@@ -3556,6 +3557,8 @@ w3vr::engine_dlss::PipelineFn g_remastered_dlss_pipeline{};
 w3vr::engine_dlss::PrepareFn g_remastered_dlss_prepare{};
 w3vr::engine_dlss::NativeEvaluateFn g_remastered_dlss_native_evaluate{};
 thread_local w3vr::engine_dlss::Scope g_remastered_dlss_scope{};
+thread_local w3vr::engine_dlss_resources::CpuTags g_remastered_dlss_cpu_tags{};
+std::atomic<uint64_t> g_remastered_dlss_sdk_activity_serial{};
 std::mutex g_remastered_dlss_native_hook_mutex{};
 std::atomic<bool> g_remastered_dlss_native_hooks_ready{};
 w3vr::engine_dlss::GetFeatureFunctionFn g_remastered_sl_get_feature_function{};
@@ -31833,6 +31836,25 @@ bool read_remastered_dlss_state(void* state, void* descriptor,
     const auto* layout = w3vr::engine_dlss::selected(
         g_engine_camera_temporal_contract.load(std::memory_order_acquire));
     __try {
+        namespace c = w3vr::engine_dlss;
+        const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (module == 0 || layout != &c::remastered_500c) return false;
+        const auto* renderer = *reinterpret_cast<const void* const*>(module + c::renderer_global);
+        if (renderer == nullptr) return false;
+        const auto vtable = *reinterpret_cast<const uintptr_t*>(renderer);
+        if (vtable == 0) return false;
+        c::StateConnection connection{};
+        connection.renderer = renderer;
+        connection.global_state = *reinterpret_cast<const void* const*>(module + c::shared_state_global);
+        connection.observed_state = state;
+        connection.vtable_rva = vtable - module;
+        // Check the primary table before reading its known C0 slot.
+        if (connection.vtable_rva != c::renderer_vtable) return false;
+        connection.getter_rva = *reinterpret_cast<const uintptr_t*>(vtable + 0xC0) - module;
+        std::memcpy(&connection.viewport, static_cast<const uint8_t*>(state) + 0x180, 4);
+        connection.sdk_initialized = static_cast<const uint8_t*>(state)[0x16];
+        if (!c::known_state_connection(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire), connection)) return false;
         return w3vr::engine_dlss::read_counters(
             {static_cast<const uint8_t*>(state), 0x184},
             {static_cast<const uint8_t*>(descriptor), 0xC48}, layout, counters) &&
@@ -31844,6 +31866,17 @@ bool read_remastered_dlss_state(void* state, void* descriptor,
 struct RemasteredDlssScopeRestore {
     w3vr::engine_dlss::Scope previous;
     ~RemasteredDlssScopeRestore() { g_remastered_dlss_scope = previous; }
+};
+
+struct RemasteredDlssResourceScopeRestore {
+    w3vr::engine_dlss_resources::CpuTags previous{g_remastered_dlss_cpu_tags};
+    RemasteredDlssResourceScopeRestore() { g_remastered_dlss_cpu_tags = {}; }
+    ~RemasteredDlssResourceScopeRestore() {
+        // Nested native rendering could overwrite the parent's SDK tags.
+        // Restore its book-keeping, but never restore a usable receipt.
+        if (previous.active) previous.rejected = true;
+        g_remastered_dlss_cpu_tags = previous;
+    }
 };
 
 struct RemasteredDlssStageRestore {
@@ -31873,6 +31906,7 @@ uint8_t __fastcall hook_remastered_dlss_pipeline(void* pipeline, void* descripto
     const w3vr::engine_dlss::PipelineCall call{
         pipeline, descriptor, index0, index1, index2, flag};
     const RemasteredDlssScopeRestore restore{g_remastered_dlss_scope};
+    const RemasteredDlssResourceScopeRestore resource_restore{};
     g_remastered_dlss_scope = {};
     w3vr::engine_dlss::PipelineSnapshot snapshot{};
     if (g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
@@ -31909,6 +31943,7 @@ uintptr_t __fastcall hook_remastered_dlss_prepare(void* state, void* descriptor,
     namespace c = w3vr::engine_dlss;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const RemasteredDlssResourceScopeRestore resource_restore{};
     RemasteredDlssStageRestore restore{g_remastered_dlss_scope, false,
         c::known_stage_return(c::Stage::preparation, caller_rva)};
     restore.entered = begin_remastered_dlss_stage(
@@ -31921,11 +31956,15 @@ uintptr_t __fastcall hook_remastered_dlss_native_evaluate(void* state, void* des
     namespace c = w3vr::engine_dlss;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const RemasteredDlssResourceScopeRestore resource_restore{};
     RemasteredDlssStageRestore restore{g_remastered_dlss_scope, false,
         c::known_stage_return(c::Stage::evaluation, caller_rva)};
     restore.entered = begin_remastered_dlss_stage(
         c::Stage::evaluation, caller_rva, state, descriptor, resources, index0, index2);
-    if (restore.entered) ensure_remastered_dlss_options_hook_for_cached_function();
+    if (restore.entered) {
+        g_remastered_dlss_cpu_tags = w3vr::engine_dlss_resources::begin(g_remastered_dlss_scope);
+        ensure_remastered_dlss_options_hook_for_cached_function();
+    }
     return c::forward(g_remastered_dlss_native_evaluate,
         c::NativeEvaluateCall{state, descriptor, resources, index0, index2});
 }
@@ -41947,6 +41986,26 @@ bool read_remastered_evaluate_viewport(const void** inputs, uint32_t count,
     return read_remastered_streamline_viewport(viewport, result);
 }
 
+bool read_remastered_dlss_binding(const void* tags, uint32_t count,
+    w3vr::engine_dlss_resources::Binding& result) {
+    namespace r = w3vr::engine_dlss_resources;
+    if (tags == nullptr || count != 1) return false;
+    r::Binding candidate{};
+    const auto* layout = w3vr::engine_dlss::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    __try {
+        if (!r::read_tag({static_cast<const uint8_t*>(tags), r::tag_bytes}, layout, candidate.tag))
+            return false;
+        // A null resource removes a tag. Preserve that event without touching
+        // an address; it invalidates a four-resource evaluation receipt.
+        if (candidate.tag.resource != 0 && !r::read_resource(
+            {reinterpret_cast<const uint8_t*>(candidate.tag.resource), r::resource_bytes},
+            layout, candidate.resource)) return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    result = candidate;
+    return true;
+}
+
 bool remastered_dlss_options_gate() {
     return g_legacy_engine_layout_accepted.load(std::memory_order_acquire) &&
         g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
@@ -42072,16 +42131,30 @@ void ensure_remastered_dlss_options_hook_for_cached_function() {
 
 int __fastcall hook_remastered_sl_set_tag_for_frame(const void* frame_token,
     const void* viewport, const void* tags, uint32_t count, void* command_buffer) {
+    const auto activity_serial = g_remastered_dlss_sdk_activity_serial.fetch_add(1,
+        std::memory_order_acq_rel) + 1;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const w3vr::engine_dlss::TagCall call{frame_token, viewport, tags, count, command_buffer};
     w3vr::engine_dlss::Viewport snapshot{};
     const bool readable = read_remastered_streamline_viewport(viewport, snapshot);
+    w3vr::engine_dlss_resources::Binding binding{};
+    const bool binding_readable = g_remastered_dlss_cpu_tags.active &&
+        w3vr::engine_dlss::known_tag_return(caller_rva) &&
+        read_remastered_dlss_binding(tags, count, binding);
     const int result = w3vr::engine_dlss::forward(g_remastered_sl_set_tag_for_frame, call);
     const bool scoped = g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
         readable && frame_token != nullptr && w3vr::engine_dlss::known_tag_return(caller_rva) &&
         w3vr::engine_dlss::scoped_sdk_call(g_remastered_dlss_scope,
             g_remastered_dlss_scope.stage, remastered_dlss_identity(), snapshot);
+    if (g_remastered_dlss_cpu_tags.active) {
+        w3vr::engine_dlss_resources::observe(g_remastered_dlss_cpu_tags,
+            g_remastered_dlss_scope, remastered_dlss_identity(), snapshot,
+            scoped && binding_readable &&
+                g_remastered_dlss_sdk_activity_serial.load(std::memory_order_acquire) == activity_serial &&
+                g_remastered_streamline_observers_ready.load(std::memory_order_acquire)
+                    ? &binding : nullptr, call, caller_rva, result, activity_serial);
+    }
     if (g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
         g_config.runtime_diagnostics && readable && frame_token != nullptr &&
         w3vr::engine_dlss::known_tag_return(caller_rva) &&
@@ -42099,17 +42172,41 @@ int __fastcall hook_remastered_sl_set_tag_for_frame(const void* frame_token,
 
 int __fastcall hook_remastered_sl_evaluate_feature(uint32_t feature,
     const void* frame_token, const void** inputs, uint32_t count, void* command_buffer) {
+    const auto activity_serial = g_remastered_dlss_sdk_activity_serial.fetch_add(1,
+        std::memory_order_acq_rel) + 1;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const w3vr::engine_dlss::EvaluateCall call{feature, frame_token, inputs, count, command_buffer};
     w3vr::engine_dlss::Viewport snapshot{};
     const bool readable = read_remastered_evaluate_viewport(inputs, count, snapshot);
+    // Move the observations out before the SDK call. Any re-entrant tags or
+    // evaluation cannot consume or lend proof to this pending evaluation.
+    auto cpu_tags = g_remastered_dlss_cpu_tags;
+    g_remastered_dlss_cpu_tags = {};
+    const auto scope_before = g_remastered_dlss_scope;
+    const auto identity_before = remastered_dlss_identity();
     const int result = w3vr::engine_dlss::forward(g_remastered_sl_evaluate_feature, call);
     const bool scoped = g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
         readable && frame_token != nullptr && feature == w3vr::engine_dlss::dlss &&
         w3vr::engine_dlss::known_evaluate_return(feature, caller_rva) &&
         w3vr::engine_dlss::scoped_sdk_call(g_remastered_dlss_scope,
             w3vr::engine_dlss::Stage::evaluation, remastered_dlss_identity(), snapshot);
+    if (!scoped || g_remastered_dlss_sdk_activity_serial.load(std::memory_order_acquire) != activity_serial ||
+        !w3vr::engine_dlss_resources::same_scope(scope_before, g_remastered_dlss_scope) ||
+        !g_remastered_streamline_observers_ready.load(std::memory_order_acquire)) cpu_tags.rejected = true;
+    const auto cpu_receipt = w3vr::engine_dlss_resources::evaluate(cpu_tags,
+        scope_before, identity_before, snapshot, call, caller_rva, result, activity_serial);
+    if (cpu_receipt.valid && g_config.runtime_diagnostics &&
+        take_bounded_log_slot(g_remastered_dlss_counter_logs, 32)) {
+        const auto& b = cpu_receipt.bindings;
+        log_line("Modern DLSS CPU resources eye=%d pair=%llu viewport=%u command=%p depth=%p motion=%p input=%p output=%p input_extent=%ux%u output_extent=%ux%u; borrowed addresses only, GPU completion/ownership unverified",
+            cpu_receipt.identity.eye, static_cast<unsigned long long>(cpu_receipt.identity.pair_id),
+            cpu_receipt.viewport, cpu_receipt.command,
+            reinterpret_cast<void*>(b[0].resource.native), reinterpret_cast<void*>(b[1].resource.native),
+            reinterpret_cast<void*>(b[2].resource.native), reinterpret_cast<void*>(b[3].resource.native),
+            b[2].tag.extent.width, b[2].tag.extent.height,
+            b[3].tag.extent.width, b[3].tag.extent.height);
+    }
     if (g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
         g_config.runtime_diagnostics && readable && frame_token != nullptr &&
         w3vr::engine_dlss::known_evaluate_return(feature, caller_rva) &&

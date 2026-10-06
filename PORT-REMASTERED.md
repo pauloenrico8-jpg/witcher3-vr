@@ -716,3 +716,67 @@ Próximo: origem/alocação dos ids nativos em estado+180, liberação de recurs
 por viewport e ciclo de vida/históricos com conclusão GPU. Não usar `id | eye`
 nem ativar ids novos/reentrada sem essas provas. Demais hooks de câmera,
 culling, efeitos e gameplay continuam pendentes para o objetivo completo.
+
+## Estado compartilhado e Resource/ResourceTag modernos
+
+O alocador chamado em `01B720AB` reserva190bytes; o construtor `01B7C940`
+devolve self e `01B720C2` grava a global `0584DE48`. O getter leaf exato
+`01BD9700` lê essa global. RTTI confirma o slotC0 da vtable primária de
+CRenderInterface `036E03C8`. O leitor de estado agora compara em cada callback
+a instância da global `05A51950`, a vtable, o slotC0, o ponteiro global e o
+receptor real, além de self+16==1 e viewport self+180==0x5531D(348957).
+Não chama o getter/construtor, não confunde comparação de ponteiros com posse
+e não admite a tabela secundária nem receptor de outro estado.
+
+O construtor usa `slInit` e passa SDKVersion `0x2000e0001fedc`:2.14.1,
+magicfedc, conforme o empacotamento da
+[versão Streamline](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_version.h).
+Nunca chamar esse construtor para criar estado por olho. O teardown `01B74300`
+chama slShutdown se self+16, libera a global compartilhada e a zera; a outra
+rota `01B7C900` também chama slShutdown. A troca examinada em `01C121D0`
+usa feature1000(FrameGeneration), não feature0(DLSS). Não extrapolar essas
+duas chamadas para um ciclo completo de liberação por viewport. Free/Allocate
+ausentes na IAT do jogo não provam ausência no componente dinâmico.
+
+O produtor `01ED28F0` constrói Resource v1 GUID
+`3A9D70CF-2418-4B72-8391-13F8721C7261`:112bytes, header32, tipoBYTE+20,
+native*+28, memory*+30, view*+38, stateDWORD+40. ResourceTag v1 GUID
+`4C6A5AAD-B445-496C-87FF-1AF3845BE653`:64bytes, resource*+20,
+bufferTypeDWORD+28, lifecycleDWORD+2C, extent4DWORD+30. ABI também conferida
+em [tipos públicos Streamline](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_core_types.h);
+os stores e constantes do executável local estabelecem os offsets usados.
+Não incorpora cabeçalhos de terceiros nem usa o layout legado.
+
+`engine_dlss_resources.h` só interpreta header reconhecido/v1/next0 e Tex2D
+com ponteiro válido, memory/view nulos e estado conhecido. Tags removidas
+resource*=nullptr são eventos válidos de remoção, nunca recursos presentes.
+Contagem1, lifecycle1(ValidUntilPresent) e quatro papéis0/1/3/4 vêm da rota
+DLSS examinada. O produtor de avaliação usa estado0 para movimento e8(UAV)
+para saída; profundidade/cor usam o estado obtido pelo rastreador nativo.
+
+Uma lista CPU por avaliação exige a mesma identidade par/geração/olho,
+descritor/estado/contexto, C40/C44, viewport, token OPACO e comando*. Observa
+somente quatro tags bem sucedidas, sem repetições/remoções/extensões. Exige
+origem0/0 e extensão positiva, três entradas do mesmo tamanho, saída não menor
+e quatro endereços native distintos. Cada tag e avaliação incrementa um serial
+global: atividade intermediária, inclusive em outra thread, recusa a lista.
+Durante a avaliação a lista é retirada do TLS; atividade aninhada não pode
+emprestar dados. Suspender renderização nativa aninhada invalida a lista do pai.
+A tentativa consome a lista inclusive em erro; não há recibo reciclado.
+
+O recibo resultante é **CPU apenas**. Não guarda estruturas nativas da pilha,
+não dá AddRef, não desreferencia FrameToken/native* e não comprova geração da
+lista de comandos, conteúdo da textura, posse ou GPU completion. Campos
+`resource_ownership_verified` e `gpu_completion_verified` são false. Não o
+envia ao mecanismo legado de completion nem libera recursos/ativação stereo.
+Originais, arrays, argumentos e status continuam encaminhados intactos.
+
+DLL compilada e106/106CTest em11,72s. Testes de recursos recusam mistura de
+identidades, ponteiros, contadores, índices, comandos/tokens, atividade
+intermediária, remoção, alias, tipos/versões/chains desconhecidos e status de
+erro. Evidência `../artifacts/remastered-modern-dlss-resource-layout-evidence.json`
+fica LOCAL. Gate5c e stereo_reentry_verified permanecem fechados; nenhum
+teste de jogo/Quest/FPS ou instalação. Próximo: COM/device/queue ownership,
+identidade moderna da lista e epochReset, submissão/fence e término GPU,
+desligamento/reinit/troca do plugin antes de separar ids/históricos por olho.
+Não presumir que o unwrap QI legado do Streamline esteja portado para2.14.1.
