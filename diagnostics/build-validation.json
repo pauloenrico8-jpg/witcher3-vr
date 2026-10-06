@@ -1,0 +1,18 @@
+{
+  "UpstreamCommit": "79293dd5f523af11579e061aa0b777d65225911c",
+  "Branch": "quest3-motion-controls",
+  "Configuration": "Release",
+  "Generator": "Visual Studio 18 2026",
+  "SoftwareTestsPassed": 94,
+  "SoftwareTestsFailed": 0,
+  "TestLog": "build/quest3/Testing/Temporary/LastTest.log",
+  "DllSha256": "CADB6790A00DA9190F9A856FC7296297C03C41F346F936CA5B62D02938A1F7E3",
+  "InstalledInGame": false,
+  "HeadsetValidated": false,
+  "PhysicalCombatImplemented": false,
+  "NovigradMeasured": false,
+  "GameCompatibility": "Installed 5.00c rejected by legacy callback preflight",
+  "RemoteForkCreated": true,
+  "RemoteForkUrl": "https://github.com/pauloenrico8-jpg/witcher3-vr",
+  "RemoteDevelopmentBranch": "quest3-motion-controls"
+}
