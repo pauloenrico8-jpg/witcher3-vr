@@ -437,6 +437,9 @@ O código desta etapa funciona assim:
 2. Distingue o descritor da cena dos dados completos da imagem. O segundo
    contém o descritor em outra posição; por isso, suas câmeras têm endereços
    diferentes. A câmera secundária nova fica em frame+600, não frame+530.
+   São dois registros internos de uma mesma cena. Eles não são as imagens
+   esquerda e direita do Quest: essas ainda precisam de cenas renderizadas
+   separadamente pelo mod.
 3. Lê posição, orientação, campo de visão, pequenos deslocamentos de câmera
    e tamanho da imagem nos campos daquela versão. Esses deslocamentos,
    chamados jitter, ajudam algumas técnicas de suavização a combinar imagens.

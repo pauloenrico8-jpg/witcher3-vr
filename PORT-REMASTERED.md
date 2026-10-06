@@ -423,8 +423,11 @@ Inicialização continua publicando somente o contrato 4.04 após o preflight.
 | Registro anterior / FOV anterior | 460 / 468 | 530 / 538 |
 | Extent de entrada no descritor / frame | A3C / A4C | BDC / BEC |
 
-Os valores são offsets hexadecimais, não endereços absolutos. `00324430`
-chama a cópia `0228A970` para desc+10 e desc+5F0. A cópia transfere os campos
+Os valores são offsets hexadecimais, não endereços absolutos.
+Os dois registros internos pertencem ao mesmo descritor/frame; não representam
+por si só os dois olhos do HMD, que precisam de frames renderizados separados.
+
+`00324430` chama a cópia `0228A970` para desc+10 e desc+5F0. A cópia transfere os campos
 4C0/4C4/4C8/4CC e reconstrói a câmera com `0228AB40`. O rebuild lê esses
 campos em `0228B6D3` a `0228B71F`; divide duas vezes o deslocamento pela
 largura/altura, com limite mínimo 1. Sinal e convenções ao longo da rota ainda
