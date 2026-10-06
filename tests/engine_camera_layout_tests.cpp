@@ -24,13 +24,13 @@ void put(std::vector<std::uint8_t>& bytes, std::size_t offset, const T& value) {
 void test_remastered_native_fixture() {
     // Deliberately use independent native evidence offsets, not offsets read
     // back from the implementation. Frame+0x10 contains the descriptor; its
-    // cameras start at +0x10/+0x5F0. Prefix bytes contain different eye values.
+    // cameras start at +0x10/+0x5F0. Prefix bytes differ between the two internal camera records.
     std::vector<std::uint8_t> frame(1 + 0xBEC + 16, 0xA7);
     const std::array<float, 2> matrix_trap{800.0f, -900.0f};
-    for (std::size_t eye = 0; eye < 2; ++eye) {
-        const auto view = 1 + (eye == 0 ? 0x20 : 0x600);
+    for (std::size_t camera_index = 0; camera_index < 2; ++camera_index) {
+        const auto view = 1 + (camera_index == 0 ? 0x20 : 0x600);
         std::array<float, 14> core{};
-        core[0] = eye == 0 ? -0.032f : 0.032f;
+        core[0] = camera_index == 0 ? -0.032f : 0.032f;
         core[7] = 93.0f;
         core[10] = 1.2f;
         put(frame, view, core);
@@ -42,7 +42,7 @@ void test_remastered_native_fixture() {
         layout::Fields fields{};
         std::size_t camera_offset{};
         require(layout::camera_offset(layout::remastered_500c,
-            layout::Origin::frame, eye, camera_offset), "Missing frame camera");
+            layout::Origin::frame, camera_index, camera_offset), "Missing frame camera");
         require(layout::read_fields(std::span<const std::uint8_t>(frame)
             .subspan(1 + camera_offset, 0x5E0), layout::remastered_500c, fields),
             "Complete unaligned Remastered camera rejected");
@@ -52,7 +52,7 @@ void test_remastered_native_fixture() {
             "Camera read mixed matrix bytes, old fields, or the other camera");
         std::size_t descriptor_offset{};
         require(layout::camera_offset(layout::remastered_500c,
-            layout::Origin::descriptor, eye, descriptor_offset) &&
+            layout::Origin::descriptor, camera_index, descriptor_offset) &&
             camera_offset == descriptor_offset + 0x10,
             "Descriptor and frame anchors were conflated");
     }
