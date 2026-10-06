@@ -405,3 +405,71 @@ frame+600), constantes de renderização, jitter e a rota da tarefa nativa.
 Os callbacks adicionais e caches dos efeitos também precisam de verificação.
 Não liberar o bloqueio por contratos isolados; duração dos recursos e imagens
 reais precisam de verificação em execução.
+
+## Mapa de campos e classificação do escritor de câmera
+
+`src/engine_camera_layout.h` separa posições por versão, usando o contrato
+temporal já selecionado. Não seleciona a versão instalada nem autoriza hooks.
+Inicialização continua publicando somente o contrato 4.04 após o preflight.
+
+| Campo/origem | 4.04 | Remastered 5.00c |
+|---|---|---|
+| Tamanho da câmera | 510 | 5E0 |
+| Câmeras no descritor | 10 / 520 | 10 / 5F0 |
+| Descritor dentro do frame | 10 | 10 |
+| Câmeras dentro do frame | 20 / 530 | 20 / 600 |
+| Jitter dentro da câmera | 400 / 404 | 4C0 / 4C4 |
+| Viewport dentro da câmera | 408 / 40C | 4C8 / 4CC |
+| Registro anterior / FOV anterior | 460 / 468 | 530 / 538 |
+| Extent de entrada no descritor / frame | A3C / A4C | BDC / BEC |
+
+Os valores são offsets hexadecimais, não endereços absolutos. `00324430`
+chama a cópia `0228A970` para desc+10 e desc+5F0. A cópia transfere os campos
+4C0/4C4/4C8/4CC e reconstrói a câmera com `0228AB40`. O rebuild lê esses
+campos em `0228B6D3` a `0228B71F`; divide duas vezes o deslocamento pela
+largura/altura, com limite mínimo 1. Sinal e convenções ao longo da rota ainda
+precisam de prova. O bloco 400 é escrito como matriz em `0228B5DB..0228B6CB`.
+Os blocos de matriz dos snapshots continuam apenas registros de bytes;
+não foram estabelecidos como um contrato novo de escrita ou culling.
+
+`022B51E0` tem o ABI observado de cinco argumentos: RCX descritor, XMM1 e
+XMM2 valores, R9D largura e quinto argumento altura em entrada RSP+28.
+Grava os mesmos valores nas duas câmeras e reconstrói ambas. As três chamadas
+diretas verificadas têm propósitos distintos:
+
+| Retorno após CALL | Classe primária verificada / propósito |
+|---|---|
+| 01D59287 | RenderUberSampleNormalTaskBatch: aplicar amostra |
+| 01D59880 | A mesma tarefa: restaurar valores capturados antes do loop |
+| 01D59D27 | RenderFinal2DTaskBatch: substituição opcional de valores |
+
+As tabelas primárias são `037A6C20` (slot 2 -> `01D590A0`) e `037A6C00`
+(slot 2 -> `01D59CD0`), verificadas por COL/RTTI, isto é, registros de tipos
+do executável. Essas chamadas não substituem as oito rotas antigas. O mapa
+registra seus propósitos, mas a instalação do escritor e a autoridade
+temporal/culling antiga continuam recusando o contrato Remastered.
+
+Os snapshots e três verificadores de campos das câmeras agora usam o mapa;
+o registro da fábrica guarda o mapa junto com a amostra. Leituras truncadas
+ou campos fora do intervalo não publicam resultados parciais. Um contrato
+nulo ou desconhecido não recebe offsets antigos como fallback.
+
+Compilação e 103/103 CTest passaram. O teste novo inclui dados deliberadamente
+diferentes em +400/+468 na câmera nova, câmeras primária/secundária distintas,
+origens frame/descritor, desalinhamento, truncamento, overflow e recusa de
+contratos não selecionados. É uma verificação de memória simulada no PC,
+sem execução do jogo. Logs locais `../artifacts/*camera-layout-final-20261006.log`;
+evidência local `../artifacts/remastered-camera-layout-evidence.json`.
+
+Outra candidata, `01C1D550`, escreve jitter diretamente em frame+4E0/AC0 e
+usa extent fixo 3840x2160. O chamador `01D03120` é slot 2 da tabela primária
+verificada `0394FA88`, CRenderCommand_TakeUberScreenshot. Essa rota de
+captura também não deve ser promovida à rota temporal da imagem normal.
+Sua evidência continua local em `../artifacts/remastered-inline-jitter-candidate.json`.
+
+Próximo passo: seguir RenderNormalEpilogueTaskBatch (`01D57F90`), sua chamada
+`01D583BF -> 01C21200` e as rotas de preparação da imagem normal; conferir
+argumentos, destino de jitter e dados de shader antes de portar o escritor.
+O comando normal chama o core `01C13630` em `01D0554C`: o retorno correto
+é `01D05551`, corrigindo a anotação anterior do handoff. Os demais hooks de
+câmera, constantes, caches dos efeitos e recursos continuam pendentes.
