@@ -12,5 +12,7 @@
   "PhysicalCombatImplemented": false,
   "NovigradMeasured": false,
   "GameCompatibility": "Installed 5.00c rejected by legacy callback preflight",
-  "RemoteForkCreated": false
+  "RemoteForkCreated": true,
+  "RemoteForkUrl": "https://github.com/pauloenrico8-jpg/witcher3-vr",
+  "RemoteDevelopmentBranch": "quest3-motion-controls"
 }
