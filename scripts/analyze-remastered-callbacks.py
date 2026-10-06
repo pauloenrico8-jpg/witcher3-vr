@@ -27,6 +27,22 @@ def ensure_report_destination(destination: Path, *inputs: Path):
             raise ValueError("Report destination would overwrite an input file")
 
 
+def register_family(name):
+    aliases = {"eax": "rax", "ax": "rax", "al": "rax", "ah": "rax",
+        "ebx": "rbx", "bx": "rbx", "bl": "rbx", "bh": "rbx",
+        "ecx": "rcx", "cx": "rcx", "cl": "rcx", "ch": "rcx",
+        "edx": "rdx", "dx": "rdx", "dl": "rdx", "dh": "rdx",
+        "esi": "rsi", "si": "rsi", "sil": "rsi",
+        "edi": "rdi", "di": "rdi", "dil": "rdi",
+        "ebp": "rbp", "bp": "rbp", "bpl": "rbp",
+        "esp": "rsp", "sp": "rsp", "spl": "rsp"}
+    return aliases.get(name, re.sub(r"(r(?:[89]|1[0-5]))[dwb]$", r"\1", name))
+
+
+NONVOLATILE_X64 = {"rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15"}
+TERMINALS = {"ret", "retf", "iret", "iretd", "iretq", "int3", "ud2", "hlt"}
+
+
 class Image:
     def __init__(self, path: Path):
         self.data = path.read_bytes()
@@ -157,18 +173,27 @@ class Image:
             self._function_chunks = chunks
         return self._function_chunks[primary]
 
-    def _bounded_switch(self, history, chunks):
+    def _bounded_switch(self, history, chunks, known_bases=None):
         """Recognize only the checked unsigned, image-relative MSVC table form.
 
-        cmp index32,N; ja default; lea base,[rip->image base];
+        cmp index32,N; ja default; [lea base,[rip->image base];]
         mov target32,[base+index64*4+table]; add target64,base; jmp target64.
+        A hoisted LEA is accepted only on this contiguous decoded path, with
+        no subsequent register write. Calls invalidate volatile bases; x64
+        Windows callee-saved bases may survive a call. No cross-path guess.
         Unknown shapes remain unresolved. A raw table/offset match never seeds
         code. Targets must stay in this exact unwind owner, outside table data.
         """
-        if len(history) < 6:
+        if len(history) < 5:
             return None
-        compare, above, base, load, add, jump = history[-6:]
-        if [x.mnemonic for x in history[-6:]] != ["cmp", "ja", "lea", "mov", "add", "jmp"]:
+        immediate_base = (len(history) >= 6 and
+            [x.mnemonic for x in history[-6:]] == ["cmp", "ja", "lea", "mov", "add", "jmp"])
+        if immediate_base:
+            compare, above, base, load, add, jump = history[-6:]
+        elif [x.mnemonic for x in history[-5:]] == ["cmp", "ja", "mov", "add", "jmp"]:
+            compare, above, load, add, jump = history[-5:]
+            base = None
+        else:
             return None
         def reg64(insn, operand):
             if operand.type != X86_OP_REG:
@@ -177,20 +202,43 @@ class Image:
             aliases = {"eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
                        "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp"}
             return aliases.get(name, name[:-1] if re.fullmatch(r"r(?:[89]|1[0-5])d", name) else name)
-        if any(len(x.operands) != n for x, n in zip(history[-6:], [2, 1, 2, 2, 2, 1])):
+        if any(len(x.operands) != n for x, n in zip([compare, above, load, add, jump], [2, 1, 2, 2, 1])):
             return None
         index, maximum = compare.operands
         if index.type != X86_OP_REG or index.size != 4 or maximum.type != X86_OP_IMM or not 0 <= maximum.imm <= 255:
             return None
         if above.operands[0].type != X86_OP_IMM:
             return None
-        base_reg, image_base = base.operands
-        if base_reg.type != X86_OP_REG or base_reg.size != 8 or image_base.type != X86_OP_MEM or image_base.mem.base != X86_REG_RIP or image_base.mem.index or base.address + base.size + image_base.mem.disp != 0:
-            return None
         dest, source = load.operands
         if dest.type != X86_OP_REG or dest.size != 4 or source.type != X86_OP_MEM or source.size != 4:
             return None
         memory = source.mem
+        if base is None:
+            base_name = load.reg_name(memory.base)
+            # Work backwards to the latest definition, not merely any earlier
+            # matching LEA. Partial-register writes also invalidate the base.
+            for previous in reversed(history[:-3]):
+                if previous.mnemonic == "call" and base_name not in NONVOLATILE_X64:
+                    return None
+                _, writes = previous.regs_access()
+                names = [register_family(previous.reg_name(register)) for register in writes]
+                if base_name in names:
+                    if previous.mnemonic != "lea":
+                        return None
+                    base = previous
+                    break
+            if base is None:
+                # The optional fact is supplied only by the normal-entry CFG
+                # meet below: EVERY currently reachable predecessor must keep
+                # the SAME checked definition. Fragment seeding is not proof.
+                base = (known_bases or {}).get(base_name)
+                if base is None:
+                    return None
+        if len(base.operands) != 2:
+            return None
+        base_reg, image_base = base.operands
+        if base_reg.type != X86_OP_REG or base_reg.size != 8 or image_base.type != X86_OP_MEM or image_base.mem.base != X86_REG_RIP or image_base.mem.index or base.address + base.size + image_base.mem.disp != 0:
+            return None
         if memory.base != base_reg.reg or memory.scale != 4 or reg64(compare, index) != load.reg_name(memory.index):
             return None
         dest64 = reg64(load, dest)
@@ -211,7 +259,62 @@ class Image:
         if not owned(above.operands[0].imm) or any(not owned(t) or table <= t < table_end for t in targets):
             return None
         return {"JumpRva": jump.address, "TableRva": table, "EntryCount": count,
-                "DefaultRva": above.operands[0].imm, "Targets": list(targets)}
+                "DefaultRva": above.operands[0].imm, "Targets": list(targets),
+                "ImageBaseDefinitionRva": base.address, "CompareRva": compare.address}
+
+    def _image_base_facts(self, decoded, switches, entry):
+        """Must-analysis of image-base definitions on checked normal-entry paths.
+
+        At joins, intersect definitions; an unknown/clobbering predecessor
+        discards the fact. Loops are revisited when the meet loses information.
+        Unresolved indirect edges have no asserted destination. The caller
+        uses this only for the sole remaining indirect jump, then rechecks
+        after adding its actual checked table edges.
+        """
+        before = {entry: {}}
+        pending = [entry]
+        while pending:
+            address = pending.pop()
+            insn = decoded.get(address)
+            if insn is None:
+                continue
+            after = dict(before[address])
+            _, writes = insn.regs_access()
+            for register in writes:
+                after.pop(register_family(insn.reg_name(register)), None)
+            if insn.mnemonic == "call":
+                after = {name: definition for name, definition in after.items()
+                         if name in NONVOLATILE_X64}
+            if insn.mnemonic == "lea" and len(insn.operands) == 2:
+                dst, src = insn.operands
+                if (dst.type == X86_OP_REG and dst.size == 8 and src.type == X86_OP_MEM
+                        and src.mem.base == X86_REG_RIP and not src.mem.index
+                        and insn.address + insn.size + src.mem.disp == 0):
+                    after[insn.reg_name(dst.reg)] = insn
+            targets = []
+            if insn.mnemonic not in TERMINALS:
+                if insn.group(CS_GRP_JUMP):
+                    operand = insn.operands[0]
+                    if operand.type == X86_OP_IMM:
+                        targets.append(operand.imm)
+                    elif address in switches:
+                        targets.extend(switches[address]["Targets"])
+                    if insn.mnemonic != "jmp":
+                        targets.append(address + insn.size)
+                else:
+                    targets.append(address + insn.size)
+            for target in targets:
+                if target not in decoded:
+                    continue
+                previous = before.get(target)
+                joined = after if previous is None else {
+                    name: definition for name, definition in previous.items()
+                    if name in after and definition.address == after[name].address}
+                if previous is None or {k: v.address for k, v in joined.items()} != {
+                        k: v.address for k, v in previous.items()}:
+                    before[target] = dict(joined)
+                    pending.append(target)
+        return before
 
     def reachable_instructions(self, rva: int):
         """Bounded control-flow decode; never decode data after a return as code.
@@ -221,44 +324,83 @@ class Image:
         All other indirect jumps remain explicitly unresolved.
         """
         chunks = self.function_chunks(rva)
+        entry = self.primary_function_rva(rva)
         starts = [begin for begin, _ in chunks]
         pending = list(starts)
         decoded = {}
         indirect = set()
         failures = set()
         switches = {}
-        while pending:
-            address = pending.pop()
-            history = []
-            while address not in decoded:
-                index = bisect.bisect_right(starts, address) - 1
-                if index < 0 or not chunks[index][0] <= address < chunks[index][1]:
-                    break
-                end = chunks[index][1]
-                instruction = next(self.decoder.disasm(self.read(address, min(15, end - address)),
-                                                      address, count=1), None)
-                if instruction is None:
-                    failures.add(address)
-                    break
-                decoded[address] = instruction
-                history.append(instruction)
-                history = history[-6:]
-                if instruction.mnemonic in {"ret", "retf", "iret", "iretd", "iretq", "int3", "ud2", "hlt"}:
-                    break
-                if instruction.group(CS_GRP_JUMP):
-                    operand = instruction.operands[0]
-                    if operand.type == X86_OP_IMM:
-                        pending.append(operand.imm)
-                    else:
-                        switch = self._bounded_switch(history, chunks)
-                        if switch is None:
-                            indirect.add(address)
-                        else:
-                            switches[address] = switch
-                            pending.extend(switch["Targets"])
-                    if instruction.mnemonic == "jmp":
+        cfg_switches = set()
+        while True:
+            while pending:
+                address = pending.pop()
+                history = []
+                while address not in decoded:
+                    index = bisect.bisect_right(starts, address) - 1
+                    if index < 0 or not chunks[index][0] <= address < chunks[index][1]:
                         break
-                address += instruction.size
+                    end = chunks[index][1]
+                    instruction = next(self.decoder.disasm(self.read(address, min(15, end - address)),
+                                                          address, count=1), None)
+                    if instruction is None:
+                        failures.add(address)
+                        break
+                    decoded[address] = instruction
+                    history.append(instruction)
+                    history = history[-128:]
+                    if instruction.mnemonic in TERMINALS:
+                        break
+                    if instruction.group(CS_GRP_JUMP):
+                        operand = instruction.operands[0]
+                        if operand.type == X86_OP_IMM:
+                            pending.append(operand.imm)
+                        else:
+                            switch = self._bounded_switch(history, chunks)
+                            if switch is None:
+                                indirect.add(address)
+                            else:
+                                switches[address] = switch
+                                pending.extend(switch["Targets"])
+                        if instruction.mnemonic == "jmp":
+                            break
+                    address += instruction.size
+            facts = self._image_base_facts(decoded, switches, entry)
+            # Do not guess incoming edges from another unknown indirect jump.
+            # Seeded fragments may decode bytes, but only normal-entry facts
+            # can prove this hoisted-register form.
+            if len(indirect) != 1:
+                break
+            jump_address = next(iter(indirect))
+            history = [decoded[jump_address]]
+            ending = {i.address + i.size: i for i in decoded.values()}
+            for _ in range(5):
+                previous = ending.get(history[0].address)
+                if previous is None:
+                    break
+                history.insert(0, previous)
+            switch = self._bounded_switch(history, chunks, facts.get(jump_address, {}))
+            if switch is None:
+                break
+            switches[jump_address] = switch
+            cfg_switches.add(jump_address)
+            indirect.remove(jump_address)
+            pending.extend(switch["Targets"])
+        hoisted_switches = {address for address, switch in switches.items()
+                           if switch["ImageBaseDefinitionRva"] < switch["CompareRva"]}
+        if cfg_switches or hoisted_switches:
+            # New case edges can introduce a clobbering back-edge. Recompute
+            # the meet before calling any of those sites verified evidence.
+            facts = self._image_base_facts(decoded, switches, entry)
+            if cfg_switches and any(address in facts for address in indirect):
+                raise ValueError("Another unresolved indirect edge prevents image-base proof")
+            for address in cfg_switches | hoisted_switches:
+                switch = switches[address]
+                base = decoded.get(switch["ImageBaseDefinitionRva"])
+                name = base.reg_name(base.operands[0].reg) if base is not None else None
+                definition = facts.get(address, {}).get(name)
+                if definition is None or definition.address != switch["ImageBaseDefinitionRva"]:
+                    raise ValueError("Switch image base is not preserved on all normal-entry paths")
         ordered = [decoded[address] for address in sorted(decoded)]
         # Refuse targets in the middle of another instruction, and never turn
         # table bytes into code even if an unwind fragment spans that data.
