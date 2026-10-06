@@ -536,6 +536,44 @@ extraído do executável foi autorizado para publicação. A instalação, os sa
 os backups e os arquivos de terceiros foram preservados. O bloqueio global
 para 5.00c permanece.
 
+## Chamadas modernas de recursos e DLSS: 6 de outubro
+
+Adaptei a forma nova de encaminhar os recursos de imagem e a execução do DLSS.
+Essas chamadas agora usam cinco argumentos, incluindo a lista de comandos da
+placa de vídeo. Usar a forma antiga trocaria os argumentos e poderia corromper
+o trabalho do jogo. Os novos pontos continuam dentro do bloqueio global de
+compatibilidade; não estão instalados no jogo.
+
+O fluxo do código é este:
+
+1. O contrato de dados separa o contador de renderização do índice usado para
+   obter o identificador do quadro. Na versão nova, são dois campos vizinhos,
+   com funções diferentes. O código os lê sem alterar os registros do jogo.
+2. A identificação da área de desenho é conferida antes de interpretar seus
+   dados. Objetos desconhecidos continuam sendo encaminhados ao componente
+   original, mas não valem como prova de que a adaptação os reconheceu.
+3. As chamadas preservam o identificador completo do quadro, os recursos,
+   a lista inteira de entradas, a lista de comandos e a resposta original.
+   Um erro continua sendo um erro; nenhum sucesso é inventado.
+4. Os observadores distinguem DLSS comum e reconstrução de raios. Eles apenas
+   registram chamadas reconhecidas; isso não prova uma imagem pronta na GPU.
+5. A instalação futura exige os três pontos modernos em conjunto. Se falhar,
+   tenta retirar o que criou e mantém os registros de sucesso desativados.
+   Nunca troca os números das áreas de desenho para separar olhos nesta etapa.
+
+A DLL compilou e 105/105 CTest passaram (11,68 segundos). O teste novo usa
+endereços fictícios de 64 bits que não podem ser lidos para conferir que os
+identificadores opacos não são truncados. Confere também vários recursos,
+argumentos opcionais, respostas de erro, campos vizinhos distintos e leituras
+incompletas. Esses testes não executam o jogo nem o headset.
+
+A evidência local mostrou as chamadas do Streamline em funções diferentes da
+candidata de pipeline anteriormente investigada. Essa candidata não foi
+promovida a função de DLSS. Os novos relatórios permanecem fora do fork, em
+`../artifacts/remastered-modern-*.json`. Próximo passo: conferir a obtenção das
+opções do DLSS e a origem do estado de avaliação, antes de separar as áreas
+e os históricos dos olhos ou repetir o preparo de um quadro.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.
