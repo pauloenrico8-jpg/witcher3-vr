@@ -500,6 +500,42 @@ no relatório local `../artifacts/normal-camera-switch-port-validation.json`.
 Nenhum teste desta etapa comprova VR no Quest, combate físico ou 60 FPS.
 Os novos dados extraídos do executável continuam locais.
 
+## Preparação dos dados para o DLSS: 6 de outubro
+
+A versão instalada usa uma forma nova de chamar o Streamline, o componente
+que recebe os dados usados pelo DLSS. A função antiga recebia números para
+identificar a imagem e a área de desenho; a nova recebe referências a objetos.
+O código agora separa essas duas formas de chamada.
+
+O fluxo da adaptação é este:
+
+1. A versão aceita escolhe o endereço da função e o lugar onde estão o número
+   da imagem e o registro de que seus dados já foram preparados. Não existe
+   uma soma única aplicada aos campos da versão antiga.
+2. Na chamada normal nova, o mod acompanha o estado e o descritor realmente
+   recebidos do jogo, apenas enquanto essa chamada está em execução. Ele não
+   procura o estado novo usando a tabela global da versão antiga.
+3. A adaptação do Streamline confere a identificação e a versão dos dados,
+   lê o jitter (pequeno deslocamento usado para suavizar a imagem) e preserva
+   os objetos originais. Encaminha a chamada e devolve sua resposta real.
+4. O registro de preparo só é aceito depois de uma resposta de sucesso,
+   para o mesmo par de imagens, olho e geração. A chamada antiga também foi
+   corrigida para registrar sucesso apenas depois dessa resposta.
+5. Repetir o preparo para o segundo olho no Remastered permanece desativado.
+   Ainda falta adaptar, em conjunto, a identificação dos recursos de cada
+   imagem, as áreas de desenho separadas e a execução do DLSS. Os campos e
+   as chamadas da versão antiga não são usados como substitutos.
+
+A DLL compilou e 104/104 CTest passaram (14,31 segundos). O teste novo usa
+memória controlada do PC para conferir campos por versão, leitura incompleta,
+identificação errada, sinalizador inválido e recusas de registros de sucesso.
+Isso não executa o jogo nem comprova imagens, controles ou FPS no Quest.
+A evidência nova permanece local em
+`../artifacts/remastered-view-constants-abi-evidence.json`; nenhum dado novo
+extraído do executável foi autorizado para publicação. A instalação, os saves,
+os backups e os arquivos de terceiros foram preservados. O bloqueio global
+para 5.00c permanece.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.

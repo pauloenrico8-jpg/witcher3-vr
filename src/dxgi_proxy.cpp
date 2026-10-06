@@ -28,6 +28,7 @@
 #include "legacy_engine_preflight.h"
 #include "engine_camera_temporal.h"
 #include "engine_camera_layout.h"
+#include "engine_view_constants_contract.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
 #include "engine_scene_factory.h"
@@ -2089,6 +2090,9 @@ using DXGIDeclareAdapterRemovalSupportFn = HRESULT(WINAPI*)();
 using DXGIGetDebugInterface1Fn = HRESULT(WINAPI*)(UINT, REFIID, void**);
 using DXGIDisableVBlankVirtualizationFn = HRESULT(WINAPI*)();
 using SlSetConstantsFn = int(__fastcall*)(void*, uint32_t, uint32_t);
+// Modern Streamline uses three references (pointers at the native ABI), not
+// two 32-bit ids. Keep its trampoline separate from the 1.5 implementation.
+using RemasteredSlSetConstantsFn = int(__fastcall*)(const void*, const void*, const void*);
 using SlSetTagFn = int(__fastcall*)(const void*, uint32_t, uint32_t, const void*);
 using SlSetFeatureConstantsFn = int(__fastcall*)(uint32_t, const void*, uint32_t, uint32_t);
 using SlEvaluateFeatureFn = int(__fastcall*)(void*, uint32_t, uint32_t, uint32_t);
@@ -3539,6 +3543,8 @@ bool g_clean_mono_render_views_valid{};
 XrView g_clean_mono_dlss_render_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 bool g_clean_mono_dlss_render_views_valid{};
 SlSetConstantsFn g_sl_set_constants{};
+RemasteredSlSetConstantsFn g_remastered_sl_set_constants{};
+thread_local w3vr::engine_view_constants::Observation g_remastered_constants_observation{};
 SlSetTagFn g_sl_set_tag{};
 SlSetFeatureConstantsFn g_sl_set_feature_constants{};
 SlEvaluateFeatureFn g_sl_evaluate_feature{};
@@ -29435,6 +29441,44 @@ FARPROC real_proc(const char* name) {
 }
 
 void __fastcall hook_engine_view_constants(void* self, void* view_data, char flags) {
+    const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* layout = w3vr::engine_view_constants::selected(contract);
+    if (contract == &w3vr::engine_camera::remastered_500c) {
+        const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+        const auto previous = g_remastered_constants_observation;
+        g_remastered_constants_observation = {};
+        if (layout != nullptr && self != nullptr && view_data != nullptr &&
+            caller_rva == w3vr::engine_view_constants::remastered_builder_return &&
+            g_engine_render_eye >= 0 && g_engine_render_eye <= 1 &&
+            g_engine_render_pair_id != 0 && g_engine_render_pair_id != UINT64_MAX) {
+            w3vr::engine_view_constants::BuilderSnapshot snapshot{};
+            bool readable{};
+            __try {
+                readable = w3vr::engine_view_constants::read_builder(
+                    {static_cast<const uint8_t*>(self), layout->state_builder_frame + sizeof(uint32_t)},
+                    {static_cast<const uint8_t*>(view_data), layout->descriptor_frame_id + sizeof(uint32_t)},
+                    layout, snapshot);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                readable = false;
+            }
+            if (readable) {
+                g_remastered_constants_observation = {self, view_data,
+                    g_engine_render_pair_id, g_engine_render_generation,
+                    snapshot.frame_id, g_engine_render_eye};
+            }
+        }
+        // Observe the actual receiver only inside this native call. Modern
+        // guard writes/re-entry stay disabled until tags/evaluation/viewport
+        // routing are ported as well. Never use the old global state getter.
+        g_engine_view_constants(self, view_data, flags);
+        g_remastered_constants_observation = previous;
+        return;
+    }
+    if (contract != &w3vr::engine_camera::legacy_404) {
+        g_engine_view_constants(self, view_data, flags);
+        return;
+    }
     const auto call = g_config.runtime_diagnostics
         ? g_engine_view_call_count.fetch_add(1) + 1
         : 0;
@@ -29503,7 +29547,10 @@ void install_engine_view_constants_hook() {
         return;
     }
 
-    constexpr uintptr_t kEngineViewConstantsRva = 0x01CFE280;
+    const auto* layout = w3vr::engine_view_constants::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) || layout == nullptr) return;
+    const uintptr_t kEngineViewConstantsRva = layout->builder_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineViewConstantsRva : nullptr;
     if (target != nullptr &&
@@ -31741,7 +31788,9 @@ uint32_t __fastcall hook_engine_upscaler_pipeline(
         g_sequential_pipeline_eye = g_engine_render_eye;
     }
 
-    if (dlss_sequential_mode_active() && g_engine_render_eye == 0 &&
+    if (w3vr::engine_view_constants::legacy_reentry_supported(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire)) &&
+        dlss_sequential_mode_active() && g_engine_render_eye == 0 &&
         frame_data != nullptr) {
         __try {
             constexpr uintptr_t kStreamlineInterfaceRva = 0x057F59E0;
@@ -31852,7 +31901,10 @@ uint32_t __fastcall hook_engine_upscaler_pipeline(
 }
 
 void install_engine_upscaler_pipeline_hook() {
-    if (!dlss_sequential_mode_active() ||
+    if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) ||
+        !w3vr::engine_view_constants::legacy_reentry_supported(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire)) ||
+        !dlss_sequential_mode_active() ||
         g_engine_upscaler_pipeline != nullptr) {
         return;
     }
@@ -41656,7 +41708,39 @@ uint32_t streamline_eye() {
     return static_cast<uint32_t>(g_present_count.load() & 1ull);
 }
 
-void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uint32_t viewport) {
+int __fastcall hook_remastered_sl_set_constants(
+    const void* constants, const void* frame_token, const void* viewport) {
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const auto observation = g_remastered_constants_observation;
+    w3vr::engine_view_constants::ConstantsSnapshot snapshot{};
+    bool readable{};
+    if (constants != nullptr && frame_token != nullptr && viewport != nullptr) {
+        __try {
+            readable = w3vr::engine_view_constants::read_remastered_constants(
+                {static_cast<const uint8_t*>(constants),
+                    w3vr::engine_view_constants::remastered_constants_bytes}, snapshot);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            readable = false;
+        }
+    }
+    // Forward all original references unchanged and return the real result.
+    // A FrameToken is opaque. The observed descriptor's frame id is used only
+    // as a diagnostic receipt number; it is never passed in place of a token.
+    const int result = g_remastered_sl_set_constants(constants, frame_token, viewport);
+    if (dlss_sequential_mode_active() &&
+        w3vr::engine_view_constants::receipt_allowed(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire),
+            observation, caller_rva, g_engine_render_pair_id,
+            g_engine_render_generation, g_engine_render_eye, result, readable)) {
+        publish_sequential_dlss_constants_receipt(
+            static_cast<uint32_t>(observation.eye), observation.pair_id,
+            observation.generation, observation.frame_id, snapshot.reset);
+    }
+    return result;
+}
+
+int __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uint32_t viewport) {
     const uint32_t eye = streamline_eye();
     const uint32_t source_viewport = viewport;
     if (constants != nullptr && eye <= 1 &&
@@ -41772,15 +41856,14 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
         }
     }
 
-    if (constants != nullptr && dlss_sequential_mode_active() && eye <= 1 &&
+    const bool sequential_receipt_pending = constants != nullptr &&
+        dlss_sequential_mode_active() && eye <= 1 &&
         g_engine_render_eye == static_cast<int>(eye) &&
-        g_engine_render_pair_id != 0 &&
-        g_engine_render_pair_id != UINT64_MAX) {
-        publish_sequential_dlss_constants_receipt(
-            eye, g_engine_render_pair_id, g_engine_render_generation,
-            frame_token,
-            static_cast<const uint8_t*>(constants)[0x19F] != 0);
-    }
+        g_engine_render_pair_id != 0 && g_engine_render_pair_id != UINT64_MAX;
+    const uint64_t receipt_pair = g_engine_render_pair_id;
+    const uint32_t receipt_generation = g_engine_render_generation;
+    const bool receipt_reset = sequential_receipt_pending &&
+        static_cast<const uint8_t*>(constants)[0x19F] != 0;
 
     // [FIX:NATIVE-DLSS-OWNER-ISOLATION V1416 2/8] Public Streamline owns a
     // distinct viewport/history per Mode-3 eye. OptiScaler keeps its native
@@ -41918,7 +42001,14 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
             (source_viewport & 0xFFFFu) | ((viewport & 0xFFFFu) << 16),
             jitter_x_bits, jitter_y_bits);
     }
-    g_sl_set_constants(constants, frame_token, viewport);
+    const int result = g_sl_set_constants(constants, frame_token, viewport);
+    if (result == 0 && sequential_receipt_pending &&
+        g_engine_render_eye == static_cast<int>(eye) &&
+        g_engine_render_pair_id == receipt_pair &&
+        g_engine_render_generation == receipt_generation) {
+        publish_sequential_dlss_constants_receipt(
+            eye, receipt_pair, receipt_generation, frame_token, receipt_reset);
+    }
 
     if (asymmetric_sl.active) {
         const auto audit_index = g_asymmetric_sl_logs.fetch_add(
@@ -41959,6 +42049,7 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
                 asymmetric_sl.jitter_and_scale[1] + writer.routed_jitter_y);
         }
     }
+    return result;
 }
 
 uint32_t streamline_viewport_for_eye(uint32_t viewport) {
@@ -43636,9 +43727,32 @@ void install_ngx_dlaa_loader_hooks() {
 }
 
 void install_streamline_hook() {
+    const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) ||
+        w3vr::engine_view_constants::selected(contract) == nullptr) return;
     const bool mode3_aer_afw =
         puredark_afw_mode3_aer_any_route_configured();
     if (!temporal_backend_is_dlss() && !mode3_aer_afw) {
+        return;
+    }
+
+    if (contract == &w3vr::engine_camera::remastered_500c) {
+        // Only transparent constants forwarding is ported here. The other
+        // modern exports have different ABIs too; no legacy tag/evaluation
+        // detour may be installed by falling through this branch.
+        if (!dlss_sequential_mode_active() || g_remastered_sl_set_constants != nullptr) return;
+        auto* interposer = GetModuleHandleW(L"sl.interposer.dll");
+        auto* target = interposer != nullptr ? GetProcAddress(interposer, "slSetConstants") : nullptr;
+        if (target == nullptr) return;
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_remastered_sl_set_constants),
+                reinterpret_cast<void**>(&g_remastered_sl_set_constants)) != MH_OK) return;
+        if (MH_EnableHook(target) != MH_OK) {
+            MH_RemoveHook(target);
+            g_remastered_sl_set_constants = nullptr;
+            log_line("Modern Streamline constants hook could not be enabled");
+            return;
+        }
+        log_line("Modern Streamline constants observer installed; stereo tag/evaluation port still pending");
         return;
     }
 
