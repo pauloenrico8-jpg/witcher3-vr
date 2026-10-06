@@ -574,6 +574,48 @@ promovida a função de DLSS. Os novos relatórios permanecem fora do fork, em
 opções do DLSS e a origem do estado de avaliação, antes de separar as áreas
 e os históricos dos olhos ou repetir o preparo de um quadro.
 
+## Entrada real e opções do DLSS: 6 de outubro, continuação
+
+A análise encontrou a entrada real do DLSS no Remastered. A antiga candidata
+continua sem esse papel confirmado. Adaptei a entrada encontrada, os pontos
+de preparo e avaliação e o acesso à função que recebe as opções do DLSS.
+Isso prepara a separação das imagens dos olhos, mas ainda não a executa.
+
+O código trabalha assim:
+
+1. A ferramenta de análise segue duas tabelas de nove modos. Ela confere o
+   endereço usado pelas tabelas mesmo quando foi calculado antes delas.
+   Se um caminho conhecido alterar esse endereço, recusa a interpretação.
+2. A entrada do DLSS encaminha seus seis argumentos e conserva a resposta
+   original de um byte. Os números de recursos passam intactos. A forma
+   antiga de sete argumentos continua restrita à versão antiga do jogo.
+3. Durante uma chamada reconhecida, o código acompanha o par de imagens,
+   o olho, o quadro e o descritor, que é o pacote de dados da imagem. Usa
+   o estado e a lista de recursos que o próprio jogo entrega aos métodos.
+4. Confere que preparo, avaliação e chamadas do componente de imagem usam
+   os mesmos objetos e a mesma área de desenho. Uma chamada aninhada ou
+   desconhecida não herda essa associação. Uma diferença recusa a prova.
+5. A função de opções é obtida pelo componente original. O código conserva
+   o endereço devolvido e acompanha a função nesse endereço, inclusive se
+   o jogo já o havia guardado. As opções, a espera ao trocar configurações
+   e as respostas originais continuam intactas. Um erro não vira sucesso.
+6. Nenhum identificador de área é trocado e nenhum preparo é repetido nesta
+   etapa. Ainda é preciso verificar recursos, históricos independentes e
+   sua liberação antes de ativar essas mudanças para os dois olhos.
+
+A DLL compilou. Passaram 105/105 CTest em 11,71s e 50/50 testes Python.
+Os testes verificam argumentos na pilha, respostas de um byte e de 64 bits,
+trocas indevidas de quadro/olho/objeto, identificação de opções e preservação
+dos dados. Isso não executa o jogo nem comprova VR, combate ou FPS.
+
+As evidências novas estão locais em `../artifacts/remastered-modern-dlss-pipeline-owner-evidence.json`
+e `remastered-modern-dlss-pipeline-recheck.json`. A segunda conferiu novamente
+as duas tabelas completas da entrada, as quatro chamadas internas e seu
+chamador conhecido. Um salto do chamador continua sem resolução; isso não
+é apresentado como uma análise completa de todos os caminhos do jogo.
+Nenhum relatório nativo novo foi publicado. Nada foi instalado no jogo.
+O bloqueio global do Remastered 5.00c e o bloqueio de repetição permanecem.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.

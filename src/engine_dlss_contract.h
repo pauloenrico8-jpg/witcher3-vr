@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <string_view>
 
 namespace w3vr::engine_dlss {
 
@@ -115,6 +116,173 @@ inline int forward(SetTagForFrameFn original, const TagCall& call) {
 }
 inline int forward(EvaluateFn original, const EvaluateCall& call) {
     return original(call.feature, call.token, call.inputs, call.count, call.command_buffer);
+}
+
+// The two bounded native switches lead to mode 6's actual DLSS route.
+// Its caller supplies six arguments and tests AL, not the legacy seven-
+// argument signature's 32-bit result. All resource indices remain opaque.
+inline constexpr std::uintptr_t pipeline_entry = 0x01C02720;
+inline constexpr std::uintptr_t pipeline_return = 0x01C0848E;
+inline constexpr std::uintptr_t prepare_entry = 0x01B78CE0;
+inline constexpr std::uintptr_t prepare_return = 0x01C03501;
+inline constexpr std::uintptr_t evaluate_entry = 0x01B77EB0;
+inline constexpr std::uintptr_t evaluate_return = 0x01C03550;
+using PipelineFn = std::uint8_t (*)(void* pipeline, void* descriptor,
+    std::uint32_t index0, std::uint32_t index1, std::uint32_t index2, std::uint8_t flag);
+// The examined native caller ignores these methods' RAX. Preserve its whole
+// payload without assigning it a bool, SDK status, or completion meaning.
+using PrepareFn = std::uintptr_t (*)(void* state, void* descriptor, void* resources);
+using NativeEvaluateFn = std::uintptr_t (*)(void* state, void* descriptor,
+    void* resources, std::uint32_t index0, std::uint32_t index2);
+struct PipelineCall {
+    void* pipeline{};
+    void* descriptor{};
+    std::uint32_t index0{}, index1{}, index2{};
+    std::uint8_t flag{};
+};
+inline std::uint8_t forward(PipelineFn original, const PipelineCall& call) {
+    return original(call.pipeline, call.descriptor,
+        call.index0, call.index1, call.index2, call.flag);
+}
+struct PrepareCall { void* state{}; void* descriptor{}; void* resources{}; };
+struct NativeEvaluateCall {
+    void* state{}; void* descriptor{}; void* resources{};
+    std::uint32_t index0{}, index2{};
+};
+inline std::uintptr_t forward(PrepareFn original, const PrepareCall& call) {
+    return original(call.state, call.descriptor, call.resources);
+}
+inline std::uintptr_t forward(NativeEvaluateFn original, const NativeEvaluateCall& call) {
+    return original(call.state, call.descriptor, call.resources, call.index0, call.index2);
+}
+
+struct PipelineSnapshot {
+    std::uint32_t mode{}, render_counter{}, token_index{};
+    std::uint8_t ray_reconstruction{};
+};
+inline bool read_pipeline(std::span<const std::uint8_t> pipeline,
+    std::span<const std::uint8_t> descriptor, const Layout* layout, PipelineSnapshot& result) {
+    if (layout != &remastered_500c || pipeline.size() < 0x78 || descriptor.size() < 0xF750)
+        return false;
+    PipelineSnapshot candidate{};
+    std::memcpy(&candidate.mode, pipeline.data() + 0x74, 4);
+    std::memcpy(&candidate.render_counter, descriptor.data() + 0xC40, 4);
+    std::memcpy(&candidate.token_index, descriptor.data() + 0xC44, 4);
+    candidate.ray_reconstruction = descriptor[0xF73C];
+    if (candidate.mode > 8 || candidate.ray_reconstruction > 1) return false;
+    result = candidate;
+    return true;
+}
+inline bool read_state_viewport(std::span<const std::uint8_t> state,
+    const Layout* layout, Viewport& result) {
+    if (layout != &remastered_500c || state.size() < 0x184) return false;
+    Viewport candidate{};
+    std::memcpy(&candidate.id, state.data() + 0x180, 4);
+    if (candidate.id == UINT32_MAX) return false;
+    result = candidate;
+    return true;
+}
+
+struct Identity {
+    std::uint64_t pair_id{};
+    std::uint32_t generation{};
+    int eye{-1};
+    bool valid() const {
+        return pair_id != 0 && pair_id != UINT64_MAX && (eye == 0 || eye == 1);
+    }
+    bool operator==(const Identity&) const = default;
+};
+enum class Stage : std::uint8_t { none, preparation, evaluation };
+struct Scope {
+    const void* pipeline{};
+    const void* descriptor{};
+    const void* state{};
+    const void* resources{};
+    PipelineSnapshot snapshot{};
+    Identity identity{};
+    std::uint32_t index0{}, index2{};
+    std::uint32_t viewport{UINT32_MAX};
+    Stage stage{Stage::none};
+    bool valid{};
+};
+inline Scope pipeline_scope(const engine_camera::TemporalContract* contract,
+    const PipelineCall& call, std::uintptr_t caller, const PipelineSnapshot& snapshot,
+    const Identity& identity) {
+    if (contract != &engine_camera::remastered_500c || caller != pipeline_return ||
+        call.pipeline == nullptr || call.descriptor == nullptr || !identity.valid() ||
+        snapshot.mode != 6 || snapshot.ray_reconstruction != 0) return {};
+    Scope scope{};
+    scope.pipeline = call.pipeline;
+    scope.descriptor = call.descriptor;
+    scope.snapshot = snapshot;
+    scope.identity = identity;
+    scope.index0 = call.index0;
+    scope.index2 = call.index2;
+    scope.valid = true;
+    return scope;
+}
+inline bool known_stage_return(Stage stage, std::uintptr_t caller) {
+    return (stage == Stage::preparation && caller == prepare_return) ||
+        (stage == Stage::evaluation && caller == evaluate_return);
+}
+inline bool evaluate_indices_match(const Scope& scope, std::uint32_t index0, std::uint32_t index2) {
+    return scope.valid && scope.index0 == index0 && scope.index2 == index2;
+}
+inline bool enter_stage(const Scope& root, Stage stage, std::uintptr_t caller,
+    const void* state, const void* descriptor, const void* resources,
+    const Counters& counters, const Viewport& viewport, const Identity& identity, Scope& result) {
+    if (!root.valid || !known_stage_return(stage, caller) || !identity.valid() ||
+        root.identity != identity || state == nullptr || resources == nullptr ||
+        descriptor != root.descriptor || viewport.id == UINT32_MAX ||
+        counters.render_counter != root.snapshot.render_counter ||
+        counters.token_index != root.snapshot.token_index ||
+        (root.state != nullptr && root.state != state) ||
+        (root.resources != nullptr && root.resources != resources) ||
+        (root.viewport != UINT32_MAX && root.viewport != viewport.id)) return false;
+    Scope candidate = root;
+    candidate.state = state;
+    candidate.resources = resources;
+    candidate.viewport = viewport.id;
+    candidate.stage = stage;
+    result = candidate;
+    return true;
+}
+inline bool scoped_sdk_call(const Scope& scope, Stage stage,
+    const Identity& identity, const Viewport& viewport) {
+    return scope.valid && stage != Stage::none && scope.stage == stage &&
+        identity.valid() && scope.identity == identity && scope.state != nullptr &&
+        scope.resources != nullptr && scope.viewport != UINT32_MAX && scope.viewport == viewport.id;
+}
+
+inline constexpr std::uintptr_t options_getter_return = 0x01ED31B5;
+inline constexpr std::uintptr_t options_setter_return = 0x01ED31CA;
+inline constexpr std::string_view options_function_name = "slDLSSSetOptions";
+inline constexpr std::array<std::uint32_t, 4> options_type{
+    0x6AC826E4, 0x41014C61, 0x8D632DA9, 0xB8571042};
+inline constexpr std::size_t options_header_bytes = 0x20;
+// Only the independently verified v3 header is interpreted. Options payload,
+// presets, dimensions and exposure values remain wholly owned by the SDK.
+inline bool known_options_header(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < options_header_bytes) return false;
+    std::uint64_t next{}, version{};
+    std::array<std::uint32_t, 4> type{};
+    std::memcpy(&next, bytes.data(), 8);
+    std::memcpy(type.data(), bytes.data() + 8, 16);
+    std::memcpy(&version, bytes.data() + 0x18, 8);
+    return next == 0 && type == options_type && version == 3;
+}
+inline bool known_options_getter(std::uint32_t feature, std::string_view name, std::uintptr_t caller) {
+    return feature == dlss && name == options_function_name && caller == options_getter_return;
+}
+using GetFeatureFunctionFn = int (*)(std::uint32_t feature, const char* name, void** function);
+using SetOptionsFn = int (*)(const void* viewport, const void* options);
+struct GetFeatureFunctionCall { std::uint32_t feature{}; const char* name{}; void** function{}; };
+struct SetOptionsCall { const void* viewport{}; const void* options{}; };
+inline int forward(GetFeatureFunctionFn original, const GetFeatureFunctionCall& call) {
+    return original(call.feature, call.name, call.function);
+}
+inline int forward(SetOptionsFn original, const SetOptionsCall& call) {
+    return original(call.viewport, call.options);
 }
 
 // A validated SDK call is still not a receipt of an eye's render, temporal
