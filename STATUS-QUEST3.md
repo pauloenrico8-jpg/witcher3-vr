@@ -380,6 +380,49 @@ e transmissão. Imagens repetidas ou geradas artificialmente não demonstram
 que o jogo atingiu a meta solicitada. A taxa do headset deve ser anotada
 separadamente. Ainda não há resultados para nenhum desses critérios.
 
+## Preparação da segunda imagem no Remastered
+
+O código agora guarda a imagem adicional até a cena normal chegar ao ponto
+de envio do jogo. Essa etapa está em `src/engine_frame_preparation.h` e ligada
+ao produtor de cenas na DLL. O fluxo preparado para 5.00c é:
+
+1. A função original recebe o objeto do jogo e cria as duas imagens. A cópia
+   adicional mantém sua própria referência: o jogo não pode liberá-la antes
+   de o mod terminar de usá-la.
+2. O mod deixa a preparação normal terminar e observa quais funções realmente
+   receberam a imagem principal. Guarda seus argumentos, sem procurar o
+   objeto do jogo em um endereço global presumido.
+3. O jogo avança o tempo dos efeitos uma vez. O mod registra essa passagem;
+   não repete o relógio para o segundo olho.
+4. No ponto em que o jogo cria o comando de envio, o mod prepara a imagem
+   adicional e aplica os efeitos observados, usando as funções originais.
+   Se os efeitos não foram usados na cena principal, não são acrescentados.
+5. O comando mantém uma referência própria à imagem adicional. O mod entrega
+   sua referência após o envio. Se a cena parar antes desse ponto, libera a
+   imagem e remove a identificação do par incompleto.
+
+Cada execução do produtor guarda seu próprio estado. Chamadas aninhadas e
+execuções em outras threads (linhas de trabalho do processador) não dividem
+a mesma imagem pendente. Os testes também verificam uma chamada de volta
+durante a preparação, evitando enviar a mesma imagem duas vezes.
+
+A preparação tem condições estreitas: o callback opcional do mundo precisa
+ser ausente ou a função vazia examinada; um callback adicional em Engine+40
+precisa estar ausente. O papel desse último callback ainda não foi confirmado.
+Mudanças nos objetos do mundo, efeitos ou motor durante a preparação também
+cancelam o par. Esses casos precisam de adaptação adicional.
+
+**O Remastered continua sem ativação.** Os efeitos escrevem alguns caches
+compartilhados, além dos dados da imagem. A aplicação repetida, os recursos
+nativos e a duração de seus objetos ainda não foram testados no jogo. Essa
+implementação não libera o restante dos endereços e campos antigos.
+
+A DLL compilou e a suíte de 102 testes do PC passou; a nova verificação simula ordem,
+relógio, cancelamento, referências, chamadas aninhadas e simultâneas. Esses
+testes não abrem o jogo nem demonstram VR ou 60 FPS. Evidência nativa local:
+`../artifacts/remastered-preparation-evidence.json`. A comparação completa do
+fork e o próximo passo ficam registrados em `../CONTINUAR-QUEST3.md`.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.

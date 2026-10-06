@@ -335,12 +335,73 @@ python scripts/analyze-remastered-rendering.py `
   --inspect-rva 0x02288F00 --call-depth 1
 ```
 
-O próximo passo é adaptar a preparação do produtor e os demais campos de
-câmera, constantes de renderização e jitter (o pequeno deslocamento usado
-pela reconstrução temporal). O produtor chama Engine slot 13 em `022758EB`,
-com engine global `05A518F8` e frame em RDX; a rotina `0224C600` altera campos
-do frame antes do comando. Há ainda uma etapa opcional do objeto CGame+100 e
-uma rota opcional anterior à criação do comando que precisam ser revisadas.
-O novo envio de comandos ainda não reproduz essas etapas. Não liberar o
-bloqueio por contratos isolados; duração dos recursos e imagens reais precisam
-de verificação em execução.
+## Preparação adiada no produtor 5.00c
+
+O produtor base é `02274B80`, chamado por `01F43750` em `01F437D6` com o
+objeto CGame em RCX e o intervalo de tempo em XMM1. A tabela primária de CGame
+`03948EE0`, slot 48, também aponta para esse produtor; CR4Game passa pelo
+wrapper `01D6ED30`. O hook usa o argumento real da chamada. O global
+`05A51930` usado pelos efeitos não foi estabelecido como CGame.
+
+Após a fábrica retornar em `022758B5`, a preparação natural é:
+
+| Etapa | Chamada | Retorno usado pelo observador |
+|---|---|---|
+| Callback opcional: CGame+100, receiver em +8, slot 10 | `022758DB` | `022758DE` |
+| Engine global `05A518F8`, slot 13, frame em RDX | `022758EB` -> `0224C600` | `022758EE` |
+| Avanço compartilhado dos efeitos | `0227591C` -> `02367890` | `02275921` |
+| Aplicação de efeitos à imagem, frame em RDX | `02275924` -> `02367B60` | `02275929` |
+| Construtor de comando, auxiliar nulo | `0227593C` -> `02297670` | `02275941` |
+
+`02367890` soma o tempo em campos do estado global de efeitos `05A51E98`,
+incluindo +64/+68/+6C. Reexecutar o produtor completo ou esse avanço para o
+outro olho alteraria a simulação. O novo caminho observa essa chamada, mas
+reexecuta somente a preparação de recursos e a aplicação à imagem.
+
+O callback opcional é aceito somente se o receiver estiver ausente ou seu
+slot 10 apontar para `0031D810`, contendo `C2 00 00` (retorno sem alterar a
+pilha). O destino foi examinado pelas tabelas primárias conferidas de CWorld
+e CGameWorld, não por uma CALL direta inventada nem por bytes vizinhos. Seu
+registro de unwind continua ausente. Essa condição permite omitir somente
+esse callback comprovadamente vazio, sem supor o tipo de um receiver novo.
+
+`0224C600` usa Engine+40 em um callback sem argumento de frame e depois
+prepara recursos da imagem. O caminho novo exige Engine+40 nulo em três
+pontos: antes das fábricas, após a preparação natural e antes da repetição.
+Engine tem a tabela examinada `037A8F18` e slot 13 correspondente; o contexto
+do mundo e os globais de efeitos também precisam manter a identidade.
+Callbacks adicionais ainda precisam de classificação antes de suportá-los.
+
+`RemasteredProducerScope` guarda uma imagem adicional por execução, usando
+estado local à thread e restaurando o produtor pai ao sair. As duas fábricas
+continuam síncronas; só o frame nativo com referência própria fica pendente,
+nunca o descritor emprestado. `PendingPair` verifica a ordem observada e
+consome essa referência no despacho ou cancelamento. O segundo olho só é
+preparado depois de o construtor natural ter retido a imagem principal.
+Repetições usam trampolines (acesso à função original preservado pelo hook),
+evitando passar pelos observadores outra vez. A instalação dos cinco hooks
+é agrupada e só autoriza a fábrica após todos estarem prontos.
+
+O envio imediato antigo não autoriza o caminho 5.00c. Chamadas auxiliares de
+fábrica fora do retorno nativo conferido não geram um segundo olho. Falta de
+etapas, chamadas repetidas, mudança de contexto ou saída antecipada cancelam
+a imagem e suas tags. Falha do alocador nativo também libera a referência.
+Os diagnósticos antigos de scheduler/renderer não leem seus offsets 4.04
+nesse ramo novo.
+
+**Isso continua sem execução no Remastered.** `02367B60` também escreve caches
+globais e chama funções nativas/indiretas; sua repetição e a vida dos recursos
+não foram validadas no jogo. Os testes simulados verificam somente o contrato
+de ordem e posse. Não foi liberado o bloqueio que ainda seleciona apenas
+4.04. Evidência local: `../artifacts/remastered-preparation-evidence.json`.
+
+A DLL passou na compilação e a suíte final passou em 102/102 testes do CTest.
+Logs: `../artifacts/build-preparation-final-20261006.log` e
+`../artifacts/test-preparation-final-20261006.log`. Os 37 testes de análise
+registrados anteriormente permanecem uma verificação distinta.
+
+O próximo passo é continuar os campos da câmera secundária (novo desc+5F0,
+frame+600), constantes de renderização, jitter e a rota da tarefa nativa.
+Os callbacks adicionais e caches dos efeitos também precisam de verificação.
+Não liberar o bloqueio por contratos isolados; duração dos recursos e imagens
+reais precisam de verificação em execução.
