@@ -1,5 +1,10 @@
 # The Witcher 3 VR
 
+> **Quest 3 development branch:** controller input prototype only. Hands and
+> physical combat are not implemented. The installed Remastered 5.00c layout
+> fails the legacy engine preflight, so this build keeps VR inactive there.
+> See [STATUS-QUEST3.md](STATUS-QUEST3.md) for evidence, limitations and remaining work.
+
 Play The Witcher 3 Next-Gen in VR with configurable stereo rendering, a movable VR HUD, first-person gameplay, cinema modes, DLSS, DLAA and TAAU support, optional frame generation, ReShade and OptiScaler integration.
 
 Its DX12 and VR architecture was informed by

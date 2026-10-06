@@ -1,0 +1,134 @@
+# Witcher 3 VR para Quest 3 — estado do desenvolvimento
+
+**Ainda não existe uma versão jogável deste projeto com mãos e combate físico.**
+Não há medição de FPS em Novigrad. O arquivo compilado está na pasta de
+desenvolvimento e não foi instalado no jogo.
+
+## O que foi verificado
+
+O ponto de partida é [Witcher3VR](https://github.com/tig3rmast3r/witcher3-vr),
+do tig3rmast3r, versão v0.9.8v2, commit
+`79293dd5f523af11579e061aa0b777d65225911c`. O autor informa que o projeto não
+oferece controles de movimento. A cópia local foi separada na linha de trabalho
+`quest3-motion-controls`. O fork na conta do GitHub ainda não foi criado.
+
+Seu jogo Steam está instalado em
+`E:\SteamLibrary\steamapps\common\The Witcher 3`. O executável DX12 informa
+`5.0.0.1044392(Build Machine)`, com SHA-256
+`9406ECCC12B68E08920931442EF6A57340E910D3E01F2082E88232487433FE51`.
+A atualização pública consultada é o
+[hotfix 5.00c](https://www.thewitcher.com/us/en/news/52073/hotfix-5-00c-out-now-for-the-witcher-3-wild-hunt-remastered-on-pc).
+
+O computador tem i5-14600KF, RTX 4070 Ti e aproximadamente 32 GB de RAM.
+Esses dados identificam a máquina; não demonstram que ela atingirá a meta em VR.
+O caminho escolhido pelo usuário é Quest 3 com Virtual Desktop. O OpenXR ativo
+no Windows, no momento da inspeção, era o SteamVR; não foi alterado.
+
+## Por que a versão atual ainda não abre como VR
+
+O código base acessa partes internas do jogo usando endereços da versão 4.04.
+Nos dois endereços usados para acompanhar a cabeça do personagem, os bytes do
+executável instalado não correspondem ao esperado. Há vários outros endereços
+fixos no mesmo código. A discussão sobre suporte ao Remastered está na
+[issue 27](https://github.com/tig3rmast3r/witcher3-vr/issues/27).
+
+Uma busca no executável encontrou os mesmos inícios de duas funções em outros
+endereços: `0x02102690` e `0x02251A40`. São candidatos para investigação.
+Isso não confirma o funcionamento completo dessas funções, seus parâmetros,
+as estruturas do personagem ou os demais recursos do motor. Nenhum endereço
+foi substituído por tentativa.
+
+O protótipo inclui uma verificação anterior à ativação dos recursos: se os dois
+pontos conhecidos não corresponderem, os recursos do mod ficam inativos.
+Essa verificação evita tentar usar o código antigo no executável instalado.
+Ela não adapta o mod ao Remastered. Mesmo uma correspondência futura não
+comprova, sozinha, a compatibilidade de todos os recursos.
+
+Evidências locais: [checagem dos endereços](diagnostics/game-compatibility.json)
+e [candidatos encontrados](diagnostics/legacy-pattern-candidates.json).
+
+## O que o código novo faz, passo a passo
+
+1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede
+   acesso aos controles esquerdo e direito. OpenXR é a interface usada para
+   conversar com o sistema de VR do PC.
+2. A cada imagem, ela consulta a posição, a direção e, quando disponíveis, as
+   velocidades de cada controle. Também lê gatilhos, botões e direcionais.
+3. Ela mantém as duas mãos separadas. Se perder o acompanhamento de uma mão ou
+   se o jogo deixar de receber os controles, descarta os dados antigos.
+4. Ela disponibiliza esses dados para a próxima parte do projeto. Ainda falta
+   usar os dados para desenhar as mãos, mover as armas e calcular contato,
+   dano e bloqueio pela trajetória real da espada.
+5. Existe uma função para solicitar vibração curta nos controles. Nenhuma
+   colisão do jogo a utiliza ainda.
+
+Foi escolhida a leitura das posições reais porque o pedido é de combate pela
+trajetória da mão. O código novo não transforma um movimento em um botão de
+ataque do jogo. Também não contém ainda o combate físico solicitado.
+
+A configuração de exemplo solicita o modo do projeto base que produz imagens
+para ambos os olhos, sem alternância entre olhos. É uma configuração para
+desenvolvimento, não um perfil de desempenho validado. A leitura dos controles
+fica desligada por padrão e pode ser solicitada em `[motion_controllers]`.
+O bloqueio de incompatibilidade continua ativo com qualquer configuração.
+
+## O que os testes comprovam
+
+A compilação no Visual Studio 2026 terminou. Os 94 testes de software passaram.
+O teste novo de controles usa um sistema de VR simulado: verifica mãos
+independentes, leitura de botões, perda de acompanhamento, dados inválidos,
+limites de vibração e encerramento dos recursos. Outro teste verifica a recusa
+de imagens de programa alteradas ou truncadas.
+
+Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
+corretas no headset e não medem Novigrad. O registro completo está em
+`build/quest3/Testing/Temporary/LastTest.log`.
+
+## Limpeza da instalação parcial de primeira pessoa
+
+Os restos do GFP foram retirados da instalação e guardados em:
+`E:\GAMES\mod VR witcher 3\backups\gfp-partial-20261005-214409`.
+Foram movidos 11 itens, contendo 18 arquivos e 83.680.651 bytes. Cada arquivo
+foi conferido por SHA-256 antes e depois da movimentação. O arquivo
+`manifest.json` registra todos os caminhos e as verificações.
+
+Isso conclui a retirada dos restos identificados, não a reinstalação.
+Os saves, as configurações pessoais e os carregadores compartilhados ficaram
+intactos. O GFP antigo não foi reinstalado no Remastered.
+
+Há uma alternativa anunciada para 5.0 DX12:
+[Remastered First Person View Toggle](https://www.nexusmods.com/witcher3/mods/13072),
+versão 2.0. O site exige login para baixar. Ela não foi baixada nem instalada.
+Sua integração com este projeto não foi testada. É um mod de câmera de primeira
+pessoa, sem o sistema de mãos e combate físico solicitado. Sua licença também
+exige autorização do autor para modificar ou incorporar seus arquivos; o
+projeto local não contém esses arquivos.
+
+## Quando o Quest será necessário
+
+Agora é possível continuar a análise de compatibilidade e desenvolver o código
+no PC. A falta de bateria não impede essas etapas.
+
+Depois de existir uma versão que abra no jogo, será necessário conectar o Quest
+para conferir profundidade nos dois olhos, movimentos da cabeça, posição das
+mãos, espada, contato, bloqueios e transmissão pelo Virtual Desktop. Só então
+o save de Novigrad será útil para medir a meta de desempenho em VR.
+
+O critério de desempenho deverá contar imagens novas do jogo para ambos os
+olhos: pelo menos 60 por segundo, ou no máximo 16,67 ms por par de imagens.
+Também será necessário observar quedas, tempo do processador, placa de vídeo
+e transmissão. Imagens repetidas ou geradas artificialmente não demonstram
+que o jogo atingiu a meta solicitada. A taxa do headset deve ser anotada
+separadamente. Ainda não há resultados para nenhum desses critérios.
+
+## Trabalho que falta
+
+- Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.
+- Integrar as posições das mãos à aparência das mãos e armas do personagem.
+- Integrar trajetória, contato, dano e bloqueio ao combate do jogo.
+- Completar a instalação limpa de primeira pessoa compatível e testar conflitos.
+- Criar o fork na conta GitHub e guardar o histórico das mudanças.
+- Validar no Quest 3 e medir Novigrad na máquina identificada.
+
+O objetivo completo do pedido continua pendente. Não há garantia de 60 FPS nem
+uma promessa de que basta instalar a DLL atual para jogar.

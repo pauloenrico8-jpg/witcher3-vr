@@ -54,4 +54,12 @@ Sync-Dependency -Name 'streamline' `
     -Commit 'e8aaa6eaac968711fb62473d4ae8256dde20919b' `
     -SparsePaths @('external/ngx-sdk/include')
 
+# CMake needs the API header even when RenderDoc capture is disabled. This
+# downloads the public header only, not the capture DLL or application.
+$renderdocRoot = Join-Path $dependencyRoot 'renderdoc'
+New-Item -ItemType Directory -Force -Path $renderdocRoot | Out-Null
+Invoke-WebRequest `
+    -Uri 'https://raw.githubusercontent.com/baldurk/renderdoc/e43b7c14d3c37fab664391db94f7586be29e49a0/renderdoc/api/app/renderdoc_app.h' `
+    -OutFile (Join-Path $renderdocRoot 'renderdoc_app.h')
+
 Write-Host 'Witcher3VR dependencies are ready.'
