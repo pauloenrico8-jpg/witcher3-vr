@@ -1,6 +1,6 @@
 # The Witcher 3 VR
 
-> **Quest 3 development branch:** controller input prototype only. Hands and
+> **Quest 3 development branch:** controller input and offline sword geometry prototypes. Hands and
 > physical combat are not implemented. The installed Remastered 5.00c layout
 > fails the legacy engine preflight, so this build keeps VR inactive there.
 > See [STATUS-QUEST3.md](STATUS-QUEST3.md) for evidence, limitations and remaining work.
@@ -24,8 +24,9 @@ as a runtime dependency.
 > user-installed DLSS 5 ReShade add-ons are not supported.
 
 > [!IMPORTANT]
-> Gameplay currently requires a mouse and keyboard or a gamepad. VR motion
-> controllers are not supported and are not currently planned.
+> Upstream gameplay currently requires a mouse and keyboard or a gamepad, and
+> upstream does not plan VR motion controllers. This branch is developing
+> controller and physical combat support; there is no working gameplay integration yet.
 
 ## Highlights
 

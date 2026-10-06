@@ -97,6 +97,29 @@ Foi escolhida a leitura das posições reais porque o pedido é de combate pela
 trajetória da mão. O código novo não transforma um movimento em um botão de
 ataque do jogo. Também não contém ainda o combate físico solicitado.
 
+O arquivo `src/sword_sweep.h` acrescenta uma parte matemática para estudar
+contato da lâmina. Ainda não está ligado aos controles ou aos inimigos do jogo.
+Seu fluxo é:
+
+1. Recebe as duas pontas da lâmina e do alvo na amostra anterior e na atual,
+   com espessuras em metros e o intervalo de tempo entre as amostras.
+2. Confere números, medidas e intervalo; descarta dados inválidos ou muito antigos.
+3. Calcula a menor distância entre lâmina e alvo. Depois avança no intervalo
+   em passos limitados pela distância que as pontas podem percorrer.
+4. Se as formas se encostarem, informa o momento aproximado, os pontos mais
+   próximos e a velocidade relativa. Isso é apenas um candidato a contato.
+5. Se o limite de cálculo acabar, informa que o resultado é inconclusivo;
+   não inventa contato nem afirma que houve uma passagem sem contato.
+
+Essa abordagem foi escolhida porque uma espada rápida pode atravessar um alvo
+fino entre duas imagens: olhar apenas as posições medidas perderia esse contato.
+O modelo atual supõe trajetórias retas para as pontas entre as amostras. Ainda
+falta representar corretamente os arcos da rotação da espada, converter as
+coordenadas do Quest para o jogo, interromper o histórico após recentralização
+ou perda de acompanhamento, identificar alvos reais, controlar repetição de
+contatos e ligar os resultados às regras de dano e bloqueio do Witcher.
+Não existe emissão de botões, dano, animação ou vibração a partir desse cálculo.
+
 A configuração de exemplo solicita o modo do projeto base que produz imagens
 para ambos os olhos, sem alternância entre olhos. É uma configuração para
 desenvolvimento, não um perfil de desempenho validado. A leitura dos controles
@@ -105,11 +128,24 @@ O bloqueio de incompatibilidade continua ativo com qualquer configuração.
 
 ## O que os testes comprovam
 
-A compilação no Visual Studio 2026 terminou. Os 94 testes de software passaram.
+A compilação no Visual Studio 2026 terminou. Os 95 testes de software passaram.
 O teste novo de controles usa um sistema de VR simulado: verifica mãos
 independentes, leitura de botões, perda de acompanhamento, dados inválidos,
 limites de vibração e encerramento dos recursos. Outro teste verifica a recusa
 de imagens de programa alteradas ou truncadas.
+
+O teste matemático da lâmina verifica passagem por alvos finos, contato entre
+espadas, alvos em movimento, contatos já existentes, situações próximas sem
+contato, pontas de espada, segmentos quase paralelos e dados inválidos.
+Também compara os tempos calculados com soluções conhecidas e confere que
+trocar a ordem das pontas ou deslocar todas as formas preserva o resultado.
+
+Três testes antigos do launcher falharam ao substituir seus arquivos temporários
+fora da pasta de trabalho no ambiente restrito. Foram repetidos com `TEMP` e
+`TMP` apontando para `build/quest3/test-temp`, dentro do projeto; todos passaram.
+Essa alteração valeu apenas para os processos de teste e não mudou a instalação
+do jogo nem as configurações do Windows. A suíte completa foi repetida nesse
+ambiente para registrar o resultado de 95/95.
 
 Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
 corretas no headset e não medem Novigrad. O registro completo está em
