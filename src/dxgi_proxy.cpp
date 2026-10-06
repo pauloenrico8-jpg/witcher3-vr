@@ -29,6 +29,7 @@
 #include "engine_camera_temporal.h"
 #include "engine_frame_submission.h"
 #include "engine_scene_factory.h"
+#include "engine_scene_descriptor.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
@@ -40460,8 +40461,6 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         render_context, render_settings, scene_descriptor);
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
-    constexpr size_t kSceneDescriptorBytes = 0xC000;
-    constexpr size_t kSceneDescriptorMinimumBytes = 0xB000;
     // [FIX:ASYMMETRIC-TAAU-SCENE-DESCRIPTOR-HARDENING V1207 1/1]
     // The REDengine scene descriptor is stack-backed. Its readable range to
     // the next VM boundary varies with address placement, so the old clone
@@ -40470,10 +40469,14 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // TAAU then receives zero jitter/extent CBs, skips pairs and replays stale
     // histories. Every observed safe bounded prefix is at least 0xBD00. Copy
     // exactly that stable prefix and zero the rest only for asymmetric TAAU;
-    // every other backend/projection route retains V1206 behavior.
-    constexpr size_t kAsymmetricTaauSceneDescriptorPrefixBytes = 0xBD00;
-    static_assert(kAsymmetricTaauSceneDescriptorPrefixBytes >=
-        kSceneDescriptorMinimumBytes);
+    // every other backend/projection route retains V1206 behavior on 4.04.
+    // Remastered uses its separate full-copy contract; this legacy prefix
+    // must never zero the newer descriptor's live tail. Neither contract
+    // activates compatibility or extends the original producer's lifetime.
+    // Newer descriptors contain borrowed pointers into the current producer.
+    // Keep their byte snapshot local to this synchronous factory hook. Its
+    // C++ byte-buffer destructor must never destroy native game resources.
+    std::vector<uint8_t> remastered_borrowed_descriptor;
     std::vector<uint8_t>* right_scene_descriptor{};
     const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
         std::memory_order_relaxed);
@@ -40584,15 +40587,19 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // generation} duplication and temporal-history route active in cinema;
     // only fullscreen menus remain single-view.
     if (duplicate_render) {
-        right_scene_descriptor = &g_engine_dual_scene_descriptors[
-            present % g_engine_dual_scene_descriptors.size()];
+        const auto descriptor_version = selected_scene_factory_version();
+        right_scene_descriptor = descriptor_version ==
+                w3vr::scene_factory::Version::remastered_500c
+            ? &remastered_borrowed_descriptor
+            : &g_engine_dual_scene_descriptors[
+                present % g_engine_dual_scene_descriptors.size()];
         const bool asymmetric_taau_descriptor_hardening =
             native_asymmetric_noaa_route_active() &&
             temporal_backend_is_taau();
-        const size_t requested_copy_bytes =
-            asymmetric_taau_descriptor_hardening
-            ? kAsymmetricTaauSceneDescriptorPrefixBytes
-            : kSceneDescriptorBytes;
+        const auto descriptor_policy = w3vr::scene_descriptor::copy_policy(
+            descriptor_version, asymmetric_taau_descriptor_hardening);
+        const size_t requested_copy_bytes = descriptor_policy.requested_bytes;
+        const size_t kSceneDescriptorBytes = descriptor_policy.storage_bytes;
         const auto copied_bytes = copy_readable_scene_descriptor(
             *right_scene_descriptor, scene_descriptor, requested_copy_bytes);
         if (right_scene_descriptor->size() < kSceneDescriptorBytes) {
@@ -40602,10 +40609,13 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             log_line("Engine dual render skipped unreadable scene descriptor=%p present=%llu",
                 scene_descriptor, static_cast<unsigned long long>(present));
             right_scene_descriptor = nullptr;
-        } else if (copied_bytes < kSceneDescriptorMinimumBytes) {
+        } else if (!w3vr::scene_descriptor::copy_accepted(
+                descriptor_version, descriptor_policy,
+                std::span<const uint8_t>{right_scene_descriptor->data(),
+                    right_scene_descriptor->size()}, copied_bytes)) {
             static std::atomic<uint32_t> truncated_copy_log_count{};
             if (truncated_copy_log_count.fetch_add(1) < 8) {
-                log_line("Engine dual render skipped truncated scene descriptor source=%p copied=0x%zX requested=0x%zX present=%llu",
+                log_line("Engine dual render skipped incomplete or invalid borrowed scene descriptor source=%p copied=0x%zX requested=0x%zX present=%llu",
                     scene_descriptor, copied_bytes, requested_copy_bytes,
                     static_cast<unsigned long long>(present));
             }

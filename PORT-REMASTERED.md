@@ -232,6 +232,66 @@ O teste de admissão usa dimensões/argumentos simulados, sem execução do jogo
 A DLL compilou; suíte completa 100/100 em
 `../artifacts/test-factory-admission-20261006.log`.
 
+## Descritor completo observado e cópia emprestada
+
+`src/engine_scene_descriptor.h` define a política usada pelo hook da fábrica.
+Mantém `C000`/mínimo `B000` e o prefixo TAAU `BD00` para 4.04. Em 5.00c, usa
+a região `F750` encontrada entre descriptor em frame `+10` e dimensões em
+`+F760`, exige leitura completa e alinhamento de 16 bytes. Não aceita aplicar
+o prefixo antigo à versão nova. O tamanho é um contrato da região observada;
+não é uma definição completa dos tipos internos nem uma liberação de versão.
+
+Revisão das partes chamadas por `00324430`:
+
+| Região de origem | Rotina de cópia | Limite observado |
+| --- | --- | --- |
+| `+10` e `+5F0` | `0228A970` | Câmeras, incluindo histórico temporal; próximas regiões em `5F0`/`BD0`. |
+| `+C70` | `00324C90` | Leitura direta termina antes de `F60`. Há retenção de referências a recursos. |
+| `+F60`, `+58F0`, `+A280` | `00325460` | Blocos separados por `4990`; filho final em `+41E0` lê até `+7A4`, dentro do bloco. |
+| `+EC20` | `0032BCA0` | Lista com contagem em `ECA0`, dados em `ECB0`, elementos de `60` bytes. O campo seguinte em `EE30` limita a quatro elementos. O código recusa contagens maiores. |
+| `+F020` | `0032BDC0` | Próxima região em `F3B0`; filhos `0032C160` copiam listas apontadas por meio de `0032F260`. |
+| `+F6F0` | `0032C200` | Leitura direta termina em `F734`; retém o recurso apontado em `+30`. |
+| `+F748` | `00324430` | Último byte fixo observado; armazenamento termina em `F750` nos dois construtores. |
+
+Os laços fixos restantes do copiador e os filhos dos blocos foram revisados.
+Listas apontadas ficam fora do bloco: seu conteúdo pertence ao produtor
+original e a fábrica nativa faz suas próprias cópias/referências. Por exemplo,
+`026DD530` retém um recurso, aloca dados e copia uma lista apontada; `0032C160`
+inicializa outro contêiner e usa `0032F260` para copiar os elementos.
+O primeiro construtor faz duas cópias nativas síncronas em `01B80676` e
+`01B80704`. Isso sustenta a política de entrada emprestada, sem chamar
+destrutores nativos sobre uma cópia simples de bytes.
+
+O descritor 5.00c fica em um vetor local à chamada da fábrica, sem compartilhar
+o anel antigo de cópias. Depois das chamadas e dos diagnósticos síncronos, o
+vetor libera somente seu armazenamento. Não amplia a duração dos objetos
+apontados. **Essa duração ainda não foi validada dentro do jogo.**
+
+Evidência local: `../artifacts/remastered-descriptor-leaf-evidence.json`.
+O relatório conserva `DescriptorLayoutFullyVerified=false`: nem todos os
+significados dos campos e tipos apontados foram definidos. O contrato cobre
+a cópia observada, sob as condições descritas; não cobre o restante da renderização.
+
+## Rotinas pequenas fora do índice de funções
+
+Windows x64 permite rotinas que não alteram a pilha nem registradores
+preservados sem registros de recuperação. Isso explica por que a análise
+anterior deixava alguns destinos sem corpo, conforme a
+[documentação da convenção x64](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention).
+
+`direct_call_leaf_facts` exige uma instrução CALL direta alcançada em um
+chamador com metadados conferidos. Ela usa o destino dessa instrução, não bytes
+vizinhos, como entrada. Confere as duas rotas de desvios condicionais dentro
+de limites de bytes/instruções; para em retornos e em saltos não resolvidos;
+recusa alterações de pilha, registradores preservados, chamadas internas,
+instruções sobrepostas e saídas da região permitida. O resultado não inventa
+um registro de função: `PrimaryEntryRva` continua nulo.
+
+Foram examinadas 28 chamadas para essas rotinas, sem ativar seus endereços.
+Para reproduzir uma delas com a ferramenta existente, acrescente
+`--inspect-leaf-call 0x00324683` ao comando de análise abaixo. Esse parâmetro
+é o endereço da chamada, e não o destino `00324C90`.
+
 ## Limites que continuam abertos
 
 - As tabelas identificam classes, mas não provam todos os campos, argumentos,
@@ -247,15 +307,18 @@ A DLL compilou; suíte completa 100/100 em
 
 ## Validação e reprodução
 
-`python tests/remastered_analysis_tests.py -v` passou em 25 testes independentes.
+`python tests/remastered_analysis_tests.py -v` passou em 37 testes independentes.
 Eles verificam blocos separados, alinhamento dos registros, cadeias inválidas,
 arquivos truncados, tabelas de classes, classes com nomes de callback iguais,
 falsas chamadas dentro de dados ou depois de um retorno, e a recusa de caminhos
 de saída que sobrescreveriam o executável ou o relatório de entrada.
 Três casos adicionais conferem gravações globais reais e falsas gravações
 dentro de dados ou após retorno. O registro atual é
-`../artifacts/remastered-analysis-tests-store-20261006.log`.
-Esses testes não substituem os 95 testes C++ registrados anteriormente nem
+`../artifacts/test-leaf-analysis-20261006.log`. Os 12 casos adicionais verificam
+a entrada por chamada real, caminhos condicionais, preservação da pilha,
+limites, arquivos truncados e a recusa de chamadas dentro de dados ou após retorno.
+Esses testes não substituem os 101 testes C++ registrados em
+`../artifacts/test-descriptor-final-20261006.log` nem
 demonstram que o jogo abre como VR.
 
 Com a dependência de análise disponível em `.analysis-packages`, executar na
@@ -272,7 +335,12 @@ python scripts/analyze-remastered-rendering.py `
   --inspect-rva 0x02288F00 --call-depth 1
 ```
 
-O próximo passo é adaptar os demais campos de câmera e fechar os contratos de
-criação/cópia/envio do frame, incluindo a vida útil dos comandos. Os acessos ao
-descritor, constantes de renderização e escrita de jitter ainda usam layout
-antigo. Não liberar o bloqueio da versão pelo contrato temporal isolado.
+O próximo passo é adaptar a preparação do produtor e os demais campos de
+câmera, constantes de renderização e jitter (o pequeno deslocamento usado
+pela reconstrução temporal). O produtor chama Engine slot 13 em `022758EB`,
+com engine global `05A518F8` e frame em RDX; a rotina `0224C600` altera campos
+do frame antes do comando. Há ainda uma etapa opcional do objeto CGame+100 e
+uma rota opcional anterior à criação do comando que precisam ser revisadas.
+O novo envio de comandos ainda não reproduz essas etapas. Não liberar o
+bloqueio por contratos isolados; duração dos recursos e imagens reais precisam
+de verificação em execução.

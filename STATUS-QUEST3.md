@@ -174,6 +174,43 @@ Registro: `../artifacts/test-factory-admission-20261006.log`. O teste novo
 confere as condições por versão com dados simulados; não executa a fábrica
 real do jogo nem comprova imagens no headset.
 
+## Cópia dos dados de cena na versão nova
+
+O descritor é o bloco de informações que a fábrica usa para montar uma imagem.
+O Remastered usa dados além do bloco copiado pelo mod antigo. O novo módulo
+`src/engine_scene_descriptor.h` separa as regras de cópia por versão.
+
+1. Para 4.04, conserva os tamanhos e o preenchimento usados pelo projeto base.
+2. Para 5.00c, pede os `0xF750` bytes da região observada nos dois construtores
+   de imagem. Esse tamanho foi confrontado com as rotinas de cópia, incluindo
+   suas partes menores. Uma cópia cortada não é aceita nem completada com zeros.
+3. Confere que uma lista interna cabe antes do próximo campo fixo: aceita de
+   zero a quatro elementos. Também exige o alinhamento de memória esperado.
+   Alinhamento é a posição do bloco em múltiplos de um tamanho exigido pelo jogo.
+4. Guarda a cópia nova somente durante a chamada que cria a imagem. Ela contém
+   endereços emprestados do jogo; copiá-los não dá ao mod a propriedade dos
+   objetos apontados. A fábrica nativa deve criar suas próprias cópias e
+   referências antes de retornar. A liberação do bloco do mod apaga apenas os
+   seus bytes, sem destruir os objetos do jogo.
+
+A ferramenta de análise também passou a examinar rotinas pequenas sem índice
+de função, mas somente quando uma chamada real já identificou sua entrada.
+Ela para nos retornos, limita o percurso e recusa instruções incompatíveis com
+esse tipo de rotina. Isso permitiu revisar 28 chamadas que antes ficavam sem
+corpo analisado. Os detalhes estão em [PORT-REMASTERED.md](PORT-REMASTERED.md).
+
+A DLL compilou e **101/101 testes C++ e 37 testes de análise passaram**.
+Os casos novos conferem cópias cortadas, listas que ultrapassariam o bloco,
+alinhamento e chamadas falsas dentro de dados. Registros:
+`../artifacts/test-descriptor-final-20261006.log` e
+`../artifacts/test-leaf-analysis-20261006.log`.
+
+**O caminho 5.00c continua bloqueado e a DLL não foi instalada.** Esse contrato
+é uma etapa da adaptação: a duração dos recursos ainda precisa de teste nativo,
+e faltam preparação do produtor, campos de câmera e constantes de renderização.
+Não houve criação de imagens no jogo, combate físico ou medição no Quest.
+Os relatórios novos permanecem locais.
+
 ## O que o código novo faz, passo a passo
 
 1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede
