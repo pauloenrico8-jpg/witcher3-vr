@@ -27,6 +27,7 @@
 #include "hand_pose_history.h"
 #include "legacy_engine_preflight.h"
 #include "engine_camera_temporal.h"
+#include "engine_camera_layout.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
 #include "engine_scene_factory.h"
@@ -504,6 +505,11 @@ std::atomic<bool> g_legacy_engine_layout_accepted{};
 // camera contract does not authorize the rest of the engine hook graph.
 std::atomic<const w3vr::engine_camera::TemporalContract*>
     g_engine_camera_temporal_contract{};
+
+const w3vr::engine_camera_layout::Layout* selected_engine_camera_layout() {
+    return w3vr::engine_camera_layout::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+}
 std::once_flag g_openxr_once{};
 std::once_flag g_performance_cpu_sets_once{};
 std::atomic<uint64_t> g_present_count{};
@@ -29538,20 +29544,25 @@ struct AsymmetricDescriptorAuditSnapshot {
 bool read_asymmetric_descriptor_snapshot(
     const uint8_t* view,
     AsymmetricDescriptorAuditSnapshot& snapshot) {
+    const auto* layout = selected_engine_camera_layout();
+    if (layout == nullptr || view == nullptr) return false;
+    w3vr::engine_camera_layout::Fields fields{};
+    bool fields_readable{};
+    __try {
+        fields_readable = w3vr::engine_camera_layout::read_fields(
+            {view, layout->camera_bytes}, *layout, fields);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fields_readable = false;
+    }
+    if (!fields_readable) return false;
     AsymmetricDescriptorAuditSnapshot candidate{};
-    if (view == nullptr ||
-        !safe_copy_asymmetric_authority(
-            view, candidate.core.data(), sizeof(candidate.core)) ||
-        !safe_copy_asymmetric_authority(
-            view + 0x468, &candidate.alternate_fov,
-            sizeof(candidate.alternate_fov)) ||
-        !safe_copy_asymmetric_authority(
-            view + 0x400, candidate.jitter.data(),
-            sizeof(candidate.jitter)) ||
-        !safe_copy_asymmetric_authority(
-            view + 0x408, candidate.viewport.data(),
-            sizeof(candidate.viewport)) ||
-        !safe_copy_asymmetric_authority(
+    candidate.core = fields.core;
+    candidate.alternate_fov = fields.alternate_fov;
+    candidate.jitter = fields.jitter;
+    candidate.viewport = fields.viewport;
+    // Raw byte fingerprints only. These matrix blocks still need a separate
+    // Remastered semantics/culling contract before any writes or routing.
+    if (!safe_copy_asymmetric_authority(
             view + 0x180, candidate.matrix_180.data(),
             sizeof(candidate.matrix_180)) ||
         !safe_copy_asymmetric_authority(
@@ -29634,6 +29645,7 @@ thread_local std::array<AsymmetricFactoryViewAuditCapture,
 thread_local size_t g_asymmetric_factory_view_pending_count{};
 
 void emit_pending_asymmetric_factory_view_audits() {
+    const auto* layout = selected_engine_camera_layout();
     const auto matrix_hash = [](const auto& matrix, bool valid) {
         return valid ? fnv1a64(matrix.data(), sizeof(matrix)) : 0ull;
     };
@@ -29643,8 +29655,10 @@ void emit_pending_asymmetric_factory_view_audits() {
         const intptr_t view_scene_delta =
             reinterpret_cast<intptr_t>(audit.view) -
             reinterpret_cast<intptr_t>(audit.scene);
-        const bool exact_primary = view_scene_delta == 0x10;
-        const bool exact_secondary = view_scene_delta == 0x520;
+        const bool exact_primary = layout != nullptr &&
+            view_scene_delta == layout->descriptor_cameras[0];
+        const bool exact_secondary = layout != nullptr &&
+            view_scene_delta == layout->descriptor_cameras[1];
         write_asymmetric_authority_audit(
             "factory_view sample=%u tid=%lu present=%llu pair=%llu eye=%d "
             "caller=0x%llX route=%s relation=%s scene=%p view=%p "
@@ -29673,8 +29687,8 @@ void emit_pending_asymmetric_factory_view_audits() {
             audit.caller_rva == 0x0162196D
                 ? "factory_rebuild"
                 : "copy_rebuild",
-            exact_primary ? "scene_plus10" :
-                (exact_secondary ? "scene_plus520" : "other"),
+            exact_primary ? "scene_primary" :
+                (exact_secondary ? "scene_secondary" : "other"),
             audit.scene, audit.view,
             static_cast<long long>(view_scene_delta),
             static_cast<long long>(audit.rebuild_begin_qpc),
@@ -30062,6 +30076,11 @@ void __fastcall hook_engine_temporal_writer(
 }
 
 void install_engine_temporal_writer_hook() {
+    // The new setter's three callers belong to UberSample/Final2D. Matching
+    // the five-argument ABI does not port ordinary temporal optical centers.
+    if (!w3vr::engine_camera_layout::legacy_temporal_writer_allowed(
+            g_engine_camera_temporal_contract.load(
+                std::memory_order_acquire))) return;
     if ((!asymmetric_authority_audit_active() &&
             !native_asymmetric_noaa_route_active()) ||
         g_engine_temporal_writer != nullptr) {
@@ -30828,6 +30847,12 @@ bool verify_native_asymmetric_frame_writer_state(
     if (frame_data == nullptr || expected_width == 0 || expected_height == 0) {
         return false;
     }
+    const auto* layout = selected_engine_camera_layout();
+    if (layout == nullptr) return false;
+    const auto primary_camera = layout->frame_descriptor +
+        layout->descriptor_cameras[0];
+    const auto secondary_camera = layout->frame_descriptor +
+        layout->descriptor_cameras[1];
     const auto* frame = static_cast<const uint8_t*>(frame_data);
     float primary_center[2]{};
     float secondary_center[2]{};
@@ -30836,17 +30861,21 @@ bool verify_native_asymmetric_frame_writer_state(
     float primary_core[11]{};
     float secondary_core[11]{};
     if (!safe_copy_asymmetric_authority(
-            frame + 0x420, primary_center, sizeof(primary_center)) ||
+            frame + primary_camera + layout->jitter,
+            primary_center, sizeof(primary_center)) ||
         !safe_copy_asymmetric_authority(
-            frame + 0x930, secondary_center, sizeof(secondary_center)) ||
+            frame + secondary_camera + layout->jitter,
+            secondary_center, sizeof(secondary_center)) ||
         !safe_copy_asymmetric_authority(
-            frame + 0x428, primary_extent, sizeof(primary_extent)) ||
+            frame + primary_camera + layout->viewport,
+            primary_extent, sizeof(primary_extent)) ||
         !safe_copy_asymmetric_authority(
-            frame + 0x938, secondary_extent, sizeof(secondary_extent)) ||
+            frame + secondary_camera + layout->viewport,
+            secondary_extent, sizeof(secondary_extent)) ||
         !safe_copy_asymmetric_authority(
-            frame + 0x20, primary_core, sizeof(primary_core)) ||
+            frame + primary_camera, primary_core, sizeof(primary_core)) ||
         !safe_copy_asymmetric_authority(
-            frame + 0x530, secondary_core, sizeof(secondary_core))) {
+            frame + secondary_camera, secondary_core, sizeof(secondary_core))) {
         return false;
     }
     const bool center_and_extent_match =
@@ -30878,13 +30907,21 @@ bool native_asymmetric_frame_centers_are_zero(void* frame_data) {
     if (frame_data == nullptr) {
         return false;
     }
+    const auto* layout = selected_engine_camera_layout();
+    if (layout == nullptr) return false;
+    const auto primary_camera = layout->frame_descriptor +
+        layout->descriptor_cameras[0];
+    const auto secondary_camera = layout->frame_descriptor +
+        layout->descriptor_cameras[1];
     const auto* frame = static_cast<const uint8_t*>(frame_data);
     float primary_center[2]{};
     float secondary_center[2]{};
     if (!safe_copy_asymmetric_authority(
-            frame + 0x420, primary_center, sizeof(primary_center)) ||
+            frame + primary_camera + layout->jitter,
+            primary_center, sizeof(primary_center)) ||
         !safe_copy_asymmetric_authority(
-            frame + 0x930, secondary_center, sizeof(secondary_center))) {
+            frame + secondary_camera + layout->jitter,
+            secondary_center, sizeof(secondary_center))) {
         return false;
     }
     for (const float center : {
@@ -30904,13 +30941,19 @@ bool verify_native_asymmetric_frame_projection(
     if (frame_data == nullptr) {
         return false;
     }
+    const auto* layout = selected_engine_camera_layout();
+    if (layout == nullptr) return false;
+    const auto primary_camera = layout->frame_descriptor +
+        layout->descriptor_cameras[0];
+    const auto secondary_camera = layout->frame_descriptor +
+        layout->descriptor_cameras[1];
     const auto* frame = static_cast<const uint8_t*>(frame_data);
     float primary_core[11]{};
     float secondary_core[11]{};
     if (!safe_copy_asymmetric_authority(
-            frame + 0x20, primary_core, sizeof(primary_core)) ||
+            frame + primary_camera, primary_core, sizeof(primary_core)) ||
         !safe_copy_asymmetric_authority(
-            frame + 0x530, secondary_core, sizeof(secondary_core))) {
+            frame + secondary_camera, secondary_core, sizeof(secondary_core))) {
         return false;
     }
     return std::isfinite(primary_core[7]) &&
@@ -32674,7 +32717,9 @@ bool capture_asymmetric_temporal_authority(
     const AsymmetricPreRebuildHashes& primary_pre_hashes,
     const AsymmetricPreRebuildHashes& secondary_pre_hashes,
     AsymmetricTemporalAuditCapture& capture) {
-    if (!asymmetric_authority_audit_active() || temporal_data == nullptr ||
+    if (!w3vr::engine_camera_layout::legacy_temporal_writer_allowed(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire)) ||
+        !asymmetric_authority_audit_active() || temporal_data == nullptr ||
         !g_engine_dual_render_active.load(std::memory_order_acquire) ||
         g_engine_menu_state.load(std::memory_order_relaxed) != 0) {
         return false;
@@ -33030,6 +33075,7 @@ bool find_asymmetric_pure_jitter_sample(
 }
 
 struct AsymmetricFrameFactoryAuditCapture {
+    const w3vr::engine_camera_layout::Layout* layout{};
     bool valid{};
     uint32_t audit_index{};
     uint32_t thread_id{};
@@ -33057,7 +33103,9 @@ bool capture_asymmetric_frame_factory(
     const void* scene_descriptor,
     const EngineFrameTag& tag,
     AsymmetricFrameFactoryAuditCapture& capture) {
-    if (!asymmetric_authority_audit_active() || frame_data == nullptr ||
+    const auto* layout = selected_engine_camera_layout();
+    if (layout == nullptr || !asymmetric_authority_audit_active() ||
+        frame_data == nullptr ||
         tag.eye >= 2 || tag.pair_id == 0 || tag.pair_id == UINT64_MAX) {
         return false;
     }
@@ -33076,21 +33124,25 @@ bool capture_asymmetric_frame_factory(
     candidate.frame_data = frame_data;
     candidate.scene_descriptor = scene_descriptor;
     candidate.tag = tag;
+    candidate.layout = layout;
     auto* frame = static_cast<uint8_t*>(frame_data);
     candidate.extent_valid = safe_copy_asymmetric_authority(
-        frame + 0xA4C, candidate.frame_extent.data(),
+        frame + layout->frame_descriptor + layout->descriptor_extent,
+        candidate.frame_extent.data(),
         sizeof(candidate.frame_extent));
     candidate.primary_valid = read_asymmetric_descriptor_snapshot(
-        frame + 0x20, candidate.primary);
+        frame + layout->frame_descriptor + layout->descriptor_cameras[0],
+        candidate.primary);
     candidate.secondary_valid = read_asymmetric_descriptor_snapshot(
-        frame + 0x530, candidate.secondary);
+        frame + layout->frame_descriptor + layout->descriptor_cameras[1],
+        candidate.secondary);
     const auto* scene = static_cast<const uint8_t*>(scene_descriptor);
     candidate.scene_primary_valid = scene != nullptr &&
         read_asymmetric_descriptor_snapshot(
-            scene + 0x10, candidate.scene_primary);
+            scene + layout->descriptor_cameras[0], candidate.scene_primary);
     candidate.scene_secondary_valid = scene != nullptr &&
         read_asymmetric_descriptor_snapshot(
-            scene + 0x520, candidate.scene_secondary);
+            scene + layout->descriptor_cameras[1], candidate.scene_secondary);
     candidate.valid = true;
     capture = candidate;
     return true;
@@ -33098,7 +33150,7 @@ bool capture_asymmetric_frame_factory(
 
 void emit_asymmetric_frame_factory(
     const AsymmetricFrameFactoryAuditCapture& capture) {
-    if (!capture.valid) {
+    if (!capture.valid || capture.layout == nullptr) {
         return;
     }
     const auto& tag = capture.tag;
@@ -33180,9 +33232,11 @@ void emit_asymmetric_frame_factory(
         static_cast<long long>(capture.qpc),
         static_cast<unsigned long long>(tag.pair_id), tag.generation, tag.eye,
         capture.scene_descriptor, capture.frame_data,
-        static_cast<uint8_t*>(capture.frame_data) + 0x10,
-        static_cast<uint8_t*>(capture.frame_data) + 0x20,
-        static_cast<uint8_t*>(capture.frame_data) + 0x530,
+        static_cast<uint8_t*>(capture.frame_data) + capture.layout->frame_descriptor,
+        static_cast<uint8_t*>(capture.frame_data) + capture.layout->frame_descriptor +
+            capture.layout->descriptor_cameras[0],
+        static_cast<uint8_t*>(capture.frame_data) + capture.layout->frame_descriptor +
+            capture.layout->descriptor_cameras[1],
         capture.extent_valid ? 1u : 0u,
         frame_extent[0], frame_extent[1], frame_extent[2], frame_extent[3],
         render_width, render_height,
