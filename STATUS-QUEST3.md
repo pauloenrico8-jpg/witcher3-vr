@@ -78,6 +78,14 @@ Ainda não existe verificação em execução para qualquer um desses candidatos
 Esse inventário não inclui todos os campos de objetos ou endereços escritos
 diretamente em outras expressões; não é uma porcentagem de conclusão do port.
 
+A análise de 06/10 acrescentou a identificação das classes pelo compilador e
+o tratamento dos blocos separados de uma função. Ela distingue o callback
+`GetCameraDirection` do diretor de câmera daquele da classe `CCamera`, encontrou
+uma cadeia de execução de renderização e confirmou acessos incompatíveis entre
+os dados de câmera das versões. As evidências e o fluxo da ferramenta estão em
+[PORT-REMASTERED.md](PORT-REMASTERED.md). São 15 tabelas de classes, 43 referências
+a tabelas e 145 entradas em um grafo limitado, sem ativação em execução.
+
 ## O que o código novo faz, passo a passo
 
 1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede
@@ -87,7 +95,10 @@ diretamente em outras expressões; não é uma porcentagem de conclusão do port
    velocidades de cada controle. Também lê gatilhos, botões e direcionais.
 3. Ela mantém as duas mãos separadas. Se perder o acompanhamento de uma mão ou
    se o jogo deixar de receber os controles, descarta os dados antigos.
-4. Ela disponibiliza esses dados para a próxima parte do projeto. Ainda falta
+4. Ela guarda pares de posições consecutivas de cada mão, com o intervalo de
+   tempo. Descarta a continuidade quando perde rastreamento/foco, muda a sessão
+   ou a origem de referência, recebe tempo repetido/invertido ou passa mais de
+   100 ms entre amostras. Ainda falta
    usar os dados para desenhar as mãos, mover as armas e calcular contato,
    dano e bloqueio pela trajetória real da espada.
 5. Existe uma função para solicitar vibração curta nos controles. Nenhuma
@@ -113,10 +124,24 @@ Seu fluxo é:
 
 Essa abordagem foi escolhida porque uma espada rápida pode atravessar um alvo
 fino entre duas imagens: olhar apenas as posições medidas perderia esse contato.
-O modelo atual supõe trajetórias retas para as pontas entre as amostras. Ainda
-falta representar corretamente os arcos da rotação da espada, converter as
-coordenadas do Quest para o jogo, interromper o histórico após recentralização
-ou perda de acompanhamento, identificar alvos reais, controlar repetição de
+Esse primeiro modelo supõe trajetórias retas para as pontas entre as amostras.
+O novo `src/rigid_sword_sweep.h` trata posição e rotação de uma lâmina rígida:
+move a mão em linha reta e gira a lâmina pelo menor arco entre as orientações
+medidas, mantendo seu comprimento. Confere contato ao longo desse arco e calcula
+a velocidade no ponto de contato, incluindo a rotação. É uma aproximação entre
+amostras: não descobre voltas inteiras ou mudanças de direção que o rastreamento
+não mediu. O alvo ainda usa trajetórias retas para suas pontas.
+
+`src/hand_pose_history.h` está ligado à leitura dos controles na DLL. Guarda
+posição anterior/atual em metros, direção e tempo para as duas mãos. A mudança
+de origem segue o horário informado pelo
+[evento do OpenXR](https://registry.khronos.org/OpenXR/specs/1.1/man/html/XrEventDataReferenceSpaceChangePending.html),
+inclusive quando o renderizador consulta tempos fora de ordem. O histórico
+da sessão é usado para impedir que uma mudança de referência pareça um golpe.
+A função de contato por arco está nos testes; ainda não é chamada contra alvos
+do jogo. Antes disso, falta converter as coordenadas para o Witcher, reiniciar
+o histórico em mudanças de arma/âncora ou teleporte, identificar alvos reais,
+controlar repetição de
 contatos e ligar os resultados às regras de dano e bloqueio do Witcher.
 Não existe emissão de botões, dano, animação ou vibração a partir desse cálculo.
 
@@ -128,7 +153,9 @@ O bloqueio de incompatibilidade continua ativo com qualquer configuração.
 
 ## O que os testes comprovam
 
-A compilação no Visual Studio 2026 terminou. Os 95 testes de software passaram.
+A compilação no Visual Studio 2026 terminou. Os 97 testes de software passaram
+na rodada que acrescentou arcos e histórico de mãos; o registro está em
+`../artifacts/test-quest3-rigid-20261006.log`.
 O teste novo de controles usa um sistema de VR simulado: verifica mãos
 independentes, leitura de botões, perda de acompanhamento, dados inválidos,
 limites de vibração e encerramento dos recursos. Outro teste verifica a recusa
@@ -140,12 +167,26 @@ contato, pontas de espada, segmentos quase paralelos e dados inválidos.
 Também compara os tempos calculados com soluções conhecidas e confere que
 trocar a ordem das pontas ou deslocar todas as formas preserva o resultado.
 
+Os testes de arco comparam tempos de contato com soluções conhecidas, verificam
+alvos sobre o arco e fora dele, velocidade de rotação, comprimento da lâmina,
+sinais equivalentes da orientação e limite de cálculo. O histórico é testado
+com perda/recuperação de uma mão, falha de consulta, perda de foco, nova sessão,
+mudança de origem no tempo correto, tempo duplicado/invertido e pausas longas.
+Esses casos são simulados no PC; não aplicam dano ou bloqueio no jogo.
+
 Três testes antigos do launcher falharam ao substituir seus arquivos temporários
 fora da pasta de trabalho no ambiente restrito. Foram repetidos com `TEMP` e
 `TMP` apontando para `build/quest3/test-temp`, dentro do projeto; todos passaram.
 Essa alteração valeu apenas para os processos de teste e não mudou a instalação
 do jogo nem as configurações do Windows. A suíte completa foi repetida nesse
 ambiente para registrar o resultado de 95/95.
+
+Separadamente, os 25 testes Python da análise do Remastered passaram em 06/10.
+Eles conferem blocos encadeados, classes, arquivos truncados, gravações de
+ponteiros globais e falsas instruções em dados. A reanálise do executável
+preservou os 15 registros de nome/callback
+anteriores. Esses testes e relatórios novos estão locais; não há publicação
+destas alterações no fork neste momento.
 
 Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
 corretas no headset e não medem Novigrad. O registro completo está em
