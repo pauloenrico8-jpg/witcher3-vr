@@ -1,6 +1,9 @@
 /build/
 /dist/
 /external/*
+/.analysis-packages/
+__pycache__/
+*.pyc
 /runtime/
 !/external/README.md
 /.vs/

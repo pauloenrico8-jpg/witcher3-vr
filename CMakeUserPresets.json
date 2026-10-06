@@ -1,0 +1,11 @@
+{
+  "version": 6,
+  "configurePresets": [{
+    "name": "quest3-vs2026",
+    "inherits": "release",
+    "generator": "Visual Studio 18 2026",
+    "binaryDir": "${sourceDir}/build/quest3"
+  }],
+  "buildPresets": [{"name": "quest3-vs2026", "configurePreset": "quest3-vs2026", "configuration": "Release"}],
+  "testPresets": [{"name": "quest3-vs2026", "configurePreset": "quest3-vs2026", "configuration": "Release", "output": {"outputOnFailure": true}}]
+}

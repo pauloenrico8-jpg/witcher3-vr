@@ -46,6 +46,7 @@ add_library(witcher3vr_dxgi SHARED
     src/dxgi_proxy.cpp
     src/dxgi_proxy.def
     src/openxr_eye_geometry.cpp
+    src/motion_controllers.cpp
     src/pipeline_flight_recorder.cpp
     src/route_flight_recorder.cpp
     src/puredark_afw_bridge.cpp
@@ -73,6 +74,14 @@ set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
+    add_executable(w3vr_legacy_engine_preflight_tests tests/legacy_engine_preflight_tests.cpp)
+    target_include_directories(w3vr_legacy_engine_preflight_tests PRIVATE src)
+    add_test(NAME legacy_engine_preflight COMMAND w3vr_legacy_engine_preflight_tests)
+    add_executable(w3vr_motion_controller_tests
+        tests/motion_controller_tests.cpp src/motion_controllers.cpp)
+    target_include_directories(w3vr_motion_controller_tests PRIVATE
+        src "${W3VR_OPENXR_DIR}/include")
+    add_test(NAME motion_controller_lifecycle COMMAND w3vr_motion_controller_tests)
     add_executable(w3vr_swapchain_identity_tests tests/swapchain_identity_tests.cpp)
     target_include_directories(w3vr_swapchain_identity_tests PRIVATE src)
     target_compile_definitions(w3vr_swapchain_identity_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
