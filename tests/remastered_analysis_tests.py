@@ -224,6 +224,70 @@ class ControlFlowTests(unittest.TestCase):
         self.assertEqual(refs[0]["UnwindRangeBeginRva"], "0x00001100")
 
 
+def switch_fixture():
+    image = fixture()
+    image.unwind_records[0x1000] = (0x1070, 0x2000)
+    # Update the indexed parent of the chained fragment too.
+    struct.pack_into("<III", image.data, image.offset(0x2028), 0x1000, 0x1070, 0x2000)
+    image.functions = sorted((b, e) for b, (e, _) in image.unwind_records.items())
+    image.starts = [b for b, _ in image.functions]
+    code = (bytes.fromhex("83f802771b488d15") + struct.pack("<i", -0x100C)
+            + bytes.fromhex("8b8c82") + struct.pack("<I", 0x1030)
+            + bytes.fromhex("4803caffe1"))
+    image.data[:len(code)] = code
+    for address in [0x1020, 0x1080, 0x1100]:
+        image.data[image.offset(address)] = 0xC3
+    for address in [0x1040, 0x1048]:
+        image.data[image.offset(address):image.offset(address) + 6] = (
+            b"\xe8" + struct.pack("<i", 0x1080 - address - 5) + b"\xc3")
+    struct.pack_into("<3I", image.data, image.offset(0x1030), 0x1040, 0x1048, 0x1040)
+    return image
+
+
+class BoundedSwitchTests(unittest.TestCase):
+    def test_calls_inside_verified_cases_are_reached_without_decoding_table_data(self):
+        image = switch_fixture()
+        flow = image.reachable_instructions(0x1000)
+        self.assertEqual(flow["UnresolvedIndirectJumps"], [])
+        self.assertEqual(flow["ResolvedJumpTables"][0]["Targets"], [0x1040, 0x1048, 0x1040])
+        self.assertFalse(any(0x1030 <= x.address < 0x103C for x in flow["Instructions"]))
+        self.assertEqual([r["InstructionRva"] for r in analysis.direct_references(image, {0x1080})],
+                         ["0x00001040", "0x00001048"])
+
+    def test_wrong_guard_or_nonzero_base_remains_unresolved(self):
+        for offset, value in [(3, 0x76), (8, (-0x100C + 1) & 0xFF)]:
+            image = switch_fixture()
+            image.data[offset] = value
+            flow = image.reachable_instructions(0x1000)
+            self.assertEqual(flow["ResolvedJumpTables"], [])
+            self.assertEqual(analysis.direct_references(image, {0x1080}), [])
+
+    def test_target_from_different_owner_or_inside_table_is_rejected(self):
+        for target in [0x1080, 0x1034, 0x9000]:
+            image = switch_fixture()
+            struct.pack_into("<I", image.data, image.offset(0x1030), target)
+            self.assertEqual(image.reachable_instructions(0x1000)["ResolvedJumpTables"], [])
+
+    def test_table_crossing_file_backed_section_is_rejected(self):
+        image = switch_fixture()
+        struct.pack_into("<I", image.data, 15, 0x11FC)
+        self.assertEqual(image.reachable_instructions(0x1000)["ResolvedJumpTables"], [])
+
+    def test_middle_of_instruction_cannot_be_an_additional_case(self):
+        image = switch_fixture()
+        struct.pack_into("<I", image.data, image.offset(0x1034), 0x1041)
+        with self.assertRaisesRegex(ValueError, "overlaps an instruction"):
+            image.reachable_instructions(0x1000)
+
+    def test_table_cannot_overlap_reached_instructions(self):
+        image = switch_fixture()
+        # Both targets are initially valid boundaries, but the table bytes
+        # themselves are reached from the default edge.
+        image.data[4] = 0x2B  # JA 0x1030
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            image.reachable_instructions(0x1000)
+
+
 class DirectCallLeafTests(unittest.TestCase):
     def leaf_image(self, code=b"\xc3", target=0x1150):
         image = fixture()

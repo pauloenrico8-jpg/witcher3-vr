@@ -120,19 +120,55 @@ void test_selection_and_writer_route_gate() {
         !layout::legacy_temporal_writer_allowed(&remastered_500c) &&
         !layout::legacy_temporal_writer_allowed(&copied),
         "Camera layout evidence enabled legacy temporal hooks for Remastered");
-    require(layout::remastered_writer_purpose(0x01D59287) ==
+    require(layout::remastered_writer_purpose(0x01C14BD1) ==
+        layout::WriterPurpose::normal_temporal &&
+        layout::remastered_writer_purpose(0x01D59287) ==
         layout::WriterPurpose::supersample_apply &&
         layout::remastered_writer_purpose(0x01D59880) ==
         layout::WriterPurpose::supersample_restore &&
         layout::remastered_writer_purpose(0x01D59D27) ==
         layout::WriterPurpose::final_2d_override,
         "New writer callers lost their separate purpose");
-    for (const auto address : {0x01D59282, 0x01D5987B, 0x01D59D22,
+    for (const auto address : {0x01C14BCC, 0x01D59282, 0x01D5987B, 0x01D59D22,
             0x01D86EA5, 0x01D87EC0, 0}) {
         require(layout::remastered_writer_purpose(address) ==
             layout::WriterPurpose::unknown,
             "CALL address or legacy return treated as a new writer route");
     }
+    require(layout::temporal_writer_rva(&legacy_404) == 0x015E5A90 &&
+        layout::temporal_writer_rva(&remastered_500c) == 0x022B51E0 &&
+        layout::temporal_writer_rva(nullptr) == 0 &&
+        layout::temporal_writer_rva(&copied) == 0,
+        "Unselected version received a native writer entry");
+    for (const auto address : layout::legacy_writer_returns) {
+        require(layout::normal_temporal_route(&legacy_404, address) &&
+            !layout::normal_temporal_route(&remastered_500c, address),
+            "Legacy return routes changed or authorized Remastered calls");
+    }
+    require(layout::normal_temporal_route(&remastered_500c, 0x01C14BD1) &&
+        !layout::normal_temporal_route(&legacy_404, 0x01C14BD1),
+        "The reached normal scene writer was not separated by version");
+    for (const auto address : {0x01C14BCC, 0x01D59287, 0x01D59880, 0x01D59D27, 0}) {
+        require(!layout::normal_temporal_route(&remastered_500c, address) &&
+            !layout::normal_temporal_route(&copied, address) &&
+            !layout::normal_temporal_route(nullptr, address),
+            "Restore, 2D, CALL, or unknown version can apply another optical center");
+    }
+    require(layout::legacy_centered_writer_hint(&legacy_404, 0x01D87EC0) &&
+        !layout::legacy_centered_writer_hint(&remastered_500c, 0x01D87EC0) &&
+        !layout::legacy_centered_writer_hint(&remastered_500c, 0x01C14BD1),
+        "Legacy already-centered hint leaked into Remastered");
+    std::array<std::size_t, 2> jitter{0xCAFE, 0xBEEF};
+    require(!layout::descriptor_jitter_offsets(nullptr, jitter) &&
+        jitter == std::array<std::size_t, 2>{0xCAFE, 0xBEEF} &&
+        !layout::descriptor_jitter_offsets(&copied, jitter),
+        "Unknown contract changed offsets");
+    require(layout::descriptor_jitter_offsets(&legacy_404, jitter) &&
+        jitter == std::array<std::size_t, 2>{0x410, 0x920},
+        "Legacy current jitter addresses changed");
+    require(layout::descriptor_jitter_offsets(&remastered_500c, jitter) &&
+        jitter == std::array<std::size_t, 2>{0x4D0, 0xAB0},
+        "Current jitter confused with frame offsets or previous jitter +4E0");
 }
 
 int main() {
