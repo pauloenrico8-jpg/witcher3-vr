@@ -86,6 +86,131 @@ os dados de câmera das versões. As evidências e o fluxo da ferramenta estão 
 [PORT-REMASTERED.md](PORT-REMASTERED.md). São 15 tabelas de classes, 43 referências
 a tabelas e 145 entradas em um grafo limitado, sem ativação em execução.
 
+## Adaptação do histórico de câmera por versão
+
+O histórico da câmera guarda como ela estava na imagem anterior. O jogo usa
+isso para calcular movimentos na imagem. A parte que constrói e grava esse
+histórico passou para `src/engine_camera_temporal.h`, com uma configuração
+própria para 4.04 e outra examinada para 5.00c.
+
+1. Lê só os dados de entrada necessários: posição, direção, tempo e projeção.
+   Recusa dados incompletos, números inválidos e projeções degeneradas.
+2. Pede à função original do jogo para construir o registro numa área temporária.
+   Mantém a ordem dos argumentos e o alinhamento que essas funções podem exigir.
+3. Confere se a função devolveu o registro esperado e o marcou como válido.
+   Um resultado inválido não substitui o histórico anterior.
+4. Grava somente o trecho destinado a esse histórico na versão escolhida.
+   Os dados das versões ficam em posições diferentes dentro da câmera; escrever
+   na posição antiga no Remastered alteraria outro trecho.
+5. Atualiza o histórico daquele olho apenas depois da escrita bem-sucedida.
+
+Escolhi essa divisão porque mudar somente o endereço de uma função deixa
+os acessos antigos aos dados dentro do objeto. Os dois caminhos de histórico
+na DLL agora usam esse módulo, e três endereços de funções de câmera vêm da
+mesma configuração. A configuração do 5.00c permanece sem ativação: outras
+partes da renderização ainda precisam de adaptação. O bloqueio anterior continua.
+
+O teste novo simula a função do jogo. Confere os argumentos e os limites de
+memória, incluindo que a configuração 5.00c conserva intacta a área usada pelo
+histórico antigo. **Esse teste não confirma execução dentro do jogo.**
+Os relatórios novos dessa rodada de câmera permanecem no projeto local.
+
+A DLL compilou após a revisão final, e a suíte do PC passou em **98/98 testes**.
+O registro desta rodada está em
+`../artifacts/test-camera-contract-final-20261006.log`. São testes de código e
+contratos simulados; não são uma abertura do jogo nem uma medição de VR.
+
+## Envio da cena e duração dos dados
+
+Uma cena precisa continuar disponível enquanto a placa de vídeo e o jogo a
+processam. A parte nova em `src/engine_frame_submission.h` prepara o envio
+usado no Remastered, com este fluxo:
+
+1. Confere as funções e o renderizador antes de começar.
+2. Pede ao jogo uma área própria para seu comando de renderização. Recusa
+   falhas e um objeto especial que o jogo não despacha.
+3. Coloca a cena nesse comando. O jogo mantém uma referência adicional à cena:
+   é um registro que impede que ela seja destruída enquanto o comando a usa.
+4. Envia o comando e libera somente a referência criada pela nossa chamada
+   à fábrica de cenas. O comando libera sua própria referência ao terminar.
+5. Se falhar antes do envio, libera os dados que pertencem à nossa chamada
+   e retira o par incompleto da identificação dos olhos.
+
+Essa divisão foi necessária porque o envio no 5.00c usa objetos e dados de fila
+que diferem da passagem antiga. Uma área criada pelo próprio mod não contém
+os dados internos que o jogo exige para esses comandos.
+
+O envio do olho duplicado agora passa por essa escolha de rota. **A rota nova
+do 5.00c continua sem ativação**, junto do bloqueio geral. Ainda faltam o
+descritor completo da cena, a preparação do produtor e outros campos e chamadas.
+Os testes de duração dos dados são simulados: nenhum frame do jogo foi enviado
+pelo novo código nesta rodada. Seu relatório novo permanece somente local.
+
+A DLL desta rodada compilou e a suíte completa passou em **99/99 testes**.
+Registro: `../artifacts/test-frame-submission-20261006.log`. Esse resultado
+verifica o código no PC, incluindo as funções simuladas; não demonstra VR
+jogável nem desempenho no save de Novigrad.
+
+## Condições para criar uma cena
+
+O código novo de `src/engine_scene_factory.h` corrige uma diferença nos
+argumentos usados pela fábrica de cenas. A fábrica é a função do jogo que
+monta os dados de uma imagem. No 5.00c, um argumento que o mod antigo exigia
+vem vazio; as configurações estão dentro dos dados da cena.
+
+Agora o código escolhe a condição da versão: mantém a regra antiga em 4.04;
+para 5.00c, confere a presença do renderizador e da cena, lê largura/altura e
+recusa dimensões inválidas. Quatro decisões de início ou identificação da
+cena usam essa verificação. O endereço da fábrica também vem da versão
+escolhida. Isso prepara a passagem para aceitar a chamada real do Remastered.
+
+**5.00c continua sem ativação.** A cópia completa dos dados da cena ainda
+precisa de revisão, incluindo os objetos que esses dados apontam. Uma segunda
+construção de frame foi identificada, mas ela não basta para confirmar o
+tamanho e a duração de todos esses dados. Seu relatório novo permanece local.
+
+A DLL compilou e a suíte completa passou em **100/100 testes do PC**.
+Registro: `../artifacts/test-factory-admission-20261006.log`. O teste novo
+confere as condições por versão com dados simulados; não executa a fábrica
+real do jogo nem comprova imagens no headset.
+
+## Cópia dos dados de cena na versão nova
+
+O descritor é o bloco de informações que a fábrica usa para montar uma imagem.
+O Remastered usa dados além do bloco copiado pelo mod antigo. O novo módulo
+`src/engine_scene_descriptor.h` separa as regras de cópia por versão.
+
+1. Para 4.04, conserva os tamanhos e o preenchimento usados pelo projeto base.
+2. Para 5.00c, pede os `0xF750` bytes da região observada nos dois construtores
+   de imagem. Esse tamanho foi confrontado com as rotinas de cópia, incluindo
+   suas partes menores. Uma cópia cortada não é aceita nem completada com zeros.
+3. Confere que uma lista interna cabe antes do próximo campo fixo: aceita de
+   zero a quatro elementos. Também exige o alinhamento de memória esperado.
+   Alinhamento é a posição do bloco em múltiplos de um tamanho exigido pelo jogo.
+4. Guarda a cópia nova somente durante a chamada que cria a imagem. Ela contém
+   endereços emprestados do jogo; copiá-los não dá ao mod a propriedade dos
+   objetos apontados. A fábrica nativa deve criar suas próprias cópias e
+   referências antes de retornar. A liberação do bloco do mod apaga apenas os
+   seus bytes, sem destruir os objetos do jogo.
+
+A ferramenta de análise também passou a examinar rotinas pequenas sem índice
+de função, mas somente quando uma chamada real já identificou sua entrada.
+Ela para nos retornos, limita o percurso e recusa instruções incompatíveis com
+esse tipo de rotina. Isso permitiu revisar 28 chamadas que antes ficavam sem
+corpo analisado. Os detalhes estão em [PORT-REMASTERED.md](PORT-REMASTERED.md).
+
+A DLL compilou e **101/101 testes C++ e 37 testes de análise passaram**.
+Os casos novos conferem cópias cortadas, listas que ultrapassariam o bloco,
+alinhamento e chamadas falsas dentro de dados. Registros:
+`../artifacts/test-descriptor-final-20261006.log` e
+`../artifacts/test-leaf-analysis-20261006.log`.
+
+**O caminho 5.00c continua bloqueado e a DLL não foi instalada.** Esse contrato
+é uma etapa da adaptação: a duração dos recursos ainda precisa de teste nativo,
+e faltam preparação do produtor, campos de câmera e constantes de renderização.
+Não houve criação de imagens no jogo, combate físico ou medição no Quest.
+Os relatórios novos permanecem locais.
+
 ## O que o código novo faz, passo a passo
 
 1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede
@@ -185,9 +310,12 @@ Separadamente, os 25 testes Python da análise do Remastered passaram em 06/10.
 Eles conferem blocos encadeados, classes, arquivos truncados, gravações de
 ponteiros globais e falsas instruções em dados. A reanálise do executável
 preservou os 15 registros de nome/callback
-anteriores. Os módulos novos, testes e ferramentas de análise foram publicados
-no fork. As árvores completas de arquivos local/publicada foram comparadas:
-conteúdo idêntico. Os relatórios novos de dados continuam somente no projeto local.
+anteriores. Os módulos de arcos/continuidade e as ferramentas de análise foram
+publicados até o commit `809f2a00fe3285bd7958aa7191943de58bc0b49a`. Naquela
+verificação anterior às adaptações de câmera, as árvores completas
+local/publicada eram idênticas. Essa referência é histórica. As comparações
+posteriores são registradas em `CONTINUAR-QUEST3.md`, na pasta superior ao
+repositório. Os relatórios novos de dados continuam somente no projeto local.
 
 Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
 corretas no headset e não medem Novigrad. O registro completo está em
