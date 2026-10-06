@@ -3552,6 +3552,19 @@ std::mutex g_remastered_streamline_hook_mutex{};
 std::atomic<bool> g_remastered_streamline_observers_ready{};
 std::atomic<uint32_t> g_remastered_streamline_observation_logs{};
 std::atomic<uint32_t> g_remastered_dlss_counter_logs{};
+w3vr::engine_dlss::PipelineFn g_remastered_dlss_pipeline{};
+w3vr::engine_dlss::PrepareFn g_remastered_dlss_prepare{};
+w3vr::engine_dlss::NativeEvaluateFn g_remastered_dlss_native_evaluate{};
+thread_local w3vr::engine_dlss::Scope g_remastered_dlss_scope{};
+std::mutex g_remastered_dlss_native_hook_mutex{};
+std::atomic<bool> g_remastered_dlss_native_hooks_ready{};
+w3vr::engine_dlss::GetFeatureFunctionFn g_remastered_sl_get_feature_function{};
+w3vr::engine_dlss::SetOptionsFn g_remastered_sl_dlss_set_options{};
+std::mutex g_remastered_dlss_options_hook_mutex{};
+void* g_remastered_dlss_options_hook_target{};
+std::atomic<bool> g_remastered_dlss_options_hook_ready{};
+std::atomic<bool> g_remastered_dlss_options_hook_failed{};
+void ensure_remastered_dlss_options_hook_for_cached_function();
 SlSetTagFn g_sl_set_tag{};
 SlSetFeatureConstantsFn g_sl_set_feature_constants{};
 SlEvaluateFeatureFn g_sl_evaluate_feature{};
@@ -31798,6 +31811,178 @@ void __fastcall hook_engine_dlss_command(void* context, uint8_t** stream) {
     g_streamline_forced_eye = previous_forced_eye;
 }
 
+w3vr::engine_dlss::Identity remastered_dlss_identity() {
+    return {g_engine_render_pair_id, g_engine_render_generation, g_engine_render_eye};
+}
+
+bool read_remastered_dlss_pipeline(void* pipeline, void* descriptor,
+    w3vr::engine_dlss::PipelineSnapshot& result) {
+    if (pipeline == nullptr || descriptor == nullptr) return false;
+    __try {
+        return w3vr::engine_dlss::read_pipeline(
+            {static_cast<const uint8_t*>(pipeline), 0x78},
+            {static_cast<const uint8_t*>(descriptor), 0xF750},
+            w3vr::engine_dlss::selected(
+                g_engine_camera_temporal_contract.load(std::memory_order_acquire)), result);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool read_remastered_dlss_state(void* state, void* descriptor,
+    w3vr::engine_dlss::Counters& counters, w3vr::engine_dlss::Viewport& viewport) {
+    if (state == nullptr || descriptor == nullptr) return false;
+    const auto* layout = w3vr::engine_dlss::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    __try {
+        return w3vr::engine_dlss::read_counters(
+            {static_cast<const uint8_t*>(state), 0x184},
+            {static_cast<const uint8_t*>(descriptor), 0xC48}, layout, counters) &&
+            w3vr::engine_dlss::read_state_viewport(
+                {static_cast<const uint8_t*>(state), 0x184}, layout, viewport);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+struct RemasteredDlssScopeRestore {
+    w3vr::engine_dlss::Scope previous;
+    ~RemasteredDlssScopeRestore() { g_remastered_dlss_scope = previous; }
+};
+
+struct RemasteredDlssStageRestore {
+    w3vr::engine_dlss::Scope previous;
+    bool entered{};
+    bool known_caller{};
+    ~RemasteredDlssStageRestore() {
+        const auto observed = g_remastered_dlss_scope;
+        g_remastered_dlss_scope = previous;
+        if (entered) {
+            // Keep the receiver actually passed by the native pipeline for
+            // its subsequent stage; restore the caller's stage on nesting.
+            g_remastered_dlss_scope.state = observed.state;
+            g_remastered_dlss_scope.resources = observed.resources;
+            g_remastered_dlss_scope.viewport = observed.viewport;
+            g_remastered_dlss_scope.valid = observed.valid;
+        } else if (previous.valid && known_caller) {
+            g_remastered_dlss_scope.valid = false;
+        }
+    }
+};
+
+uint8_t __fastcall hook_remastered_dlss_pipeline(void* pipeline, void* descriptor,
+    uint32_t index0, uint32_t index1, uint32_t index2, uint8_t flag) {
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const w3vr::engine_dlss::PipelineCall call{
+        pipeline, descriptor, index0, index1, index2, flag};
+    const RemasteredDlssScopeRestore restore{g_remastered_dlss_scope};
+    g_remastered_dlss_scope = {};
+    w3vr::engine_dlss::PipelineSnapshot snapshot{};
+    if (g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
+        caller_rva == w3vr::engine_dlss::pipeline_return &&
+        read_remastered_dlss_pipeline(pipeline, descriptor, snapshot)) {
+        g_remastered_dlss_scope = w3vr::engine_dlss::pipeline_scope(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire),
+            call, caller_rva, snapshot, remastered_dlss_identity());
+    }
+    // This is transparent even for unknown callers/backends. No guard, mode,
+    // options cache, cooldown, resource or viewport is changed or replayed.
+    return w3vr::engine_dlss::forward(g_remastered_dlss_pipeline, call);
+}
+
+bool begin_remastered_dlss_stage(w3vr::engine_dlss::Stage stage, uintptr_t caller_rva,
+    void* state, void* descriptor, void* resources, uint32_t index0, uint32_t index2) {
+    namespace c = w3vr::engine_dlss;
+    c::Scope candidate{};
+    c::Counters counters{};
+    c::Viewport viewport{};
+    const auto root = g_remastered_dlss_scope;
+    const bool entered = g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
+        root.valid && c::known_stage_return(stage, caller_rva) &&
+        (stage != c::Stage::evaluation || c::evaluate_indices_match(root, index0, index2)) &&
+        read_remastered_dlss_state(state, descriptor, counters, viewport) &&
+        c::enter_stage(root, stage, caller_rva, state, descriptor, resources,
+            counters, viewport, remastered_dlss_identity(), candidate);
+    // Unknown or mismatched nested methods cannot inherit the parent's proof.
+    g_remastered_dlss_scope = entered ? candidate : c::Scope{};
+    return entered;
+}
+
+uintptr_t __fastcall hook_remastered_dlss_prepare(void* state, void* descriptor, void* resources) {
+    namespace c = w3vr::engine_dlss;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    RemasteredDlssStageRestore restore{g_remastered_dlss_scope, false,
+        c::known_stage_return(c::Stage::preparation, caller_rva)};
+    restore.entered = begin_remastered_dlss_stage(
+        c::Stage::preparation, caller_rva, state, descriptor, resources, 0, 0);
+    return c::forward(g_remastered_dlss_prepare, c::PrepareCall{state, descriptor, resources});
+}
+
+uintptr_t __fastcall hook_remastered_dlss_native_evaluate(void* state, void* descriptor,
+    void* resources, uint32_t index0, uint32_t index2) {
+    namespace c = w3vr::engine_dlss;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    RemasteredDlssStageRestore restore{g_remastered_dlss_scope, false,
+        c::known_stage_return(c::Stage::evaluation, caller_rva)};
+    restore.entered = begin_remastered_dlss_stage(
+        c::Stage::evaluation, caller_rva, state, descriptor, resources, index0, index2);
+    if (restore.entered) ensure_remastered_dlss_options_hook_for_cached_function();
+    return c::forward(g_remastered_dlss_native_evaluate,
+        c::NativeEvaluateCall{state, descriptor, resources, index0, index2});
+}
+
+void install_remastered_dlss_native_hooks() {
+    namespace c = w3vr::engine_dlss;
+    if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) ||
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire) !=
+            &w3vr::engine_camera::remastered_500c || !dlss_sequential_mode_active()) return;
+    std::scoped_lock lock{g_remastered_dlss_native_hook_mutex};
+    if (g_remastered_dlss_pipeline != nullptr || g_remastered_dlss_prepare != nullptr ||
+        g_remastered_dlss_native_evaluate != nullptr) return;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (module == nullptr) return;
+    struct NativeHook { uintptr_t rva; void* detour; void** original; };
+    const std::array<NativeHook, 3> hooks{{
+        {c::pipeline_entry, reinterpret_cast<void*>(&hook_remastered_dlss_pipeline),
+            reinterpret_cast<void**>(&g_remastered_dlss_pipeline)},
+        {c::prepare_entry, reinterpret_cast<void*>(&hook_remastered_dlss_prepare),
+            reinterpret_cast<void**>(&g_remastered_dlss_prepare)},
+        {c::evaluate_entry, reinterpret_cast<void*>(&hook_remastered_dlss_native_evaluate),
+            reinterpret_cast<void**>(&g_remastered_dlss_native_evaluate)},
+    }};
+    g_remastered_dlss_native_hooks_ready.store(false, std::memory_order_release);
+    size_t created{};
+    const auto rollback = [&] {
+        for (size_t i = created; i > 0; --i) {
+            const auto& hook = hooks[i - 1];
+            const auto status = MH_RemoveHook(module + hook.rva);
+            if (status == MH_OK) *hook.original = nullptr;
+            else log_line("Modern native DLSS hook cleanup failed RVA=0x%llX status=%d; scope disabled",
+                static_cast<unsigned long long>(hook.rva), static_cast<int>(status));
+        }
+    };
+    for (const auto& hook : hooks) {
+        const auto status = MH_CreateHook(module + hook.rva, hook.detour, hook.original);
+        if (status != MH_OK) {
+            log_line("Modern native DLSS hook create failed RVA=0x%llX status=%d",
+                static_cast<unsigned long long>(hook.rva), static_cast<int>(status));
+            rollback();
+            return;
+        }
+        ++created;
+    }
+    for (const auto& hook : hooks) {
+        const auto status = MH_EnableHook(module + hook.rva);
+        if (status != MH_OK) {
+            log_line("Modern native DLSS hook enable failed RVA=0x%llX status=%d",
+                static_cast<unsigned long long>(hook.rva), static_cast<int>(status));
+            rollback();
+            return;
+        }
+    }
+    g_remastered_dlss_native_hooks_ready.store(true, std::memory_order_release);
+    log_line("Modern native DLSS pipeline/preparation/evaluation scope installed; stereo re-entry remains disabled");
+}
+
 // REDengine guards the common sl::Constants builder, native input preparation
 // and evaluation independently. Strict Stereo must execute all three original
 // producers for eye 0; copying a peer constants block is invalid because it
@@ -31925,6 +32110,11 @@ uint32_t __fastcall hook_engine_upscaler_pipeline(
 }
 
 void install_engine_upscaler_pipeline_hook() {
+    if (g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
+        &w3vr::engine_camera::remastered_500c) {
+        install_remastered_dlss_native_hooks();
+        return;
+    }
     if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) ||
         !w3vr::engine_view_constants::legacy_reentry_supported(
             g_engine_camera_temporal_contract.load(std::memory_order_acquire)) ||
@@ -41757,6 +41947,129 @@ bool read_remastered_evaluate_viewport(const void** inputs, uint32_t count,
     return read_remastered_streamline_viewport(viewport, result);
 }
 
+bool remastered_dlss_options_gate() {
+    return g_legacy_engine_layout_accepted.load(std::memory_order_acquire) &&
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
+            &w3vr::engine_camera::remastered_500c && dlss_sequential_mode_active() &&
+        g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
+        g_remastered_streamline_observers_ready.load(std::memory_order_acquire);
+}
+
+bool is_remastered_options_function_name(const char* name) {
+    if (name == nullptr) return false;
+    __try { return std::memcmp(name, "slDLSSSetOptions", sizeof("slDLSSSetOptions")) == 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void* read_remastered_sdk_function(void** function) {
+    if (function == nullptr) return nullptr;
+    __try { return *function; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+bool read_remastered_options_header(const void* options) {
+    if (options == nullptr) return false;
+    __try {
+        return w3vr::engine_dlss::known_options_header(
+            {static_cast<const uint8_t*>(options), w3vr::engine_dlss::options_header_bytes});
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+int __fastcall hook_remastered_sl_dlss_set_options(const void* viewport, const void* options) {
+    namespace c = w3vr::engine_dlss;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    c::Viewport snapshot{};
+    const bool readable = read_remastered_streamline_viewport(viewport, snapshot) &&
+        read_remastered_options_header(options);
+    const int result = c::forward(g_remastered_sl_dlss_set_options, c::SetOptionsCall{viewport, options});
+    if (remastered_dlss_options_gate() &&
+        g_remastered_dlss_options_hook_ready.load(std::memory_order_acquire) && readable &&
+        caller_rva == c::options_setter_return &&
+        c::scoped_sdk_call(g_remastered_dlss_scope, c::Stage::evaluation,
+            remastered_dlss_identity(), snapshot) && g_config.runtime_diagnostics &&
+        take_bounded_log_slot(g_remastered_streamline_observation_logs, 32)) {
+        log_line("Modern DLSS options viewport=%u eye=%d pair=%llu result=%d; native options/cache/cooldown preserved",
+            snapshot.id, g_remastered_dlss_scope.identity.eye,
+            static_cast<unsigned long long>(g_remastered_dlss_scope.identity.pair_id), result);
+    }
+    return result;
+}
+
+void install_remastered_dlss_options_target(void* target) {
+    if (target == nullptr || !remastered_dlss_options_gate()) return;
+    std::scoped_lock lock{g_remastered_dlss_options_hook_mutex};
+    if (g_remastered_dlss_options_hook_target != nullptr) {
+        if (g_remastered_dlss_options_hook_target != target) {
+            // A plugin/lifetime change needs a complete verified transition.
+            // Do not silently start using a second options implementation.
+            g_remastered_dlss_options_hook_ready.store(false, std::memory_order_release);
+            g_remastered_dlss_options_hook_failed.store(true, std::memory_order_release);
+        }
+        return;
+    }
+    if (g_remastered_dlss_options_hook_failed.load(std::memory_order_acquire)) return;
+    HMODULE owner{};
+    const auto plugin = GetModuleHandleW(L"sl.dlss.dll");
+    if (plugin == nullptr || !GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(target), &owner) || owner != plugin) return;
+    g_remastered_dlss_options_hook_ready.store(false, std::memory_order_release);
+    const auto create_status = MH_CreateHook(target,
+        reinterpret_cast<void*>(&hook_remastered_sl_dlss_set_options),
+        reinterpret_cast<void**>(&g_remastered_sl_dlss_set_options));
+    if (create_status != MH_OK) {
+        g_remastered_dlss_options_hook_failed.store(true, std::memory_order_release);
+        log_line("Modern DLSS options hook create failed status=%d", static_cast<int>(create_status));
+        return;
+    }
+    g_remastered_dlss_options_hook_target = target;
+    const auto enable_status = MH_EnableHook(target);
+    if (enable_status != MH_OK) {
+        const auto remove_status = MH_RemoveHook(target);
+        if (remove_status == MH_OK) {
+            g_remastered_sl_dlss_set_options = nullptr;
+            g_remastered_dlss_options_hook_target = nullptr;
+        }
+        g_remastered_dlss_options_hook_failed.store(true, std::memory_order_release);
+        log_line("Modern DLSS options hook enable failed status=%d cleanup=%d; routing disabled",
+            static_cast<int>(enable_status), static_cast<int>(remove_status));
+        return;
+    }
+    g_remastered_dlss_options_hook_ready.store(true, std::memory_order_release);
+    log_line("Modern DLSS options observer installed at SDK-returned plugin target=%p; native caches preserved", target);
+}
+
+int __fastcall hook_remastered_sl_get_feature_function(uint32_t feature, const char* name, void** function) {
+    namespace c = w3vr::engine_dlss;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const int result = c::forward(g_remastered_sl_get_feature_function,
+        c::GetFeatureFunctionCall{feature, name, function});
+    if (result == 0 && feature == c::dlss && caller_rva == c::options_getter_return &&
+        is_remastered_options_function_name(name)) {
+        install_remastered_dlss_options_target(read_remastered_sdk_function(function));
+    }
+    // Keep the exact SDK-written pointer, including failure output. In
+    // particular, never substitute a wrapper address into the native cache.
+    return result;
+}
+
+void ensure_remastered_dlss_options_hook_for_cached_function() {
+    namespace c = w3vr::engine_dlss;
+    if (!remastered_dlss_options_gate() || !g_remastered_dlss_scope.valid ||
+        g_remastered_dlss_scope.stage != c::Stage::evaluation ||
+        g_remastered_dlss_options_hook_ready.load(std::memory_order_acquire) ||
+        g_remastered_dlss_options_hook_failed.load(std::memory_order_acquire) ||
+        g_remastered_sl_get_feature_function == nullptr) return;
+    // A native cache may already contain this address before our getter hook
+    // is installed. Query the SDK at the actual native evaluation stage,
+    // after its device exists, and hook the returned function itself. Do not
+    // read/write the game's cache or call the setter outside its native route.
+    void* target{};
+    const int result = c::forward(g_remastered_sl_get_feature_function,
+        c::GetFeatureFunctionCall{c::dlss, c::options_function_name.data(), &target});
+    if (result == 0) install_remastered_dlss_options_target(target);
+}
+
 int __fastcall hook_remastered_sl_set_tag_for_frame(const void* frame_token,
     const void* viewport, const void* tags, uint32_t count, void* command_buffer) {
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
@@ -41765,16 +42078,22 @@ int __fastcall hook_remastered_sl_set_tag_for_frame(const void* frame_token,
     w3vr::engine_dlss::Viewport snapshot{};
     const bool readable = read_remastered_streamline_viewport(viewport, snapshot);
     const int result = w3vr::engine_dlss::forward(g_remastered_sl_set_tag_for_frame, call);
+    const bool scoped = g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
+        readable && frame_token != nullptr && w3vr::engine_dlss::known_tag_return(caller_rva) &&
+        w3vr::engine_dlss::scoped_sdk_call(g_remastered_dlss_scope,
+            g_remastered_dlss_scope.stage, remastered_dlss_identity(), snapshot);
     if (g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
         g_config.runtime_diagnostics && readable && frame_token != nullptr &&
         w3vr::engine_dlss::known_tag_return(caller_rva) &&
         take_bounded_log_slot(g_remastered_streamline_observation_logs, 32)) {
-        log_line("Modern Streamline tags viewport=%u count=%u token=%p command=%p result=%d return=0x%llX; observation only",
+        log_line("Modern Streamline tags viewport=%u count=%u token=%p command=%p result=%d return=0x%llX native_scope=%d eye=%d pair=%llu; observation only",
             snapshot.id, count, frame_token, command_buffer, result,
-            static_cast<unsigned long long>(caller_rva));
+            static_cast<unsigned long long>(caller_rva), scoped ? 1 : 0,
+            scoped ? g_remastered_dlss_scope.identity.eye : -1,
+            scoped ? static_cast<unsigned long long>(g_remastered_dlss_scope.identity.pair_id) : 0ull);
     }
-    // Shared by DLSS and ray reconstruction; no eye/resource/GPU completion
-    // receipt may be inferred from this call or a coincident TLS eye.
+    // Shared by DLSS and ray reconstruction; only the verified native root
+    // and receiver can associate the CPU call. Still no GPU completion proof.
     return result;
 }
 
@@ -41786,13 +42105,20 @@ int __fastcall hook_remastered_sl_evaluate_feature(uint32_t feature,
     w3vr::engine_dlss::Viewport snapshot{};
     const bool readable = read_remastered_evaluate_viewport(inputs, count, snapshot);
     const int result = w3vr::engine_dlss::forward(g_remastered_sl_evaluate_feature, call);
+    const bool scoped = g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
+        readable && frame_token != nullptr && feature == w3vr::engine_dlss::dlss &&
+        w3vr::engine_dlss::known_evaluate_return(feature, caller_rva) &&
+        w3vr::engine_dlss::scoped_sdk_call(g_remastered_dlss_scope,
+            w3vr::engine_dlss::Stage::evaluation, remastered_dlss_identity(), snapshot);
     if (g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
         g_config.runtime_diagnostics && readable && frame_token != nullptr &&
         w3vr::engine_dlss::known_evaluate_return(feature, caller_rva) &&
         take_bounded_log_slot(g_remastered_streamline_observation_logs, 32)) {
-        log_line("Modern Streamline evaluate feature=%u viewport=%u token=%p command=%p result=%d return=0x%llX; observation only",
+        log_line("Modern Streamline evaluate feature=%u viewport=%u token=%p command=%p result=%d return=0x%llX native_scope=%d eye=%d pair=%llu; observation only",
             feature, snapshot.id, frame_token, command_buffer, result,
-            static_cast<unsigned long long>(caller_rva));
+            static_cast<unsigned long long>(caller_rva), scoped ? 1 : 0,
+            scoped ? g_remastered_dlss_scope.identity.eye : -1,
+            scoped ? static_cast<unsigned long long>(g_remastered_dlss_scope.identity.pair_id) : 0ull);
     }
     // SDK eOk only means the API accepted the call, not that its command
     // buffer ran on the GPU. Do not call legacy DLSS completion/resource code.
@@ -41817,6 +42143,12 @@ int __fastcall hook_remastered_sl_set_constants(
         }
     }
     readable = readable && read_remastered_streamline_viewport(viewport, viewport_snapshot);
+    w3vr::engine_dlss::Counters native_counters{};
+    w3vr::engine_dlss::Viewport native_viewport{};
+    readable = readable && read_remastered_dlss_state(
+        const_cast<void*>(observation.state), const_cast<void*>(observation.descriptor),
+        native_counters, native_viewport) && native_viewport.id == viewport_snapshot.id &&
+        native_counters.token_index == observation.frame_id;
     // Forward all original references unchanged and return the real result.
     // A FrameToken is opaque. The observed descriptor's frame id is used only
     // as a diagnostic receipt number; it is never passed in place of a token.
@@ -43831,18 +44163,19 @@ void install_streamline_hook() {
     }
 
     if (contract == &w3vr::engine_camera::remastered_500c) {
-        // All three modern observers use their actual SDK ABIs. Options and
+        // All four modern observers use their actual SDK ABIs. Options and
         // per-eye viewport/history routing remain unported; no legacy detour
         // or legacy re-entry may be installed by falling through this branch.
         std::scoped_lock lock{g_remastered_streamline_hook_mutex};
         if (!dlss_sequential_mode_active() ||
             g_remastered_sl_set_constants != nullptr ||
             g_remastered_sl_set_tag_for_frame != nullptr ||
-            g_remastered_sl_evaluate_feature != nullptr) return;
+            g_remastered_sl_evaluate_feature != nullptr ||
+            g_remastered_sl_get_feature_function != nullptr) return;
         auto* interposer = GetModuleHandleW(L"sl.interposer.dll");
         if (interposer == nullptr) return;
         struct ObserverHook { const char* name; void* target; void* detour; void** original; };
-        const std::array<ObserverHook, 3> hooks{{
+        const std::array<ObserverHook, 4> hooks{{
             {"slSetConstants", reinterpret_cast<void*>(GetProcAddress(interposer, "slSetConstants")),
                 reinterpret_cast<void*>(&hook_remastered_sl_set_constants),
                 reinterpret_cast<void**>(&g_remastered_sl_set_constants)},
@@ -43852,6 +44185,9 @@ void install_streamline_hook() {
             {"slEvaluateFeature", reinterpret_cast<void*>(GetProcAddress(interposer, "slEvaluateFeature")),
                 reinterpret_cast<void*>(&hook_remastered_sl_evaluate_feature),
                 reinterpret_cast<void**>(&g_remastered_sl_evaluate_feature)},
+            {"slGetFeatureFunction", reinterpret_cast<void*>(GetProcAddress(interposer, "slGetFeatureFunction")),
+                reinterpret_cast<void*>(&hook_remastered_sl_get_feature_function),
+                reinterpret_cast<void**>(&g_remastered_sl_get_feature_function)},
         }};
         for (const auto& hook : hooks) if (hook.target == nullptr) return;
         g_remastered_streamline_observers_ready.store(false, std::memory_order_release);
@@ -43886,7 +44222,7 @@ void install_streamline_hook() {
             }
         }
         g_remastered_streamline_observers_ready.store(true, std::memory_order_release);
-        log_line("Modern Streamline constants/tag/evaluation observers installed; per-eye options/history routing still pending");
+        log_line("Modern Streamline constants/tag/evaluation/getter observers installed; dynamic options observer awaits native DLSS stage; per-eye history routing still pending");
         return;
     }
 
