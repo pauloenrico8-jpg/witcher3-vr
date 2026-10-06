@@ -664,6 +664,60 @@ identidade da lista de comandos após reutilização e conclusão na placa de v�
 além de tratar reinicialização/desligamento do componente antes de separar os
 históricos. Os demais requisitos do mod permanecem pendentes.
 
+## Posse das texturas e lista real de comandos: 6 de outubro, continuação
+
+Criei uma parte que consegue manter objetos reais da placa de vídeo vivos
+enquanto o código precisa deles. Antes, havia somente endereços copiados.
+Uma referência COM é uma reserva de uso: impede que o objeto seja destruído
+até que essa reserva seja devolvida. Isso não congela o conteúdo da imagem.
+
+O fluxo é este:
+
+1. Recebe a lista de quatro texturas já conferida na etapa anterior.
+2. Reconhece o dono da lista de comandos. Um objeto desconhecido não é
+   aceito como uma lista real somente porque foi devolvido sem erro.
+3. Para a lista intermediária da NVIDIA, confere a tabela de funções,
+   os identificadores e a impressão digital da função instalada. Somente
+   a passagem para a lista original que foi examinada é permitida.
+4. Pede uma referência real da lista, do dispositivo e de cada textura.
+   Confere que todos pertencem ao mesmo dispositivo e que as quatro
+   texturas são objetos diferentes, mesmo se seus endereços aparentarem
+   representar interfaces diferentes do mesmo objeto.
+5. Confere formato de imagem, tamanho, ausência de múltiplas amostras
+   e a possibilidade de escrever na textura de saída. Uma falha devolve
+   todas as referências adquiridas, sem deixar uma lista parcial válida.
+6. As referências permanecem com o resultado enquanto ele existir e são
+   devolvidas automaticamente quando termina seu uso. No observador futuro
+   do jogo, são temporárias: ainda não ficam guardadas até o término na GPU.
+7. Uma função separada verifica o número de conclusão da GPU. Recusa zero
+   como destino e o valor especial que indica perda do dispositivo.
+
+Escolhi essa abordagem para impedir o uso de objetos já destruídos ou de
+outra placa. Não executei nem modifiquei comandos do jogo. A chamada geral
+do SDK da NVIDIA continua bloqueada sem inicialização e sincronização
+comprovadas; a passagem de interface conferida não precisa dessa chamada.
+
+A prova em `../artifacts/remastered-modern-streamline-command-base-evidence.json`
+confirmou a passagem de interface no componente instalado. A busca anterior
+apenas por instruções de endereço era parcial: as duas comparações do
+identificador estão na própria função. Essa análise não executa o componente.
+
+O teste independente usa texturas e comandos reais da **RTX 4070 Ti**.
+Passaram 24 cópias de imagem com espera de conclusão e conferência dos bytes
+devolvidos. Ele soltou as referências do chamador para verificar que as
+referências adquiridas mantêm as imagens vivas. Também recusou repetição,
+imagem pequena, saída sem escrita, um buffer e uma textura de outro dispositivo.
+Esse teste fabrica a associação de olho/quadro para exercitar o código;
+não é uma chamada real do DLSS nem uma imagem produzida pelo jogo.
+
+A DLL compilou e passaram **107/107 testes em 11,13 segundos**. Os resultados finais
+e os comandos estão no registro local `../artifacts/modern-dlss-ownership-port-validation.json`.
+Nada foi instalado no jogo. O mod continua **não jogável**, sem teste no Quest
+e sem medição de Novigrad. Próximo: acompanhar a reutilização da lista de
+comandos e conservar as referências até a submissão e conclusão exatas da
+GPU, tratando desligamento/reinicialização do componente antes dos históricos
+independentes por olho. A posse temporária não abre o bloqueio do Remastered.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.

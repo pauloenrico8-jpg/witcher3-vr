@@ -31,6 +31,7 @@
 #include "engine_view_constants_contract.h"
 #include "engine_dlss_contract.h"
 #include "engine_dlss_resources.h"
+#include "modern_dlss_ownership.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
 #include "engine_scene_factory.h"
@@ -42198,6 +42199,18 @@ int __fastcall hook_remastered_sl_evaluate_feature(uint32_t feature,
         scope_before, identity_before, snapshot, call, caller_rva, result, activity_serial);
     if (cpu_receipt.valid && g_config.runtime_diagnostics &&
         take_bounded_log_slot(g_remastered_dlss_counter_logs, 32)) {
+        // A scoped native callback still owns these UntilPresent resources.
+        // Acquire temporary COM references and compare real native devices.
+        // Allow only independently checked modern command-list base QI.
+        // The non-thread-safe SDK API remains closed until host SDK
+        // serialization/lifetime is verified; never use a layout offset.
+        // References retire at scope exit; they do NOT supply a GPU ticket.
+        const auto ownership = w3vr::modern_dlss_ownership::acquire(
+            cpu_receipt, classify_command_list_owner,
+            {nullptr, 0, false, w3vr::modern_dlss_ownership::installed_streamline_command_base});
+        log_line("Modern DLSS temporary native ownership accepted=%d reason=%u native_command=%p native_device=%p; recording/submission/GPU completion unverified",
+            ownership ? 1 : 0, static_cast<unsigned>(ownership.failure),
+            ownership.command.Get(), ownership.device.Get());
         const auto& b = cpu_receipt.bindings;
         log_line("Modern DLSS CPU resources eye=%d pair=%llu viewport=%u command=%p depth=%p motion=%p input=%p output=%p input_extent=%ux%u output_extent=%ux%u; borrowed addresses only, GPU completion/ownership unverified",
             cpu_receipt.identity.eye, static_cast<unsigned long long>(cpu_receipt.identity.pair_id),
