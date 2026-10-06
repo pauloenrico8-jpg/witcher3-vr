@@ -245,6 +245,97 @@ def switch_fixture():
 
 
 class BoundedSwitchTests(unittest.TestCase):
+    def joined_image(self, clobber=False, back_edge=False):
+        image = fixture()
+        image.unwind_records = {0x1000: (0x1180, 0x2000), 0x1180: (0x1190, 0x2010)}
+        image.functions = sorted((b, e) for b, (e, _) in image.unwind_records.items())
+        image.starts = [b for b, _ in image.functions]
+        image.data[:0x200] = b"\xcc" * 0x200
+        # LEA R12=image base; TEST EDX; JE alternate path; join at 1030.
+        code = bytes.fromhex("4c8d25") + struct.pack("<i", -0x1007)
+        code += bytes.fromhex("85d27415")
+        code += bytes.fromhex("4531e4") if clobber else b"\x90" * 3
+        code += b"\xe9" + struct.pack("<i", 0x1030 - 0x1013)
+        image.data[:len(code)] = code
+        image.data[0x20:0x25] = b"\xe9" + struct.pack("<i", 0x1030 - 0x1025)
+        code = bytes.fromhex("83f801773b418b8c84") + struct.pack("<I", 0x1080)
+        code += bytes.fromhex("4c01e1ffe1")
+        image.data[0x30:0x30 + len(code)] = code
+        for address in [0x1050, 0x1060]:
+            payload = b"\xe8" + struct.pack("<i", 0x1180 - address - 5) + b"\xc3"
+            if address == 0x1050 and back_edge:
+                payload = bytes.fromhex("4531e4e9") + struct.pack("<i", 0x1030 - 0x1058)
+            image.data[image.offset(address):image.offset(address) + len(payload)] = payload
+        image.data[0x70] = image.data[0x180] = 0xC3
+        struct.pack_into("<2I", image.data, image.offset(0x1080), 0x1050, 0x1060)
+        return image
+
+    def test_hoisted_base_is_proved_across_both_paths_at_a_join(self):
+        image = self.joined_image()
+        flow = image.reachable_instructions(0x1000)
+        self.assertEqual(flow["UnresolvedIndirectJumps"], [])
+        self.assertEqual(flow["ResolvedJumpTables"][0]["ImageBaseDefinitionRva"], 0x1000)
+        self.assertEqual([r["InstructionRva"] for r in analysis.direct_references(image, {0x1180})],
+                         ["0x00001050", "0x00001060"])
+
+    def test_a_clobber_on_either_incoming_path_discards_the_fact(self):
+        image = self.joined_image(clobber=True)
+        self.assertEqual(image.reachable_instructions(0x1000)["ResolvedJumpTables"], [])
+        self.assertEqual(analysis.direct_references(image, {0x1180}), [])
+
+    def test_a_new_clobbering_case_back_edge_invalidates_the_proof(self):
+        image = self.joined_image(back_edge=True)
+        with self.assertRaisesRegex(ValueError, "not preserved"):
+            image.reachable_instructions(0x1000)
+
+    def hoisted_image(self, between=b"", volatile=False):
+        image = switch_fixture()
+        base = bytes.fromhex("488d15" if volatile else "4c8d25") + struct.pack("<i", -0x1007)
+        before = base + between
+        default = 0x1038
+        branch_end = 0x1000 + len(before) + 5
+        load = bytes.fromhex("8b8c82" if volatile else "418b8c84") + struct.pack("<I", 0x1060)
+        add = bytes.fromhex("4803ca" if volatile else "4c01e1")
+        code = before + bytes.fromhex("83f80277") + bytes([default - branch_end]) + load + add + bytes.fromhex("ffe1")
+        image.data[:0x40] = b"\xcc" * 0x40
+        image.data[:len(code)] = code
+        image.data[image.offset(default)] = 0xC3
+        struct.pack_into("<3I", image.data, image.offset(0x1060), 0x1040, 0x1048, 0x1040)
+        return image
+
+    def test_hoisted_base_survives_unrelated_instructions_and_nonvolatile_call(self):
+        # The real native mode selector hoists R12 before scalar/vector work
+        # and calls. The unrelated call does not grant authority to its bytes.
+        for between in [b"\x90" * 7, b"\xe8" + struct.pack("<i", 0x1080 - 0x100C)]:
+            image = self.hoisted_image(between)
+            flow = image.reachable_instructions(0x1000)
+            self.assertEqual(flow["UnresolvedIndirectJumps"], [])
+            self.assertEqual(flow["ResolvedJumpTables"][0]["TableRva"], 0x1060)
+            self.assertTrue(any(i.address == 0x1048 for i in flow["Instructions"]))
+            self.assertFalse(any(0x1060 <= i.address < 0x106C for i in flow["Instructions"]))
+
+    def test_hoisted_base_clobber_or_volatile_call_is_not_proof(self):
+        for between, volatile in [(bytes.fromhex("4531e4"), False),
+                (bytes.fromhex("6641bc0100"), False),
+                (b"\xe8" + struct.pack("<i", 0x1080 - 0x100C), True)]:
+            image = self.hoisted_image(between, volatile)
+            self.assertEqual(image.reachable_instructions(0x1000)["ResolvedJumpTables"], [])
+
+    def test_hoisted_wrong_base_and_unrelated_definition_are_rejected(self):
+        image = self.hoisted_image()
+        image.data[3] += 1
+        self.assertEqual(image.reachable_instructions(0x1000)["ResolvedJumpTables"], [])
+        image = self.hoisted_image(bytes.fromhex("4531e4488d1500000000"))
+        self.assertEqual(image.reachable_instructions(0x1000)["ResolvedJumpTables"], [])
+
+    def test_locally_hoisted_base_is_rechecked_after_a_clobbering_incoming_path(self):
+        image = self.hoisted_image(bytes.fromhex("85d27427"))
+        # The initial contiguous path finds LEA R12. Its alternate path changes
+        # R12 and jumps back to the compare; the local pattern is insufficient.
+        image.data[0x32:0x3A] = bytes.fromhex("4531e4e9") + struct.pack("<i", 0x100B - 0x103A)
+        with self.assertRaisesRegex(ValueError, "not preserved"):
+            image.reachable_instructions(0x1000)
+
     def test_calls_inside_verified_cases_are_reached_without_decoding_table_data(self):
         image = switch_fixture()
         flow = image.reachable_instructions(0x1000)
