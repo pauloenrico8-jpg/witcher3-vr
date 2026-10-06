@@ -68,6 +68,12 @@ Além dessas funções, o código base depende de funções internas de renderiz
 endereços de retorno, tabelas globais e posições de campos dentro dos objetos.
 Esses pontos ainda precisam ser comparados. Substituir apenas os endereços da
 câmera não seria uma adaptação completa e poderia corromper a memória do jogo.
+O [inventário dos pontos antigos](diagnostics/remastered-port-inventory.json)
+registra 41 constantes de endereço e 17 entradas em duas listas de endereços.
+Onze constantes têm candidatos identificados pelos registros de funções.
+Ainda não existe verificação em execução para qualquer um desses candidatos.
+Esse inventário não inclui todos os campos de objetos ou endereços escritos
+diretamente em outras expressões; não é uma porcentagem de conclusão do port.
 
 ## O que o código novo faz, passo a passo
 

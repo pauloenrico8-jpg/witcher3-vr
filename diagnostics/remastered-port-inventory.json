@@ -1,0 +1,430 @@
+{
+  "ExecutableSha256": "9406ECCC12B68E08920931442EF6A57340E910D3E01F2082E88232487433FE51",
+  "LegacyNamedConstants": [
+    {
+      "Name": "kEngineViewConstantsRva",
+      "LegacyRva": "0x01CFE280",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kCenteredTemporalWriterReturnRva",
+      "LegacyRva": "0x01D87EC0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineTemporalWriterRva",
+      "LegacyRva": "0x015E5A90",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kGameplayFrameBuilderCallerRva",
+      "LegacyRva": "0x01D002CF",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineFrameBuilderRva",
+      "LegacyRva": "0x01D86400",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineDlssCommandEmitRva",
+      "LegacyRva": "0x007F82A0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kStreamlineInterfaceRva",
+      "LegacyRva": "0x057F59E0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineUpscalerPipelineRva",
+      "LegacyRva": "0x01DD1390",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineDlssCommandRva",
+      "LegacyRva": "0x00830330",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineGameplayEntryRva",
+      "LegacyRva": "0x01D00260",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineSceneEnqueueRva",
+      "LegacyRva": "0x01621FC0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineRenderSceneSetupRva",
+      "LegacyRva": "0x01553070",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineShadowCascadeBuildRva",
+      "LegacyRva": "0x01E60B20",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kNormalHaltonReturnRva",
+      "LegacyRva": "0x01D86EA5",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineFrustumAabbTestRva",
+      "LegacyRva": "0x0031E050",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kAnimatedComponentVisibilityReturnRva",
+      "LegacyRva": "0x015E186C",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kNativeCustomCameraVtableRva",
+      "LegacyRva": "0x02D645B0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kViewFactoryReturnRva",
+      "LegacyRva": "0x0162196D",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kViewCopyRebuildReturnRva",
+      "LegacyRva": "0x015FF863",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kGetHeadBoneIndexRva",
+      "LegacyRva": "0x01C4B550",
+      "ScriptApiName": "GetHeadBoneIndex",
+      "RemasteredCandidates": [
+        "0x02102690"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kGetBoneWorldMatrixRva",
+      "LegacyRva": "0x0152E600",
+      "ScriptApiName": "GetBoneWorldMatrixByIndex",
+      "RemasteredCandidates": [
+        "0x02251A40"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kActorIsInGameplaySceneRva",
+      "LegacyRva": "0x01C4CD70",
+      "ScriptApiName": "IsInGameplayScene",
+      "RemasteredCandidates": [
+        "0x02103880"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kActorIsInNonGameplayCutsceneRva",
+      "LegacyRva": "0x01C4CD90",
+      "ScriptApiName": "IsInNonGameplayCutscene",
+      "RemasteredCandidates": [
+        "0x021038A0"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kGameIsPlayingNonGameplaySceneRva",
+      "LegacyRva": "0x01549800",
+      "ScriptApiName": "IsCurrentlyPlayingNonGameplayScene",
+      "RemasteredCandidates": [
+        "0x0226CDB0"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kCameraEnableManualControlRva",
+      "LegacyRva": "0x01F580E0",
+      "ScriptApiName": "EnableManualControl",
+      "RemasteredCandidates": [
+        "0x01E07620"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kTopmostCameraObjectRva",
+      "LegacyRva": "0x0161B9C0",
+      "ScriptApiName": "GetTopmostCameraObject",
+      "RemasteredCandidates": [
+        "0x0237A0A0"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kIsLoadingScreenVideoPlayingRva",
+      "LegacyRva": "0x0154EED0",
+      "ScriptApiName": "IsLoadingScreenVideoPlaying",
+      "RemasteredCandidates": [
+        "0x02271A80"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineCameraDirectionRva",
+      "LegacyRva": "0x0161BBC0",
+      "ScriptApiName": "GetCameraDirection",
+      "RemasteredCandidates": [
+        "0x0237A1C0",
+        "0x02470440"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kTransformToEulerRva",
+      "LegacyRva": "0x02C9C30",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kScriptArgumentDecoderTableRva",
+      "LegacyRva": "0x057ED890",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kScriptOutParameterRva",
+      "LegacyRva": "0x057F58E0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kProjectionNearThresholdRva",
+      "LegacyRva": "0x02D84B2C",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kProjectionNumeratorRva",
+      "LegacyRva": "0x02D84EA0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kProjectionYSignMaskRva",
+      "LegacyRva": "0x02D865B0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kWorldVectorToViewRatioRva",
+      "LegacyRva": "0x0161BDA0",
+      "ScriptApiName": "WorldVectorToViewRatio",
+      "RemasteredCandidates": [
+        "0x0237A720"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineTemporalCameraBuildRva",
+      "LegacyRva": "0x015FE010",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineViewRebuildRva",
+      "LegacyRva": "0x015FE550",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineViewCopyRebuildRva",
+      "LegacyRva": "0x015FF640",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineFrameDataFactoryRva",
+      "LegacyRva": "0x016214C0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kEngineIsAnyMenuRva",
+      "LegacyRva": "0x01F3C5C0",
+      "ScriptApiName": "IsAnyMenu",
+      "RemasteredCandidates": [
+        "0x01DEE020"
+      ],
+      "Evidence": "NamedRegistrationOnly",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    },
+    {
+      "Name": "kViewportResolutionRva",
+      "LegacyRva": "0x01563DC0",
+      "ScriptApiName": null,
+      "RemasteredCandidates": [],
+      "Evidence": "NotMapped",
+      "RuntimeVerified": false,
+      "ObjectLayoutVerified": false
+    }
+  ],
+  "LegacyAddressArrays": {
+    "kAsymmetricTemporalWriterReturnRvas": [
+      "0x01553A78",
+      "0x01553E1B",
+      "0x01D861E3",
+      "0x01D86DBC",
+      "0x01D86EA5",
+      "0x01D87606",
+      "0x01D87925",
+      "0x01D87EC0"
+    ],
+    "kAsymmetricCullingFrustumReturnRvas": [
+      "0x01D678CC",
+      "0x01E12543",
+      "0x01DE4622",
+      "0x01DACDA2",
+      "0x01DACE1A",
+      "0x01DACECC",
+      "0x01DAD0D0",
+      "0x01DAD165",
+      "0x01DAD3C2"
+    ]
+  },
+  "NamedConstantCount": 41,
+  "NamedConstantsWithRegistrationCandidates": 11,
+  "RenderAddressMappingsVerified": false,
+  "RuntimePortEnabled": false,
+  "Notes": [
+    "Registration addresses are script callbacks, not necessarily the underlying native engine functions.",
+    "GetCurrentViewportResolution is a script callback and cannot replace the four-argument internal viewport function.",
+    "This inventory covers named RVA declarations and two address arrays. It does not cover every object field offset or inline address.",
+    "All candidates require ABI, owner type, memory layout and in-game validation before installation."
+  ]
+}
