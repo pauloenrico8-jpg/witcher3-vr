@@ -15,8 +15,16 @@ import struct
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".analysis-packages"))
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_GRP_JUMP
 from capstone.x86 import X86_OP_MEM, X86_OP_IMM, X86_OP_REG, X86_REG_RIP, X86_REG_RAX
+
+
+def ensure_report_destination(destination: Path, *inputs: Path):
+    target = destination.resolve()
+    for source in inputs:
+        if target == source.resolve() or (destination.exists() and source.exists()
+                                          and destination.samefile(source)):
+            raise ValueError("Report destination would overwrite an input file")
 
 
 class Image:
@@ -44,12 +52,16 @@ class Image:
             self.sections.append((name, va, size, raw, flags))
         exception_rva, exception_size = struct.unpack_from("<II", self.data, optional + 112 + 3 * 8)
         self.functions = []
+        self.unwind_records = {}
         for offset in range(self.offset(exception_rva), self.offset(exception_rva) + exception_size, 12):
-            begin, end, _ = struct.unpack_from("<III", self.data, offset)
+            begin, end, unwind = struct.unpack_from("<III", self.data, offset)
             if begin < end:
                 self.functions.append((begin, end))
+                self.unwind_records[begin] = (end, unwind)
         self.functions.sort()
         self.starts = [begin for begin, _ in self.functions]
+        self._primary_entries = {}
+        self._function_chunks = None
         self.decoder = Cs(CS_ARCH_X86, CS_MODE_64)
         self.decoder.detail = True
 
@@ -77,6 +89,114 @@ class Image:
         offset = self.offset(begin)
         return list(self.decoder.disasm(self.data[offset:offset + end - begin], begin))
 
+    def read(self, rva: int, size: int) -> bytes:
+        """Read a complete range from one file-backed section, without zero fill."""
+        for _, va, length, raw, _ in self.sections:
+            if size >= 0 and va <= rva and rva + size <= va + length:
+                offset = raw + rva - va
+                if offset + size <= len(self.data):
+                    return self.data[offset:offset + size]
+        raise ValueError(f"Range outside file-backed sections: {rva:#x}+{size:#x}")
+
+    def executable(self, rva: int) -> bool:
+        return any(va <= rva < va + size and flags & 0x20000000
+                   for _, va, size, _, flags in self.sections)
+
+    def primary_function_rva(self, rva: int):
+        """Follow checked UNW_FLAG_CHAININFO records to the primary entry.
+
+        A .pdata range may start in the middle of a function. Only the final
+        primary record supplies an entry candidate. Never join intervening
+        bytes or silently accept malformed/cyclic chains.
+        https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
+        """
+        bounds = self.function(rva)
+        if bounds is None:
+            return None
+        current = bounds[0]
+        visited = []
+        while current not in self._primary_entries:
+            if current in visited or len(visited) >= 64:
+                raise ValueError("Cyclic or excessively long unwind chain")
+            visited.append(current)
+            end, unwind = self.unwind_records[current]
+            version_flags, _, count, _ = self.read(unwind, 4)
+            flags = version_flags >> 3
+            version = version_flags & 7
+            # The game also contains three unchained version-2 CRT records.
+            # Their header identifies a primary range; epilogue codes need not
+            # be decoded here. Do not claim support for a version-2 chain.
+            if version not in {1, 2} or flags & ~7 or (version == 2 and flags & 4):
+                raise ValueError("Unsupported unwind format")
+            if not flags & 4:
+                self._primary_entries[current] = current
+                break
+            if flags & 3:
+                raise ValueError("Chained unwind record also declares a handler")
+            chain_rva = unwind + 4 + ((count + 1) & ~1) * 2
+            parent, parent_end, parent_unwind = struct.unpack("<III", self.read(chain_rva, 12))
+            if self.unwind_records.get(parent) != (parent_end, parent_unwind):
+                raise ValueError("Unwind chain does not match an indexed runtime function")
+            if not self.executable(parent):
+                raise ValueError("Unwind parent is outside executable sections")
+            current = parent
+        primary = self._primary_entries[current]
+        for fragment in visited:
+            self._primary_entries[fragment] = primary
+        return primary
+
+    def function_chunks(self, rva: int):
+        primary = self.primary_function_rva(rva)
+        if primary is None:
+            return []
+        if self._function_chunks is None:
+            chunks = {}
+            for begin, end in self.functions:
+                entry = self.primary_function_rva(begin)
+                chunks.setdefault(entry, []).append((begin, end))
+            self._function_chunks = chunks
+        return self._function_chunks[primary]
+
+    def reachable_instructions(self, rva: int):
+        """Bounded control-flow decode; never decode data after a return as code.
+
+        Seed primary and checked unwind fragment entries, follow direct branches
+        inside those ranges, but don't guess targets of indirect jumps. This is
+        deliberately incomplete when a jump table hasn't been resolved.
+        """
+        chunks = self.function_chunks(rva)
+        starts = [begin for begin, _ in chunks]
+        pending = list(starts)
+        decoded = {}
+        indirect = set()
+        failures = set()
+        while pending:
+            address = pending.pop()
+            while address not in decoded:
+                index = bisect.bisect_right(starts, address) - 1
+                if index < 0 or not chunks[index][0] <= address < chunks[index][1]:
+                    break
+                end = chunks[index][1]
+                instruction = next(self.decoder.disasm(self.read(address, min(15, end - address)),
+                                                      address, count=1), None)
+                if instruction is None:
+                    failures.add(address)
+                    break
+                decoded[address] = instruction
+                if instruction.mnemonic in {"ret", "retf", "iret", "iretd", "iretq", "int3", "ud2", "hlt"}:
+                    break
+                if instruction.group(CS_GRP_JUMP):
+                    operand = instruction.operands[0]
+                    if operand.type == X86_OP_IMM:
+                        pending.append(operand.imm)
+                    else:
+                        indirect.add(address)
+                    if instruction.mnemonic == "jmp":
+                        break
+                address += instruction.size
+        return {"Instructions": [decoded[address] for address in sorted(decoded)],
+                "UnresolvedIndirectJumps": sorted(indirect), "DecodeFailures": sorted(failures)}
+
     def occurrences(self, value: bytes):
         start = 0
         while (start := self.data.find(value, start)) >= 0:
@@ -93,7 +213,7 @@ class Image:
         Decode each enclosing unwind function once before accepting a match.
         """
         possible_functions = set()
-        pattern = re.compile(rb"[\x48-\x4f][\x8d\x8b][\x05\x0d\x15\x1d\x25\x2d\x35\x3d]....", re.DOTALL)
+        pattern = re.compile(rb"(?=([\x48-\x4f][\x8d\x8b\x89][\x05\x0d\x15\x1d\x25\x2d\x35\x3d]....))", re.DOTALL)
         for _, va, size, raw, flags in self.sections:
             if not flags & 0x20000000:
                 continue
@@ -106,8 +226,9 @@ class Image:
                     if function:
                         possible_functions.add(function)
         references = []
-        for begin, end in sorted(possible_functions):
-            for insn in self.instructions(begin, end):
+        primary_entries = {self.primary_function_rva(begin) for begin, _ in possible_functions}
+        for begin in sorted(primary_entries):
+            for insn in self.reachable_instructions(begin)["Instructions"]:
                 for operand in insn.operands:
                     if operand.type == X86_OP_MEM and operand.mem.base == X86_REG_RIP:
                         target = insn.address + insn.size + operand.mem.disp
@@ -138,7 +259,7 @@ def registration_candidates(image: Image, strings: dict, references: list):
             name_rva = int(ref["InstructionRva"], 16)
             bounds = image.function(name_rva)
             if bounds not in cache:
-                cache[bounds] = image.instructions(*bounds)
+                cache[bounds] = image.reachable_instructions(bounds[0])["Instructions"]
             instructions = cache[bounds]
             for index, insn in enumerate(instructions):
                 if not name_rva - 80 <= insn.address < name_rva or insn.mnemonic != "lea":
@@ -150,7 +271,7 @@ def registration_candidates(image: Image, strings: dict, references: list):
                     continue
                 target = insn.address + insn.size + source.mem.disp
                 callback_bounds = image.function(target)
-                indexed_start = bool(callback_bounds and callback_bounds[0] == target)
+                indexed_start = bool(callback_bounds and image.primary_function_rva(target) == target)
                 if callback_bounds and not indexed_start:
                     continue
                 executable_target = any(va <= target < va + size and flags & 0x20000000
@@ -184,7 +305,7 @@ def registration_candidates(image: Image, strings: dict, references: list):
                         length_basis = "FirstReturnWithin64Bytes_NoUnwindRecord"
                     offset = image.offset(start)
                     records.append({"CandidateRva": f"0x{target:08X}",
-                        "RegistrationFunctionRva": f"0x{bounds[0]:08X}",
+                        "RegistrationFunctionRva": f"0x{image.primary_function_rva(name_rva):08X}",
                         "NameReferenceRva": f"0x{name_rva:08X}",
                         "PointerLoadRva": f"0x{insn.address:08X}",
                         "PointerStoreRva": f"0x{store.address:08X}",
@@ -201,6 +322,7 @@ def main():
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
+    ensure_report_destination(args.report, args.exe)
     image = Image(args.exe)
     names = ["GetHeadBoneIndex", "GetBoneWorldMatrixByIndex", "IsInGameplayScene",
              "IsInNonGameplayCutscene", "IsCurrentlyPlayingNonGameplayScene",
