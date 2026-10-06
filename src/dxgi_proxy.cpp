@@ -23,6 +23,8 @@
 #include "command_list_identity.h"
 #include "cinema_aspect.h"
 #include "openxr_eye_geometry.h"
+#include "motion_controllers.h"
+#include "legacy_engine_preflight.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
@@ -491,6 +493,7 @@ IDxcUtils* g_dxc_utils{};
 IDxcCompiler3* g_dxc_compiler{};
 std::mutex g_log_mutex{};
 std::once_flag g_init_once{};
+std::atomic<bool> g_legacy_engine_layout_accepted{};
 std::once_flag g_openxr_once{};
 std::once_flag g_performance_cpu_sets_once{};
 std::atomic<uint64_t> g_present_count{};
@@ -526,6 +529,8 @@ constexpr int kRtHistoryMaximumBufferCount = 16;
 
 struct Config {
     bool openxr_enabled{true};
+    bool motion_controllers_enabled{false};
+    bool motion_controllers_diagnostics{false};
     int openxr_mode{1};
     // V12033 keeps both launcher families on the proven Mode-3 producer.
     // This flag changes only its cadence: false is original strict Stereo,
@@ -1325,6 +1330,7 @@ std::atomic<float> g_xr_visibility_half_tan_y{};
 std::atomic<bool> g_xr_visibility_bounds_valid{};
 XrInstance g_xr_instance{XR_NULL_HANDLE};
 XrSession g_xr_session{XR_NULL_HANDLE};
+w3vr::motion::Controllers g_motion_controllers;
 XrSpace g_xr_space{XR_NULL_HANDLE};
 XrSpace g_xr_view_space{XR_NULL_HANDLE};
 XrSystemId g_xr_system{};
@@ -14288,6 +14294,8 @@ void load_config() {
         g_config.renderdoc_streamline_device_bridge = read_ini_bool(
             "renderdoc", "streamline_device_bridge", false);
         g_config.openxr_enabled = read_ini_bool("openxr", "enabled", true);
+        g_config.motion_controllers_enabled = read_ini_bool("motion_controllers", "enabled", false);
+        g_config.motion_controllers_diagnostics = read_ini_bool("motion_controllers", "diagnostics", false);
         // Intentionally isolated in its own INI. The launcher never touches
         // this manual test gate; a missing file/key keeps normal AFW enabled.
         g_config.puredark_afw_enabled = read_sidecar_ini_bool(
@@ -43633,6 +43641,24 @@ void install_xinput_snap_turn_hook() {
     }
 }
 
+bool legacy_engine_preflight_for_process() {
+    const auto* module = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    if (module == nullptr) return false;
+    __try {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+            dos->e_lfanew > 0x100000) return false;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(module + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE ||
+            nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+            nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+        return w3vr::legacy_engine_layout_matches(
+            {module, nt->OptionalHeader.SizeOfImage});
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void ensure_initialized() {
     std::call_once(g_init_once, []() {
         // [DEBUG:RENDERDOC-DLSS-CAPTURE V12103 3/3] Load the manual INI gate
@@ -43640,6 +43666,17 @@ void ensure_initialized() {
         // with the default OFF setting the adjacent DLL is never loaded.
         initialize_real_dxgi_exports();
         load_config();
+        // Reject the observed Remastered layout before installing ANY legacy
+        // engine, graphics, input or upscaler hooks. Keep Windows DXGI exports
+        // available so loading an unsupported development DLL does not attempt
+        // to run the old fixed-address code. This is not a Remastered port.
+        if (!legacy_engine_preflight_for_process()) {
+            log_line("Quest3 development build disabled: legacy 4.04 callback "
+                "layout mismatch. Engine hooks and VR remain inactive; "
+                "Remastered requires a verified port.");
+            return;
+        }
+        g_legacy_engine_layout_accepted.store(true, std::memory_order_release);
         if (g_config.renderdoc_capture_enabled &&
             g_config.renderdoc_streamline_device_bridge) {
             initialize_real_d3d12_create_device_export();
@@ -45979,6 +46016,12 @@ void initialize_openxr_probe() {
             return;
         }
 
+        if (g_config.motion_controllers_enabled) {
+            const auto motion_result = g_motion_controllers.initialize(
+                g_xr_instance, g_xr_session, pfn_xrGetInstanceProcAddr);
+            log_line("Motion controllers initialization result=%s (%d); tracking only, gameplay adapter pending",
+                xr_result_name(motion_result), motion_result);
+        }
         refresh_openxr_visibility_bounds();
 
         XrReferenceSpaceCreateInfo space_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
@@ -46015,6 +46058,9 @@ void poll_openxr_events() {
         if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
             g_xr_session_state = changed->state;
+            if (changed->state != XR_SESSION_STATE_FOCUSED) {
+                g_motion_controllers.invalidate();
+            }
             log_line("OpenXR session state changed=%d", static_cast<int>(g_xr_session_state));
 
             if (g_xr_session_state == XR_SESSION_STATE_READY && !g_xr_session_running) {
@@ -46262,6 +46308,24 @@ void update_hmd_freelook_pose() {
     g_hmd_pose_valid.store(true, std::memory_order_release);
 }
 
+void update_motion_controllers(XrTime display_time) {
+    if (!g_config.motion_controllers_enabled) return;
+    g_motion_controllers.update(g_xr_space, display_time,
+        g_xr_session_state == XR_SESSION_STATE_FOCUSED);
+    // Optional 1 Hz diagnostics only. No per-frame disk writes.
+    if (g_config.motion_controllers_diagnostics) {
+        static XrTime last_logged{};
+        if (display_time - last_logged >= 1000000000) {
+            last_logged = display_time;
+            const auto frame = g_motion_controllers.snapshot();
+            log_line("Motion tracking time=%lld ready=%d focused=%d result=%d left=%d right=%d left_trigger=%.3f right_trigger=%.3f",
+                static_cast<long long>(frame.display_time), frame.ready, frame.focused, frame.result,
+                frame.hands[0].grip_tracked, frame.hands[1].grip_tracked,
+                frame.hands[0].trigger, frame.hands[1].trigger);
+        }
+    }
+}
+
 void prepare_openxr_render_frame(uint32_t origin) {
     if (!g_config.hmd_freelook || g_xr_render_frame_prepared.load() ||
         !g_xr_resources_ready || !g_xr_session_running) {
@@ -46308,6 +46372,7 @@ void prepare_openxr_render_frame(uint32_t origin) {
         g_xr_frame_prepare_origin.store(origin, std::memory_order_relaxed);
     }
 
+    update_motion_controllers(frame_state.predictedDisplayTime);
     XrViewState view_state{XR_TYPE_VIEW_STATE};
     XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
     locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -48425,6 +48490,7 @@ void render_openxr_test_frame(
             g_xr_frame_prepare_origin.store(3, std::memory_order_relaxed);
         }
 
+        update_motion_controllers(frame_state.predictedDisplayTime);
         XrViewState view_state{XR_TYPE_VIEW_STATE};
         XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
         locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -53437,7 +53503,8 @@ HRESULT STDMETHODCALLTYPE hook_create_swapchain(
 void hook_factory(void* factory) {
     ensure_initialized();
 
-    if (factory == nullptr) {
+    if (factory == nullptr ||
+        !g_legacy_engine_layout_accepted.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -53545,7 +53612,8 @@ void unregister_reshade_overlay_event() {
 // Per-frame order is therefore ReShade::Present -> Witcher3VR::Present -> XR.
 bool prepare_secondary_reshade_runtime() {
     std::call_once(g_reshade_secondary_once, []() {
-        if (!current_process_is_witcher3()) {
+        if (!current_process_is_witcher3() ||
+            !g_legacy_engine_layout_accepted.load(std::memory_order_acquire)) {
             return;
         }
 
@@ -53751,6 +53819,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void* reserved) {
             return TRUE;
         }
         unregister_reshade_overlay_event();
+        g_motion_controllers.shutdown();
         if (g_xr_session != XR_NULL_HANDLE && pfn_xrDestroySession != nullptr) {
             pfn_xrDestroySession(g_xr_session);
         }
