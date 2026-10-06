@@ -580,3 +580,62 @@ Logs locais `../artifacts/*view-constants-20261006.log`. Relatório novo LOCAL
 Próximo passo: verificar o produtor de tags e avaliação modernos e o pipeline
 candidato `01D2B640`, mapear separadamente os guards e conservar os objetos
 FrameToken/ViewportHandle em todas as chamadas. Nenhum teste de jogo/Quest/FPS.
+
+## ABI de tags/avaliação e contadores distintos: 6 de outubro
+
+A varredura das CALLs RIP FF15 da IAT, aceitas somente em instruções
+decodificadas de funções com unwind, identificou `slSetTagForFrame` (IAT
+`02984CF0`) e `slEvaluateFeature` (`02984CF8`). O produtor de tags é `01ED28F0`,
+com RETURNs `01ED2ADA` e `01ED2BA0`, incluindo seu caminho de remoção.
+O avaliador `01ED2C00` chama feature 0 em `01ED322A` (RETURN `01ED3230`).
+O avaliador `01ED32B0` chama feature 1001 em `01ED3F8A` (RETURN `01ED3F90`).
+São DLSS e DLSS Ray Reconstruction respectivamente, não geração de quadros.
+Essa evidência não prova que todos os caminhos dinâmicos foram encontrados.
+
+As funções nativas `01B77EB0` e `01B77890` verificam estado+124 contra
+descritor+C40. A preparação `01B78CE0` usa estado+128 contra C40 e pode
+atualizar +124 quando a entrada já foi preparada. O builder usa +120/C44.
+`engine_dlss_contract.h` mantém C40 e C44 independentes, lê ambos os guards
+sem escrevê-los e aceita somente o contrato canônico 5.00c. Não existe um
+deslocamento único em relação ao layout antigo. O cooldown em estado+17C
+e o receptor dos métodos ainda precisam ser compreendidos; não são zerados.
+
+O ABI moderno de tags é `(token*, viewport*, tags*, count, command*)`; o de
+avaliação é `(feature, token*, inputs**, count, command*)`. Os novos tipos e
+encaminhadores não compartilham trampolines legados, preservam ponteiros de
+64 bits, arrays, quinta posição do comando, contagens e retorno real. Não
+interpretam ResourceTag/Resource usando os offsets antigos. Nenhum token é
+desreferenciado. A leitura de viewport exige header sem cadeia, GUID
+`171B6435-9B3C-4FC8-9994-FBE52569AAA4`, versão 1 e id diferente de UINT_MAX.
+Lê +20 em um objeto de 0x28 bytes. Dados desconhecidos são encaminhados intactos.
+A avaliação interpreta apenas o caminho nativo examinado de uma entrada;
+arrays arbitrários continuam sendo repassados inteiros.
+
+A instalação moderna cria constantes, tags e avaliação, publica readiness
+somente quando todos foram ativados e faz rollback dos hooks criados se
+houver falha. Só limpa um trampoline após remoção bem-sucedida: uma detour
+ainda ativa precisa conservar sua função original. Readiness false impede
+recibos de constantes em uma instalação parcial. A remoção/ativação ainda não
+foi exercitada no jogo. Logs limitados são observações posteriores ao retorno
+do SDK, não recibos de conclusão na GPU. Tags compartilham um produtor entre
+features; nenhuma identidade de olho é inferida só do TLS.
+
+Referência primária de assinaturas e identidade dos objetos:
+[API oficial](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_core_api.h),
+[tipos oficiais](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_core_types.h).
+O layout nativo e os sites vêm da evidência local do executável identificado.
+
+Validação: DLL compilada, 105/105 CTest em 11,68s; testes com ponteiros opacos
+de 64 bits, quinta posição, arrays completos, erros, objetos inválidos e
+campos distintos. Nenhuma execução no jogo, Quest ou medição de FPS.
+Os relatórios `../artifacts/remastered-modern-streamline-call-owners.json`,
+`remastered-modern-streamline-producers.json`, `remastered-modern-dlss-state-methods.json`,
+`remastered-modern-dlss-method-rtti.json` e `remastered-modern-dlss-method-rip-owners.json`
+permanecem exclusivamente locais. As duas últimas buscas não localizaram
+receptores, sem provar sua inexistência. O candidato `01D2B640` não foi
+confirmado como pipeline de DLSS e não recebe uma assinatura presumida.
+
+Próximo: examinar o getter de opções e seu setter dinâmico, localizar o
+receptor/rota real de avaliação e verificar IDs de viewport, limites e
+históricos separados. Não usar `id | eye`: ids ímpares podem colidir. O gate
+global e a reentrada moderna permanecem fechados até o port completo.
