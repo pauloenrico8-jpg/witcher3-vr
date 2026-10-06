@@ -423,6 +423,47 @@ testes não abrem o jogo nem demonstram VR ou 60 FPS. Evidência nativa local:
 `../artifacts/remastered-preparation-evidence.json`. A comparação completa do
 fork e o próximo passo ficam registrados em `../CONTINUAR-QUEST3.md`.
 
+## Campos de câmera por versão: etapa de 6 de outubro
+
+O mapa de campos está em `src/engine_camera_layout.h`. Um campo é uma posição
+dentro dos dados guardados pelo jogo: por exemplo, onde fica a largura da
+imagem. A versão nova mudou essas posições de maneiras diferentes. Somar o
+mesmo número a todas elas faria o mod ler ou escrever dados errados.
+
+O código desta etapa funciona assim:
+
+1. Usa a versão já aceita pela inicialização para escolher o mapa. Uma versão
+   desconhecida não recebe automaticamente o mapa antigo.
+2. Distingue o descritor da cena dos dados completos da imagem. O segundo
+   contém o descritor em outra posição; por isso, suas câmeras têm endereços
+   diferentes. A câmera secundária nova fica em frame+600, não frame+530.
+3. Lê posição, orientação, campo de visão, pequenos deslocamentos de câmera
+   e tamanho da imagem nos campos daquela versão. Esses deslocamentos,
+   chamados jitter, ajudam algumas técnicas de suavização a combinar imagens.
+   No Remastered, o local antigo do jitter agora contém parte de uma matriz,
+   um conjunto de números usado para calcular a imagem.
+4. Guarda o resultado somente se a leitura inteira estiver disponível. Dados
+   incompletos não substituem uma leitura anterior válida. Os verificadores
+   das duas câmeras e os registros da fábrica agora usam esse mesmo mapa.
+5. Recusa instalar o escritor temporal antigo no Remastered. A função nova
+   encontrada tem duas chamadas de supersampling — vários desenhos de uma
+   cena para combinar amostras — e outra do desenho final 2D. Uma chamada
+   restaura valores anteriores. Ela precisa ser tratada separadamente para
+   não aplicar o deslocamento de um olho duas vezes.
+
+A DLL compilou e os 103 testes do CTest passaram. O teste novo usa dados
+montados no PC para conferir câmeras distintas, posições antigas que agora
+contêm outros dados, limites de leitura, versão desconhecida e separação das
+três rotas novas. Os testes não executam essas funções dentro do jogo.
+
+Ainda faltam as rotas temporais da imagem normal, as constantes enviadas à
+placa de vídeo e os outros pontos de câmera e jogo. A inicialização continua
+aceitando somente 4.04; o mod não está funcionando no Remastered nem foi
+instalado nesta etapa. Não houve teste no Quest ou medição de FPS.
+Logs locais: `../artifacts/build-camera-layout-final-20261006.log` e
+`../artifacts/test-camera-layout-final-20261006.log`. O relatório novo
+`../artifacts/remastered-camera-layout-evidence.json` permanece local.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.
