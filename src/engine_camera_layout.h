@@ -10,8 +10,8 @@
 
 namespace w3vr::engine_camera_layout {
 
-// Field placement only. This does not authorize a game version, a camera
-// hook, matrix semantics, or a temporal/optical-center route. The 5.00c data
+// Field placement and bounded writer-route data. This does not authorize a
+// game version, matrix semantics, or a complete temporal/optical-center port. The 5.00c data
 // were examined in executable SHA-256 9406ECCC12B68E08920931442EF6A57340E910D3E01F2082E88232487433FE51.
 struct Layout {
     std::size_t camera_bytes;
@@ -82,7 +82,7 @@ inline bool read_fields(std::span<const std::uint8_t> view,
     return true;
 }
 
-enum class WriterPurpose { unknown, supersample_apply, supersample_restore,
+enum class WriterPurpose { unknown, normal_temporal, supersample_apply, supersample_restore,
     final_2d_override };
 
 struct WriterCandidate {
@@ -91,7 +91,8 @@ struct WriterCandidate {
 };
 
 inline constexpr std::uint32_t remastered_writer_rva = 0x022B51E0;
-inline constexpr std::array<WriterCandidate, 3> remastered_writer_candidates{{
+inline constexpr std::array<WriterCandidate, 4> remastered_writer_candidates{{
+    {0x01C14BD1, WriterPurpose::normal_temporal},
     {0x01D59287, WriterPurpose::supersample_apply},
     {0x01D59880, WriterPurpose::supersample_restore},
     {0x01D59D27, WriterPurpose::final_2d_override}}};
@@ -103,11 +104,53 @@ inline WriterPurpose remastered_writer_purpose(std::uintptr_t return_rva) {
     return WriterPurpose::unknown;
 }
 
-// These new calls are NOT replacements for the eight legacy routes. The
+inline constexpr std::array<std::uintptr_t, 8> legacy_writer_returns{
+    0x01553A78, 0x01553E1B, 0x01D861E3, 0x01D86DBC,
+    0x01D86EA5, 0x01D87606, 0x01D87925, 0x01D87EC0};
+
+// Entry/route selection is reached only after the main version preflight.
+// Adding the 5.00c data does not change that preflight's rejection of 5.00c.
+inline std::uintptr_t temporal_writer_rva(
+    const engine_camera::TemporalContract* contract) {
+    if (contract == &engine_camera::legacy_404) return 0x015E5A90;
+    if (contract == &engine_camera::remastered_500c) return remastered_writer_rva;
+    return 0;
+}
+
+inline bool normal_temporal_route(const engine_camera::TemporalContract* contract,
+    std::uintptr_t return_rva) {
+    if (contract == &engine_camera::legacy_404) {
+        for (const auto rva : legacy_writer_returns) if (rva == return_rva) return true;
+    }
+    if (contract == &engine_camera::remastered_500c)
+        return remastered_writer_purpose(return_rva) == WriterPurpose::normal_temporal;
+    return false;
+}
+
+inline bool legacy_centered_writer_hint(
+    const engine_camera::TemporalContract* contract, std::uintptr_t return_rva) {
+    return contract == &engine_camera::legacy_404 && return_rva == 0x01D87EC0;
+}
+
+// Current jitter, not previous jitter or the history-record block. This
+// setter's RCX is a descriptor; it is not the containing frame pointer.
+inline bool descriptor_jitter_offsets(const engine_camera::TemporalContract* contract,
+    std::array<std::size_t, 2>& result) {
+    const auto* layout = selected(contract);
+    if (layout == nullptr) return false;
+    result = {layout->descriptor_cameras[0] + layout->jitter,
+              layout->descriptor_cameras[1] + layout->jitter};
+    return true;
+}
+
+// These new calls are NOT one-to-one replacements for the eight legacy routes. The
 // supersampling loop restores values it captured; adding the optical center
 // again on restore would accumulate it. Final2D's inputs need a separate
 // ownership/source contract. Do not install either an old RVA or this candidate
-// as a complete Remastered temporal hook merely because its ABI matches.
+// as a complete Remastered port merely because its ABI matches. The normal
+// call was reached through the validated mode table at 01C14B72. The builder
+// separately stores previous jitter at descriptor+4E0/+4E4 AFTER the setter;
+// that write is not proof that the previous projection has been ported.
 inline bool legacy_temporal_writer_allowed(
     const engine_camera::TemporalContract* contract) {
     return contract == &engine_camera::legacy_404;

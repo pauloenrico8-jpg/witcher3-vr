@@ -2698,10 +2698,8 @@ constexpr bool kAsymmetricAuthorityAuditBuild = true;
 bool asymmetric_authority_audit_active() {
     return kAsymmetricAuthorityAuditBuild && g_config.runtime_diagnostics;
 }
-constexpr std::array<uintptr_t, 8> kAsymmetricTemporalWriterReturnRvas{
-    0x01553A78, 0x01553E1B,
-    0x01D861E3, 0x01D86DBC, 0x01D86EA5, 0x01D87606,
-    0x01D87925, 0x01D87EC0};
+constexpr auto kAsymmetricTemporalWriterReturnRvas =
+    w3vr::engine_camera_layout::legacy_writer_returns;
 constexpr std::array<uintptr_t, 9> kAsymmetricCullingFrustumReturnRvas{
     0x01D678CC, 0x01E12543, 0x01DE4622, 0x01DACDA2, 0x01DACE1A,
     0x01DACECC, 0x01DAD0D0, 0x01DAD165, 0x01DAD3C2};
@@ -29856,13 +29854,13 @@ void __fastcall hook_engine_temporal_writer(
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva =
         reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
-    bool native_asymmetric_known_route{};
-    for (const auto route_rva : kAsymmetricTemporalWriterReturnRvas) {
-        if (caller_rva == route_rva) {
-            native_asymmetric_known_route = true;
-            break;
-        }
-    }
+    const auto* camera_contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    const bool native_asymmetric_known_route =
+        w3vr::engine_camera_layout::normal_temporal_route(camera_contract, caller_rva);
+    std::array<size_t, 2> jitter_offsets{};
+    const bool jitter_layout_valid =
+        w3vr::engine_camera_layout::descriptor_jitter_offsets(camera_contract, jitter_offsets);
     EngineFrameTag native_asymmetric_tag{};
     const bool native_asymmetric_tag_valid =
         native_asymmetric_noaa_route_active() &&
@@ -29906,7 +29904,6 @@ void __fastcall hook_engine_temporal_writer(
     // aligned the final resolve but detached terrain/material sampling from the
     // scene projection. V1130 removes the pair-FOV center only from the private
     // resolve CB10 using the runtime-proven pixel/texture-Y encoding.
-    constexpr uintptr_t kCenteredTemporalWriterReturnRva = 0x01D87EC0;
     // [TRIAL:NATIVE-STEREO-DLSS V1136] The later temporal writer receives an
     // already-centered value on validated TAAU runs, but that property was
     // previously hard-coded to the backend.  Detect the actual value instead:
@@ -29916,7 +29913,7 @@ void __fastcall hook_engine_temporal_writer(
         native_asymmetric_center_applied &&
         (temporal_backend_is_taau() ||
             g_config.temporal_backend == TemporalBackend::Dlss) &&
-        caller_rva == kCenteredTemporalWriterReturnRva &&
+        w3vr::engine_camera_layout::legacy_centered_writer_hint(camera_contract, caller_rva) &&
         fabsf(value0 - native_asymmetric_descriptor.
             redengine_center_offset_px_x) <= 1.0f &&
         fabsf(value1 - native_asymmetric_descriptor.
@@ -29930,6 +29927,7 @@ void __fastcall hook_engine_temporal_writer(
     }
     const bool asymmetric_capture_candidate =
         asymmetric_authority_audit_active() && temporal_data != nullptr &&
+        w3vr::engine_camera_layout::legacy_temporal_writer_allowed(camera_contract) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0;
     size_t pre_route_index = kAsymmetricTemporalWriterReturnRvas.size();
@@ -29962,12 +29960,12 @@ void __fastcall hook_engine_temporal_writer(
         g_asymmetric_temporal_route_logs[pre_route_index].load(
             std::memory_order_relaxed) < post_capture_limit;
     const bool primary_pre_valid = pre_capture_requested &&
-        temporal_bytes != nullptr && safe_copy_asymmetric_authority(
-            temporal_bytes + 0x410, primary_pre_jitter,
+        temporal_bytes != nullptr && jitter_layout_valid && safe_copy_asymmetric_authority(
+            temporal_bytes + jitter_offsets[0], primary_pre_jitter,
             sizeof(primary_pre_jitter));
     const bool secondary_pre_valid = pre_capture_requested &&
-        temporal_bytes != nullptr && safe_copy_asymmetric_authority(
-            temporal_bytes + 0x920, secondary_pre_jitter,
+        temporal_bytes != nullptr && jitter_layout_valid && safe_copy_asymmetric_authority(
+            temporal_bytes + jitter_offsets[1], secondary_pre_jitter,
             sizeof(secondary_pre_jitter));
     AsymmetricPreRebuildHashes primary_pre_hashes{};
     AsymmetricPreRebuildHashes secondary_pre_hashes{};
@@ -29984,12 +29982,12 @@ void __fastcall hook_engine_temporal_writer(
     const float native_expected_post_value0 = routed_value0;
     const float native_expected_post_value1 = routed_value1;
     const bool native_asymmetric_post_center_valid =
-        native_asymmetric_tag_valid && temporal_bytes != nullptr &&
+        native_asymmetric_tag_valid && temporal_bytes != nullptr && jitter_layout_valid &&
         safe_copy_asymmetric_authority(
-            temporal_bytes + 0x410, native_primary_post_center,
+            temporal_bytes + jitter_offsets[0], native_primary_post_center,
             sizeof(native_primary_post_center)) &&
         safe_copy_asymmetric_authority(
-            temporal_bytes + 0x920, native_secondary_post_center,
+            temporal_bytes + jitter_offsets[1], native_secondary_post_center,
             sizeof(native_secondary_post_center)) &&
         memcmp(native_primary_post_center, &native_expected_post_value0,
             sizeof(float)) == 0 &&
@@ -30076,20 +30074,20 @@ void __fastcall hook_engine_temporal_writer(
 }
 
 void install_engine_temporal_writer_hook() {
-    // The new setter's three callers belong to UberSample/Final2D. Matching
-    // the five-argument ABI does not port ordinary temporal optical centers.
-    if (!w3vr::engine_camera_layout::legacy_temporal_writer_allowed(
-            g_engine_camera_temporal_contract.load(
-                std::memory_order_acquire))) return;
+    // The startup preflight still rejects Remastered; no INI enables it.
+    // Select entries by the accepted contract, never by ABI similarity.
+    if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire)) return;
+    const auto writer_rva = w3vr::engine_camera_layout::temporal_writer_rva(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    if (writer_rva == 0) return;
     if ((!asymmetric_authority_audit_active() &&
             !native_asymmetric_noaa_route_active()) ||
         g_engine_temporal_writer != nullptr) {
         return;
     }
-    constexpr uintptr_t kEngineTemporalWriterRva = 0x015E5A90;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr
-        ? module + kEngineTemporalWriterRva
+        ? module + writer_rva
         : nullptr;
     if (target != nullptr &&
         MH_CreateHook(target,
@@ -30100,7 +30098,7 @@ void install_engine_temporal_writer_hook() {
             true, std::memory_order_release);
         log_line(
             "Hooked REDengine temporal writer for packed jitter/asymmetric authority audit RVA=0x%llX target=%p",
-            static_cast<unsigned long long>(kEngineTemporalWriterRva), target);
+            static_cast<unsigned long long>(writer_rva), target);
     } else {
         g_engine_temporal_writer_hook_ready.store(
             false, std::memory_order_release);
