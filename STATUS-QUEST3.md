@@ -113,7 +113,7 @@ partes da renderização ainda precisam de adaptação. O bloqueio anterior cont
 O teste novo simula a função do jogo. Confere os argumentos e os limites de
 memória, incluindo que a configuração 5.00c conserva intacta a área usada pelo
 histórico antigo. **Esse teste não confirma execução dentro do jogo.**
-Essa rodada de câmera está no projeto local; ainda não foi publicada no fork.
+Os relatórios novos dessa rodada de câmera permanecem no projeto local.
 
 A DLL compilou após a revisão final, e a suíte do PC passou em **98/98 testes**.
 O registro desta rodada está em
@@ -144,7 +144,7 @@ O envio do olho duplicado agora passa por essa escolha de rota. **A rota nova
 do 5.00c continua sem ativação**, junto do bloqueio geral. Ainda faltam o
 descritor completo da cena, a preparação do produtor e outros campos e chamadas.
 Os testes de duração dos dados são simulados: nenhum frame do jogo foi enviado
-pelo novo código nesta rodada. Esta mudança também permanece somente local.
+pelo novo código nesta rodada. Seu relatório novo permanece somente local.
 
 A DLL desta rodada compilou e a suíte completa passou em **99/99 testes**.
 Registro: `../artifacts/test-frame-submission-20261006.log`. Esse resultado
@@ -167,7 +167,7 @@ escolhida. Isso prepara a passagem para aceitar a chamada real do Remastered.
 **5.00c continua sem ativação.** A cópia completa dos dados da cena ainda
 precisa de revisão, incluindo os objetos que esses dados apontam. Uma segunda
 construção de frame foi identificada, mas ela não basta para confirmar o
-tamanho e a duração de todos esses dados. Esta rodada está somente local.
+tamanho e a duração de todos esses dados. Seu relatório novo permanece local.
 
 A DLL compilou e a suíte completa passou em **100/100 testes do PC**.
 Registro: `../artifacts/test-factory-admission-20261006.log`. O teste novo
@@ -312,9 +312,10 @@ ponteiros globais e falsas instruções em dados. A reanálise do executável
 preservou os 15 registros de nome/callback
 anteriores. Os módulos de arcos/continuidade e as ferramentas de análise foram
 publicados até o commit `809f2a00fe3285bd7958aa7191943de58bc0b49a`. Naquela
-verificação, as árvores completas local/publicada eram idênticas. A rodada de
-câmera descrita acima acrescenta alterações locais posteriores; aquela comparação
-não as cobre. Os relatórios novos de dados continuam somente no projeto local.
+verificação anterior às adaptações de câmera, as árvores completas
+local/publicada eram idênticas. Essa referência é histórica. As comparações
+posteriores são registradas em `CONTINUAR-QUEST3.md`, na pasta superior ao
+repositório. Os relatórios novos de dados continuam somente no projeto local.
 
 Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
 corretas no headset e não medem Novigrad. O registro completo está em
