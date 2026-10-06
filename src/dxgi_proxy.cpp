@@ -29,6 +29,7 @@
 #include "engine_camera_temporal.h"
 #include "engine_camera_layout.h"
 #include "engine_view_constants_contract.h"
+#include "engine_dlss_contract.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
 #include "engine_scene_factory.h"
@@ -3545,6 +3546,12 @@ bool g_clean_mono_dlss_render_views_valid{};
 SlSetConstantsFn g_sl_set_constants{};
 RemasteredSlSetConstantsFn g_remastered_sl_set_constants{};
 thread_local w3vr::engine_view_constants::Observation g_remastered_constants_observation{};
+w3vr::engine_dlss::SetTagForFrameFn g_remastered_sl_set_tag_for_frame{};
+w3vr::engine_dlss::EvaluateFn g_remastered_sl_evaluate_feature{};
+std::mutex g_remastered_streamline_hook_mutex{};
+std::atomic<bool> g_remastered_streamline_observers_ready{};
+std::atomic<uint32_t> g_remastered_streamline_observation_logs{};
+std::atomic<uint32_t> g_remastered_dlss_counter_logs{};
 SlSetTagFn g_sl_set_tag{};
 SlSetFeatureConstantsFn g_sl_set_feature_constants{};
 SlEvaluateFeatureFn g_sl_evaluate_feature{};
@@ -29466,6 +29473,23 @@ void __fastcall hook_engine_view_constants(void* self, void* view_data, char fla
                 g_remastered_constants_observation = {self, view_data,
                     g_engine_render_pair_id, g_engine_render_generation,
                     snapshot.frame_id, g_engine_render_eye};
+                if (g_config.runtime_diagnostics) {
+                    w3vr::engine_dlss::Counters counters{};
+                    bool counters_readable{};
+                    __try {
+                        counters_readable = w3vr::engine_dlss::read_counters(
+                            {static_cast<const uint8_t*>(self), 0x12C},
+                            {static_cast<const uint8_t*>(view_data), 0xC48},
+                            w3vr::engine_dlss::selected(contract), counters);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        counters_readable = false;
+                    }
+                    if (counters_readable && take_bounded_log_slot(g_remastered_dlss_counter_logs, 32)) {
+                        log_line("Modern DLSS counters token_index=%u render_counter=%u built=%u evaluated=%u prepared=%u; observation only",
+                            counters.token_index, counters.render_counter, snapshot.guard_frame,
+                            counters.evaluated_counter, counters.prepared_counter);
+                    }
+                }
             }
         }
         // Observe the actual receiver only inside this native call. Modern
@@ -41708,12 +41732,80 @@ uint32_t streamline_eye() {
     return static_cast<uint32_t>(g_present_count.load() & 1ull);
 }
 
+bool read_remastered_streamline_viewport(const void* viewport,
+    w3vr::engine_dlss::Viewport& result) {
+    if (viewport == nullptr) return false;
+    __try {
+        return w3vr::engine_dlss::read_viewport(
+            {static_cast<const uint8_t*>(viewport), w3vr::engine_dlss::viewport_bytes}, result);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool read_remastered_evaluate_viewport(const void** inputs, uint32_t count,
+    w3vr::engine_dlss::Viewport& result) {
+    // Only the examined native one-input path is interpreted. Arbitrary
+    // arrays/chains are forwarded intact, never reduced to the first input.
+    if (inputs == nullptr || count != 1) return false;
+    const void* viewport{};
+    __try {
+        viewport = inputs[0];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return read_remastered_streamline_viewport(viewport, result);
+}
+
+int __fastcall hook_remastered_sl_set_tag_for_frame(const void* frame_token,
+    const void* viewport, const void* tags, uint32_t count, void* command_buffer) {
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const w3vr::engine_dlss::TagCall call{frame_token, viewport, tags, count, command_buffer};
+    w3vr::engine_dlss::Viewport snapshot{};
+    const bool readable = read_remastered_streamline_viewport(viewport, snapshot);
+    const int result = w3vr::engine_dlss::forward(g_remastered_sl_set_tag_for_frame, call);
+    if (g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
+        g_config.runtime_diagnostics && readable && frame_token != nullptr &&
+        w3vr::engine_dlss::known_tag_return(caller_rva) &&
+        take_bounded_log_slot(g_remastered_streamline_observation_logs, 32)) {
+        log_line("Modern Streamline tags viewport=%u count=%u token=%p command=%p result=%d return=0x%llX; observation only",
+            snapshot.id, count, frame_token, command_buffer, result,
+            static_cast<unsigned long long>(caller_rva));
+    }
+    // Shared by DLSS and ray reconstruction; no eye/resource/GPU completion
+    // receipt may be inferred from this call or a coincident TLS eye.
+    return result;
+}
+
+int __fastcall hook_remastered_sl_evaluate_feature(uint32_t feature,
+    const void* frame_token, const void** inputs, uint32_t count, void* command_buffer) {
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const w3vr::engine_dlss::EvaluateCall call{feature, frame_token, inputs, count, command_buffer};
+    w3vr::engine_dlss::Viewport snapshot{};
+    const bool readable = read_remastered_evaluate_viewport(inputs, count, snapshot);
+    const int result = w3vr::engine_dlss::forward(g_remastered_sl_evaluate_feature, call);
+    if (g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
+        g_config.runtime_diagnostics && readable && frame_token != nullptr &&
+        w3vr::engine_dlss::known_evaluate_return(feature, caller_rva) &&
+        take_bounded_log_slot(g_remastered_streamline_observation_logs, 32)) {
+        log_line("Modern Streamline evaluate feature=%u viewport=%u token=%p command=%p result=%d return=0x%llX; observation only",
+            feature, snapshot.id, frame_token, command_buffer, result,
+            static_cast<unsigned long long>(caller_rva));
+    }
+    // SDK eOk only means the API accepted the call, not that its command
+    // buffer ran on the GPU. Do not call legacy DLSS completion/resource code.
+    return result;
+}
+
 int __fastcall hook_remastered_sl_set_constants(
     const void* constants, const void* frame_token, const void* viewport) {
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const auto observation = g_remastered_constants_observation;
     w3vr::engine_view_constants::ConstantsSnapshot snapshot{};
+    w3vr::engine_dlss::Viewport viewport_snapshot{};
     bool readable{};
     if (constants != nullptr && frame_token != nullptr && viewport != nullptr) {
         __try {
@@ -41724,11 +41816,13 @@ int __fastcall hook_remastered_sl_set_constants(
             readable = false;
         }
     }
+    readable = readable && read_remastered_streamline_viewport(viewport, viewport_snapshot);
     // Forward all original references unchanged and return the real result.
     // A FrameToken is opaque. The observed descriptor's frame id is used only
     // as a diagnostic receipt number; it is never passed in place of a token.
     const int result = g_remastered_sl_set_constants(constants, frame_token, viewport);
-    if (dlss_sequential_mode_active() &&
+    if (g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
+        dlss_sequential_mode_active() &&
         w3vr::engine_view_constants::receipt_allowed(
             g_engine_camera_temporal_contract.load(std::memory_order_acquire),
             observation, caller_rva, g_engine_render_pair_id,
@@ -43737,22 +43831,62 @@ void install_streamline_hook() {
     }
 
     if (contract == &w3vr::engine_camera::remastered_500c) {
-        // Only transparent constants forwarding is ported here. The other
-        // modern exports have different ABIs too; no legacy tag/evaluation
-        // detour may be installed by falling through this branch.
-        if (!dlss_sequential_mode_active() || g_remastered_sl_set_constants != nullptr) return;
+        // All three modern observers use their actual SDK ABIs. Options and
+        // per-eye viewport/history routing remain unported; no legacy detour
+        // or legacy re-entry may be installed by falling through this branch.
+        std::scoped_lock lock{g_remastered_streamline_hook_mutex};
+        if (!dlss_sequential_mode_active() ||
+            g_remastered_sl_set_constants != nullptr ||
+            g_remastered_sl_set_tag_for_frame != nullptr ||
+            g_remastered_sl_evaluate_feature != nullptr) return;
         auto* interposer = GetModuleHandleW(L"sl.interposer.dll");
-        auto* target = interposer != nullptr ? GetProcAddress(interposer, "slSetConstants") : nullptr;
-        if (target == nullptr) return;
-        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_remastered_sl_set_constants),
-                reinterpret_cast<void**>(&g_remastered_sl_set_constants)) != MH_OK) return;
-        if (MH_EnableHook(target) != MH_OK) {
-            MH_RemoveHook(target);
-            g_remastered_sl_set_constants = nullptr;
-            log_line("Modern Streamline constants hook could not be enabled");
-            return;
+        if (interposer == nullptr) return;
+        struct ObserverHook { const char* name; void* target; void* detour; void** original; };
+        const std::array<ObserverHook, 3> hooks{{
+            {"slSetConstants", reinterpret_cast<void*>(GetProcAddress(interposer, "slSetConstants")),
+                reinterpret_cast<void*>(&hook_remastered_sl_set_constants),
+                reinterpret_cast<void**>(&g_remastered_sl_set_constants)},
+            {"slSetTagForFrame", reinterpret_cast<void*>(GetProcAddress(interposer, "slSetTagForFrame")),
+                reinterpret_cast<void*>(&hook_remastered_sl_set_tag_for_frame),
+                reinterpret_cast<void**>(&g_remastered_sl_set_tag_for_frame)},
+            {"slEvaluateFeature", reinterpret_cast<void*>(GetProcAddress(interposer, "slEvaluateFeature")),
+                reinterpret_cast<void*>(&hook_remastered_sl_evaluate_feature),
+                reinterpret_cast<void**>(&g_remastered_sl_evaluate_feature)},
+        }};
+        for (const auto& hook : hooks) if (hook.target == nullptr) return;
+        g_remastered_streamline_observers_ready.store(false, std::memory_order_release);
+        size_t created{};
+        const auto rollback = [&] {
+            for (size_t i = created; i > 0; --i) {
+                const auto& hook = hooks[i - 1];
+                // RemoveHook disables an enabled hook itself. Clear its
+                // trampoline only if removal succeeded; a still-live detour
+                // must retain its original function even after a failure.
+                const auto status = MH_RemoveHook(hook.target);
+                if (status == MH_OK) *hook.original = nullptr;
+                else log_line("Modern Streamline observer cleanup failed %s status=%d; receipts disabled",
+                    hook.name, static_cast<int>(status));
+            }
+        };
+        for (const auto& hook : hooks) {
+            const auto status = MH_CreateHook(hook.target, hook.detour, hook.original);
+            if (status != MH_OK) {
+                log_line("Modern Streamline observer create failed %s status=%d", hook.name, static_cast<int>(status));
+                rollback();
+                return;
+            }
+            ++created;
         }
-        log_line("Modern Streamline constants observer installed; stereo tag/evaluation port still pending");
+        for (const auto& hook : hooks) {
+            const auto status = MH_EnableHook(hook.target);
+            if (status != MH_OK) {
+                log_line("Modern Streamline observer enable failed %s status=%d", hook.name, static_cast<int>(status));
+                rollback();
+                return;
+            }
+        }
+        g_remastered_streamline_observers_ready.store(true, std::memory_order_release);
+        log_line("Modern Streamline constants/tag/evaluation observers installed; per-eye options/history routing still pending");
         return;
     }
 
