@@ -1,0 +1,400 @@
+{
+  "ExecutableSha256": "9406ECCC12B68E08920931442EF6A57340E910D3E01F2082E88232487433FE51",
+  "ImageBase": "0x140000000",
+  "Callbacks": {
+    "GetHeadBoneIndex": {
+      "CandidateRva": "0x02102690",
+      "UnwindFunctionStartsHere": true,
+      "FunctionBytes": 39,
+      "FunctionSha256": "f4514f55c7e53d072f14b91be33880c425b649c49473c067fb6053390c352b9e",
+      "DirectCalls": [],
+      "RipDataReferences": [],
+      "AddressReferences": [
+        {
+          "TargetRva": "0x02102690",
+          "InstructionRva": "0x00567F20",
+          "FunctionRva": "0x00564E40",
+          "Instruction": "lea rax, [rip + 0x1b9a769]"
+        }
+      ],
+      "RegistrationFunctionsAlsoReferencingExactName": [
+        "0x00564E40"
+      ]
+    },
+    "GetBoneWorldMatrixByIndex": {
+      "CandidateRva": "0x02251A40",
+      "UnwindFunctionStartsHere": true,
+      "FunctionBytes": 638,
+      "FunctionSha256": "0b69d2801a21cda9377177c107e0666f4b2ab5c3fede83655739bdb0fe483b0b",
+      "DirectCalls": [],
+      "RipDataReferences": [
+        "0x05A6BA80",
+        "0x05C6ECA0",
+        "0x05C6ECA4",
+        "0x05C6ECA8",
+        "0x05C6ECAC",
+        "0x05C6ECB0",
+        "0x05C6ECB4",
+        "0x05C6ECB8",
+        "0x05C6ECBC",
+        "0x05C6ECC0",
+        "0x05C6ECC4",
+        "0x05C6ECC8",
+        "0x05C6ECCC",
+        "0x05C6ECD0",
+        "0x05C6ECD4",
+        "0x05C6ECD8",
+        "0x05C6ECDC"
+      ],
+      "AddressReferences": [
+        {
+          "TargetRva": "0x02251A40",
+          "InstructionRva": "0x0086F5CB",
+          "FunctionRva": "0x0086E1C0",
+          "Instruction": "lea rax, [rip + 0x19e246e]"
+        }
+      ],
+      "RegistrationFunctionsAlsoReferencingExactName": [
+        "0x0086E1C0"
+      ]
+    }
+  },
+  "RegistrationCandidates": {
+    "GetHeadBoneIndex": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x02102690",
+          "RegistrationFunctionRva": "0x00564E40",
+          "NameReferenceRva": "0x00567F2A",
+          "PointerLoadRva": "0x00567F20",
+          "PointerStoreRva": "0x00567F35",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 39,
+          "FunctionSha256": "f4514f55c7e53d072f14b91be33880c425b649c49473c067fb6053390c352b9e"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "GetBoneWorldMatrixByIndex": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x02251A40",
+          "RegistrationFunctionRva": "0x0086E1C0",
+          "NameReferenceRva": "0x0086F5ED",
+          "PointerLoadRva": "0x0086F5CB",
+          "PointerStoreRva": "0x0086F5D7",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 638,
+          "FunctionSha256": "0b69d2801a21cda9377177c107e0666f4b2ab5c3fede83655739bdb0fe483b0b"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "IsInGameplayScene": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x02103880",
+          "RegistrationFunctionRva": "0x00564E40",
+          "NameReferenceRva": "0x005674EC",
+          "PointerLoadRva": "0x005674E2",
+          "PointerStoreRva": "0x005674F7",
+          "UnwindFunctionStartsHere": false,
+          "LengthBasis": "FirstReturnWithin64Bytes_NoUnwindRecord",
+          "FunctionBytes": 20,
+          "FunctionSha256": "eefb17e2786f43f8622d8c9fd8c85a6b4edd9287d1a2aa083f5e70e439ca132a"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "IsInNonGameplayCutscene": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x021038A0",
+          "RegistrationFunctionRva": "0x00564E40",
+          "NameReferenceRva": "0x0056747A",
+          "PointerLoadRva": "0x00567470",
+          "PointerStoreRva": "0x00567485",
+          "UnwindFunctionStartsHere": false,
+          "LengthBasis": "FirstReturnWithin64Bytes_NoUnwindRecord",
+          "FunctionBytes": 20,
+          "FunctionSha256": "93cda1b195a884cd87b48aa9b460b31f4dc4a6c66bcd7667ed9cb70e5e50f009"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "IsCurrentlyPlayingNonGameplayScene": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x0226CDB0",
+          "RegistrationFunctionRva": "0x0087B440",
+          "NameReferenceRva": "0x0087E198",
+          "PointerLoadRva": "0x0087E18D",
+          "PointerStoreRva": "0x0087E1A6",
+          "UnwindFunctionStartsHere": false,
+          "LengthBasis": "FirstReturnWithin64Bytes_NoUnwindRecord",
+          "FunctionBytes": 20,
+          "FunctionSha256": "83d431fb4decf719523d9201d29998afe045ae7e3f384adbfb23bd952a43ca8b"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "EnableManualControl": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x01E07620",
+          "RegistrationFunctionRva": "0x004AF430",
+          "NameReferenceRva": "0x004B0E89",
+          "PointerLoadRva": "0x004B0E6B",
+          "PointerStoreRva": "0x004B0E72",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 184,
+          "FunctionSha256": "e0ed324940e38a056c9ed5cf0e0e2dad203f2df54950965dcbd19873180c1a24"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "GetTopmostCameraObject": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x0237A0A0",
+          "RegistrationFunctionRva": "0x00945D70",
+          "NameReferenceRva": "0x009465F3",
+          "PointerLoadRva": "0x009465D2",
+          "PointerStoreRva": "0x009465E1",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 242,
+          "FunctionSha256": "793eff7d53db207989327079d7d68197b243a69456e8214a8719372f1c8b57de"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "IsLoadingScreenVideoPlaying": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x02271A80",
+          "RegistrationFunctionRva": "0x0087B440",
+          "NameReferenceRva": "0x0087BD39",
+          "PointerLoadRva": "0x0087BD1C",
+          "PointerStoreRva": "0x0087BD27",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 97,
+          "FunctionSha256": "3141b984480c74ddd526463de2a1797494c83d340ed905ed093f181b7514c36c"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "GetCameraDirection": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x0237A1C0",
+          "RegistrationFunctionRva": "0x00945D70",
+          "NameReferenceRva": "0x009464A1",
+          "PointerLoadRva": "0x00946480",
+          "PointerStoreRva": "0x0094648F",
+          "UnwindFunctionStartsHere": false,
+          "LengthBasis": "FirstReturnWithin64Bytes_NoUnwindRecord",
+          "FunctionBytes": 59,
+          "FunctionSha256": "ecd9f318c6dc2770b647c87f5c9b6436f4698cf9e728932541d3781b63da06f2"
+        },
+        {
+          "CandidateRva": "0x02470440",
+          "RegistrationFunctionRva": "0x009C1210",
+          "NameReferenceRva": "0x009C1E89",
+          "PointerLoadRva": "0x009C1E68",
+          "PointerStoreRva": "0x009C1E77",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 180,
+          "FunctionSha256": "2be2a7477e54c071800e6fb3baf739a706fc1328cfb069b397e72e52dba686d3"
+        }
+      ],
+      "Ambiguous": true
+    },
+    "WorldVectorToViewRatio": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x0237A720",
+          "RegistrationFunctionRva": "0x00945D70",
+          "NameReferenceRva": "0x00945F59",
+          "PointerLoadRva": "0x00945F38",
+          "PointerStoreRva": "0x00945F47",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 265,
+          "FunctionSha256": "509d5f66e62bf85c590dcfd40bcaede8b0d47f14cfcf368dccf25fcfefbbe5c4"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "IsAnyMenu": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x01DEE020",
+          "RegistrationFunctionRva": "0x00498BB0",
+          "NameReferenceRva": "0x00498C47",
+          "PointerLoadRva": "0x00498C2A",
+          "PointerStoreRva": "0x00498C35",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 35,
+          "FunctionSha256": "a63df4b87da1da797e315fb43310303402965862fbba161294f32ef5ae75be4a"
+        }
+      ],
+      "Ambiguous": false
+    },
+    "GetCurrentViewportResolution": {
+      "Candidates": [
+        {
+          "CandidateRva": "0x0226A590",
+          "RegistrationFunctionRva": "0x0087B440",
+          "NameReferenceRva": "0x0087EFAD",
+          "PointerLoadRva": "0x0087EF9C",
+          "PointerStoreRva": "0x0087EFA8",
+          "UnwindFunctionStartsHere": true,
+          "LengthBasis": "UnwindRecord",
+          "FunctionBytes": 194,
+          "FunctionSha256": "1c84057145257c115f4704f9c6256fa958f623547f331f0f806a3d6c568b8628"
+        }
+      ],
+      "Ambiguous": false
+    }
+  },
+  "NameStrings": {
+    "GetHeadBoneIndex": [
+      "0x0382D9D8"
+    ],
+    "GetBoneWorldMatrixByIndex": [
+      "0x03946C20"
+    ],
+    "IsInGameplayScene": [
+      "0x0382D758"
+    ],
+    "IsInNonGameplayCutscene": [
+      "0x0382D780"
+    ],
+    "IsCurrentlyPlayingNonGameplayScene": [
+      "0x03949908"
+    ],
+    "EnableManualControl": [
+      "0x03805020"
+    ],
+    "GetTopmostCameraObject": [
+      "0x0397F7F0"
+    ],
+    "IsLoadingScreenVideoPlaying": [
+      "0x03949708"
+    ],
+    "GetCameraDirection": [
+      "0x0397F8F8"
+    ],
+    "WorldVectorToViewRatio": [
+      "0x0397F85C",
+      "0x0397F940"
+    ],
+    "IsAnyMenu": [
+      "0x037FCE40"
+    ],
+    "GetCurrentViewportResolution": [
+      "0x0394A008"
+    ]
+  },
+  "References": [
+    {
+      "TargetRva": "0x037FCE40",
+      "InstructionRva": "0x00498C47",
+      "FunctionRva": "0x00498BB0",
+      "Instruction": "lea rdx, [rip + 0x33641f2]"
+    },
+    {
+      "TargetRva": "0x03805020",
+      "InstructionRva": "0x004B0E89",
+      "FunctionRva": "0x004AF430",
+      "Instruction": "lea rdx, [rip + 0x3354190]"
+    },
+    {
+      "TargetRva": "0x0382D780",
+      "InstructionRva": "0x0056747A",
+      "FunctionRva": "0x00564E40",
+      "Instruction": "lea rdx, [rip + 0x32c62ff]"
+    },
+    {
+      "TargetRva": "0x0382D758",
+      "InstructionRva": "0x005674EC",
+      "FunctionRva": "0x00564E40",
+      "Instruction": "lea rdx, [rip + 0x32c6265]"
+    },
+    {
+      "TargetRva": "0x02102690",
+      "InstructionRva": "0x00567F20",
+      "FunctionRva": "0x00564E40",
+      "Instruction": "lea rax, [rip + 0x1b9a769]"
+    },
+    {
+      "TargetRva": "0x0382D9D8",
+      "InstructionRva": "0x00567F2A",
+      "FunctionRva": "0x00564E40",
+      "Instruction": "lea rdx, [rip + 0x32c5aa7]"
+    },
+    {
+      "TargetRva": "0x02251A40",
+      "InstructionRva": "0x0086F5CB",
+      "FunctionRva": "0x0086E1C0",
+      "Instruction": "lea rax, [rip + 0x19e246e]"
+    },
+    {
+      "TargetRva": "0x03946C20",
+      "InstructionRva": "0x0086F5ED",
+      "FunctionRva": "0x0086E1C0",
+      "Instruction": "lea rdx, [rip + 0x30d762c]"
+    },
+    {
+      "TargetRva": "0x03949708",
+      "InstructionRva": "0x0087BD39",
+      "FunctionRva": "0x0087B440",
+      "Instruction": "lea rdx, [rip + 0x30cd9c8]"
+    },
+    {
+      "TargetRva": "0x03949908",
+      "InstructionRva": "0x0087E198",
+      "FunctionRva": "0x0087B440",
+      "Instruction": "lea rdx, [rip + 0x30cb769]"
+    },
+    {
+      "TargetRva": "0x0394A008",
+      "InstructionRva": "0x0087EFAD",
+      "FunctionRva": "0x0087B440",
+      "Instruction": "lea rdx, [rip + 0x30cb054]"
+    },
+    {
+      "TargetRva": "0x0397F940",
+      "InstructionRva": "0x00945F59",
+      "FunctionRva": "0x00945D70",
+      "Instruction": "lea rdx, [rip + 0x30399e0]"
+    },
+    {
+      "TargetRva": "0x0397F8F8",
+      "InstructionRva": "0x009464A1",
+      "FunctionRva": "0x00945D70",
+      "Instruction": "lea rdx, [rip + 0x3039450]"
+    },
+    {
+      "TargetRva": "0x0397F7F0",
+      "InstructionRva": "0x009465F3",
+      "FunctionRva": "0x00945D70",
+      "Instruction": "lea rdx, [rip + 0x30391f6]"
+    },
+    {
+      "TargetRva": "0x0397F8F8",
+      "InstructionRva": "0x009C1E89",
+      "FunctionRva": "0x009C1210",
+      "Instruction": "lea rdx, [rip + 0x2fbda68]"
+    }
+  ],
+  "RuntimePortEnabled": false,
+  "Note": "Static registration evidence only; no game or headset validation and no binary changes."
+}

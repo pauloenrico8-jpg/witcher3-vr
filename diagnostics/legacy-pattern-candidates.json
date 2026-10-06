@@ -1,0 +1,21 @@
+{
+  "GetHeadBoneIndex": {
+    "ExactEntryMatches": 1,
+    "Candidates": [
+      {
+        "Section": ".text",
+        "Rva": "0x02102690"
+      }
+    ]
+  },
+  "GetBoneWorldMatrix": {
+    "ExactEntryMatches": 1,
+    "Candidates": [
+      {
+        "Section": ".text",
+        "Rva": "0x02251A40"
+      }
+    ]
+  },
+  "Note": "Candidates only. Function identity, ABI, object layout and other engine hooks are not verified. No offsets were patched."
+}

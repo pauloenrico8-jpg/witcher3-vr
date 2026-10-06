@@ -1,0 +1,21 @@
+{
+  "ExecutableVersion": "5.0.0.1044392(Build Machine)",
+  "ExecutableSha256": "9406ECCC12B68E08920931442EF6A57340E910D3E01F2082E88232487433FE51",
+  "UpstreamCommit": "79293dd5f523af11579e061aa0b777d65225911c",
+  "HeadProviderSignaturesMatch": false,
+  "Checks": [
+    {
+      "Function": "GetHeadBoneIndex",
+      "Rva": "0x01C4B550",
+      "Match": false
+    },
+    {
+      "Function": "GetBoneWorldMatrix",
+      "Rva": "0x0152E600",
+      "Match": false
+    }
+  ],
+  "GameRuntimeValidated": false,
+  "FullVrCompatibilityValidated": false,
+  "Note": "Static check of two first-person callbacks only. Does not validate stereo, controllers, combat or FPS."
+}
