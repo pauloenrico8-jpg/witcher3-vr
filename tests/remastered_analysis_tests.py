@@ -162,6 +162,23 @@ class IdentityTests(unittest.TestCase):
 
 
 class ControlFlowTests(unittest.TestCase):
+    def test_rip_store_finds_global_pointer_initialization(self):
+        image = fixture()
+        image.data[:8] = b"\x48\x89\x05" + struct.pack("<i",0x2050-0x1007) + b"\xc3"
+        refs=image.rip_references({0x2050})
+        self.assertEqual([ref["InstructionRva"] for ref in refs],["0x00001000"])
+        self.assertTrue(refs[0]["Instruction"].startswith("mov qword ptr [rip"))
+
+    def test_rip_store_after_return_is_not_a_reference(self):
+        image=fixture()
+        image.data[:9] = b"\xc3\x48\x89\x05" + struct.pack("<i",0x2050-0x1008) + b"\xc3"
+        self.assertEqual(image.rip_references({0x2050}),[])
+
+    def test_rip_store_inside_immediate_is_not_a_reference(self):
+        image=fixture()
+        image.data[:11] = b"\x48\xb8\x48\x89\x05" + struct.pack("<i",0x2050-0x1009) + b"\x90\xc3"
+        self.assertEqual(image.rip_references({0x2050}),[])
+
     def test_fake_call_after_return_is_not_code(self):
         image = fixture()
         offset = image.offset(0x1000)

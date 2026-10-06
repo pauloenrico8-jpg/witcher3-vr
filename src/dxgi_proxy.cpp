@@ -24,6 +24,7 @@
 #include "cinema_aspect.h"
 #include "openxr_eye_geometry.h"
 #include "motion_controllers.h"
+#include "hand_pose_history.h"
 #include "legacy_engine_preflight.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
@@ -1331,6 +1332,7 @@ std::atomic<bool> g_xr_visibility_bounds_valid{};
 XrInstance g_xr_instance{XR_NULL_HANDLE};
 XrSession g_xr_session{XR_NULL_HANDLE};
 w3vr::motion::Controllers g_motion_controllers;
+w3vr::motion::HandPoseHistory g_hand_pose_history;
 XrSpace g_xr_space{XR_NULL_HANDLE};
 XrSpace g_xr_view_space{XR_NULL_HANDLE};
 XrSystemId g_xr_system{};
@@ -46060,6 +46062,7 @@ void poll_openxr_events() {
             g_xr_session_state = changed->state;
             if (changed->state != XR_SESSION_STATE_FOCUSED) {
                 g_motion_controllers.invalidate();
+                g_hand_pose_history.reset();
             }
             log_line("OpenXR session state changed=%d", static_cast<int>(g_xr_session_state));
 
@@ -46080,6 +46083,9 @@ void poll_openxr_events() {
                 reset_native_asymmetric_noaa_state();
                 log_line("OpenXR xrEndSession result=%s (%d)", xr_result_name(result), result);
             }
+        } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
+            g_motion_controllers.reference_space_change(*changed);
         } else if (event.type ==
                 XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
             // [FIX:VISIBILITY-MASK-FIT 3/7] The runtime may change its lens
@@ -46312,16 +46318,19 @@ void update_motion_controllers(XrTime display_time) {
     if (!g_config.motion_controllers_enabled) return;
     g_motion_controllers.update(g_xr_space, display_time,
         g_xr_session_state == XR_SESSION_STATE_FOCUSED);
+    const auto frame = g_motion_controllers.snapshot();
+    const auto paths = g_hand_pose_history.update(frame);
     // Optional 1 Hz diagnostics only. No per-frame disk writes.
     if (g_config.motion_controllers_diagnostics) {
         static XrTime last_logged{};
         if (display_time - last_logged >= 1000000000) {
             last_logged = display_time;
-            const auto frame = g_motion_controllers.snapshot();
-            log_line("Motion tracking time=%lld ready=%d focused=%d result=%d left=%d right=%d left_trigger=%.3f right_trigger=%.3f",
+            log_line("Motion tracking time=%lld ready=%d focused=%d result=%d left=%d right=%d left_trigger=%.3f right_trigger=%.3f epoch=%llu left_path=%d right_path=%d",
                 static_cast<long long>(frame.display_time), frame.ready, frame.focused, frame.result,
                 frame.hands[0].grip_tracked, frame.hands[1].grip_tracked,
-                frame.hands[0].trigger, frame.hands[1].trigger);
+                frame.hands[0].trigger, frame.hands[1].trigger,
+                static_cast<unsigned long long>(paths.tracking_epoch),
+                paths.hands[0].continuous, paths.hands[1].continuous);
         }
     }
 }

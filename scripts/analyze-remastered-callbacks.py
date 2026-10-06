@@ -213,7 +213,7 @@ class Image:
         Decode each enclosing unwind function once before accepting a match.
         """
         possible_functions = set()
-        pattern = re.compile(rb"(?=([\x48-\x4f][\x8d\x8b][\x05\x0d\x15\x1d\x25\x2d\x35\x3d]....))", re.DOTALL)
+        pattern = re.compile(rb"(?=([\x48-\x4f][\x8d\x8b\x89][\x05\x0d\x15\x1d\x25\x2d\x35\x3d]....))", re.DOTALL)
         for _, va, size, raw, flags in self.sections:
             if not flags & 0x20000000:
                 continue
