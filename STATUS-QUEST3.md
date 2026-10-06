@@ -185,8 +185,9 @@ Separadamente, os 25 testes Python da análise do Remastered passaram em 06/10.
 Eles conferem blocos encadeados, classes, arquivos truncados, gravações de
 ponteiros globais e falsas instruções em dados. A reanálise do executável
 preservou os 15 registros de nome/callback
-anteriores. Esses testes e relatórios novos estão locais; não há publicação
-destas alterações no fork neste momento.
+anteriores. Os módulos novos, testes e ferramentas de análise foram publicados
+no fork. As árvores completas de arquivos local/publicada foram comparadas:
+conteúdo idêntico. Os relatórios novos de dados continuam somente no projeto local.
 
 Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
 corretas no headset e não medem Novigrad. O registro completo está em
