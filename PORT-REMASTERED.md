@@ -530,3 +530,53 @@ nenhum mede execução no jogo ou no headset.
 Próximo passo: adaptar a preparação das constantes `01B799C0`, distinguir
 estado/renderizador/descritor, verificar a escrita do jitter anterior e portar
 as demais leituras e matrizes do frame builder. O bloqueio global permanece.
+
+## Builder e ABI de constantes Streamline: 6 de outubro
+
+`engine_view_constants_contract.h` seleciona somente os contratos canônicos:
+4.04 builder `01CFE280`, frame-id desc+AA4, guard estado+6C; 5.00c builder
+`01B799C0`, frame-id desc+C44, guard estado+120. O descritor não é o frame;
+o estado não é o renderizador. Nenhum getter global legado, guard de entrada
+ou guard de avaliação foi atribuído ao novo estado por deslocamento presumido.
+
+O hook novo observa RCX/RDX apenas sob RETURN `01C14C26`, com olho/par/geração
+válidos. O chamador obtém RCX de renderer+C0 e passa RDX=frame+10. A observação
+fica restrita à chamada original e restaura a anterior ao sair, inclusive em
+chamadas aninhadas. A instalação escolhe a entrada por contrato e exige o gate
+prévio. Probes de matrizes antigos e a reentrada antiga ficam exclusivos de 4.04.
+
+As importações verificadas no executável são `slGetNewFrameToken` em IAT
+`02984CB0` e `slSetConstants` em `02984CB8`, ambas de `sl.interposer.dll`.
+A CALL `01B79C45` recebe endereço do token e endereço do frame-id. A CALL
+`01B7A5E4` recebe constantes RBP+240, token opaco [RBP+210] e objeto viewport
+RBP+218; RETURN correto `01B7A5EA`. Nenhum ponteiro é reduzido a uint32_t.
+
+Construtor leaf `00320940`, chamado em `01B79CD4`, foi decodificado só até seu
+primeiro RET `00320D50`. Ele inicializa o GUID Constants, versão 2 e campo final
+em +1C4. O layout confirma header de 0x20 bytes (32 bytes), jitter +160, escala de vetores
++168, reset +1BF e tamanho mínimo 1C8. Tipo/versão/sinalizador são conferidos
+antes da leitura; falhas preservam a saída. O callback novo encaminha os três
+ponteiros originais sem alterar constantes ou viewport, devolve o resultado
+real e publica recibo somente após sucesso e identidade temporal exata. Seu
+número de recibo vem do descritor observado, não de uma suposta leitura do token.
+
+A documentação oficial sustenta a interpretação do ABI e do header:
+[API](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_core_api.h),
+[estruturas](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_struct.h),
+[constantes](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_consts.h).
+A escolha do layout do jogo vem da evidência local, não do cabeçalho atual sozinho.
+
+O instalador moderno só pode criar o observador de constantes; não cai na
+instalação de slSetTag/slSetFeatureConstants/slEvaluateFeature antigos. Falha
+na ativação remove a interceptação recém-criada. A inicialização global ainda
+rejeita 5.00c antes de instalar qualquer hook. Reentrada moderna fica fechada
+até tags, viewport e avaliação serem portados juntos; observar um sucesso não
+comprova isolamento de históricos nem conclusão na GPU. O callback legado agora
+também devolve o resultado real e publica recibo apenas após sucesso.
+
+Validação: build da DLL e teste novo, 104/104 CTest (14,31s), diff sem erros.
+Logs locais `../artifacts/*view-constants-20261006.log`. Relatório novo LOCAL
+`../artifacts/remastered-view-constants-abi-evidence.json`, não publicado.
+Próximo passo: verificar o produtor de tags e avaliação modernos e o pipeline
+candidato `01D2B640`, mapear separadamente os guards e conservar os objetos
+FrameToken/ViewportHandle em todas as chamadas. Nenhum teste de jogo/Quest/FPS.
