@@ -26,6 +26,7 @@
 #include "motion_controllers.h"
 #include "hand_pose_history.h"
 #include "legacy_engine_preflight.h"
+#include "engine_camera_temporal.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
@@ -495,6 +496,10 @@ IDxcCompiler3* g_dxc_compiler{};
 std::mutex g_log_mutex{};
 std::once_flag g_init_once{};
 std::atomic<bool> g_legacy_engine_layout_accepted{};
+// Published only after the legacy preflight. The statically examined 5.00c
+// camera contract does not authorize the rest of the engine hook graph.
+std::atomic<const w3vr::engine_camera::TemporalContract*>
+    g_engine_camera_temporal_contract{};
 std::once_flag g_openxr_once{};
 std::once_flag g_performance_cpu_sets_once{};
 std::atomic<uint64_t> g_present_count{};
@@ -2309,8 +2314,7 @@ EngineViewCopyRebuildFn g_engine_view_copy_rebuild{};
 // that independent authority at the native CCustomCamera boundary instead.
 std::atomic<float> g_native_world_fov_degrees{60.0f};
 std::atomic<bool> g_native_world_fov_valid{};
-using EngineTemporalCameraBuildFn = void*(__fastcall*)(
-    void*, float, const void*, const void*, float, float, float, float, float);
+using EngineTemporalCameraBuildFn = w3vr::engine_camera::NativeBuilder;
 EngineTemporalCameraBuildFn g_engine_temporal_camera_build{};
 using EngineCameraDirectionFn = void(__fastcall*)(void*, void*, float*);
 EngineCameraDirectionFn g_engine_camera_direction{};
@@ -2838,7 +2842,8 @@ thread_local uint64_t g_engine_render_pair_id{};
 // AER tag is a safe camera fallback, but only a frame-data registry hit
 // proves which deferred REDengine task owns the emitted DLSS command.
 thread_local bool g_engine_render_tag_frame_lookup_exact{};
-constexpr size_t kEngineTemporalCameraRecordBytes = 0xB0;
+constexpr size_t kEngineTemporalCameraRecordBytes =
+    w3vr::engine_camera::record_bytes;
 struct EnginePerEyeTemporalCameraHistory {
     std::array<uint8_t, kEngineTemporalCameraRecordBytes> record{};
     uint64_t pair_id{};
@@ -30075,6 +30080,40 @@ void install_engine_temporal_writer_hook() {
     }
 }
 
+bool build_engine_camera_temporal_record(float* view, float time,
+    w3vr::engine_camera::TemporalRecord& record) {
+    if (view == nullptr || g_engine_camera_temporal_contract.load(
+            std::memory_order_acquire) == nullptr) {
+        return false;
+    }
+    // Read only the common input prefix, not a legacy-sized whole camera.
+    std::array<uint8_t, w3vr::engine_camera::source_prefix_bytes> prefix{};
+    __try {
+        memcpy(prefix.data(), view, prefix.size());
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return w3vr::engine_camera::build_record(prefix, time,
+        g_engine_temporal_camera_build, record);
+}
+
+bool write_engine_previous_camera_record(float* view,
+    const w3vr::engine_camera::TemporalRecord& record) {
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (view == nullptr || contract == nullptr) return false;
+    // The native camera hook owns this range; the version contract provides
+    // its record offset. The span alone cannot validate the native allocation.
+    __try {
+        return w3vr::engine_camera::write_previous_record(
+            {reinterpret_cast<uint8_t*>(view),
+                contract->previous_record_offset +
+                    w3vr::engine_camera::record_bytes}, *contract, record);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // [FIX:MODE3-FALLBACK-DLSS-HISTORY V1256 1/2] Reused-camera cutscenes do
 // not reach hook_engine_view_rebuild(), so V9416/V14003 cannot install the
 // previous corrected camera before REDengine derives native motion vectors.
@@ -30097,21 +30136,9 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
 
     const float engine_time = g_engine_temporal_camera_build_time.load(
         std::memory_order_relaxed);
-    if (!std::isfinite(engine_time) ||
-        !std::isfinite(view[7]) || view[7] <= 0.1f ||
-        !std::isfinite(view[10]) || view[10] <= 0.1f ||
-        !std::isfinite(view[11]) ||
-        !std::isfinite(view[12]) || view[12] <= 0.0f ||
-        !std::isfinite(view[13]) || view[13] <= view[12]) {
-        return false;
-    }
-
-    alignas(16) std::array<uint8_t, kEngineTemporalCameraRecordBytes>
-        current_record{};
-    void* built = g_engine_temporal_camera_build(
-        current_record.data(), engine_time, view, view + 4,
-        view[7], view[10], view[12], view[13], view[11]);
-    if (built != current_record.data() || current_record[0] == 0) {
+    w3vr::engine_camera::TemporalRecord current_record{};
+    if (!build_engine_camera_temporal_record(view, engine_time,
+            current_record)) {
         return false;
     }
 
@@ -30130,8 +30157,10 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
         const auto& previous_record = continued
             ? slot.record
             : current_record;
-        memcpy(reinterpret_cast<uint8_t*>(view) + 0x460,
-            previous_record.data(), previous_record.size());
+        if (!write_engine_previous_camera_record(view, previous_record)) {
+            continued = false;
+            return false;
+        }
         slot.record = current_record;
         slot.pair_id = pair_id;
         slot.valid = true;
@@ -36680,21 +36709,13 @@ bool prepare_engine_per_eye_native_temporal_history(
     const float engine_time = g_engine_temporal_camera_build_time.load(
         std::memory_order_relaxed);
     if (eye < 0 || eye > 1 || pair_id == 0 || pair_id == UINT64_MAX ||
-        !time_valid || !std::isfinite(engine_time) ||
-        !std::isfinite(view[7]) || view[7] <= 0.1f ||
-        !std::isfinite(view[10]) || view[10] <= 0.1f ||
-        !std::isfinite(view[11]) ||
-        !std::isfinite(view[12]) || view[12] <= 0.0f ||
-        !std::isfinite(view[13]) || view[13] <= view[12]) {
+        !time_valid) {
         return false;
     }
 
-    alignas(16) std::array<uint8_t, kEngineTemporalCameraRecordBytes>
-        current_record{};
-    void* built = g_engine_temporal_camera_build(
-        current_record.data(), engine_time, view, view + 4,
-        view[7], view[10], view[12], view[13], view[11]);
-    if (built != current_record.data() || current_record[0] == 0) {
+    w3vr::engine_camera::TemporalRecord current_record{};
+    if (!build_engine_camera_temporal_record(view, engine_time,
+            current_record)) {
         return false;
     }
 
@@ -36708,8 +36729,9 @@ bool prepare_engine_per_eye_native_temporal_history(
         const auto& previous_record = continued
             ? slot.record
             : current_record;
-        memcpy(reinterpret_cast<uint8_t*>(view) + 0x460,
-            previous_record.data(), previous_record.size());
+        if (!write_engine_previous_camera_record(view, previous_record)) {
+            return false;
+        }
         slot.record = current_record;
         slot.pair_id = pair_id;
         slot.valid = true;
@@ -39810,7 +39832,10 @@ void install_engine_temporal_camera_builder_hook() {
         return;
     }
 
-    constexpr uintptr_t kEngineTemporalCameraBuildRva = 0x015FE010;
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == nullptr) return;
+    const uintptr_t kEngineTemporalCameraBuildRva = contract->builder_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr
         ? module + kEngineTemporalCameraBuildRva
@@ -39847,7 +39872,10 @@ void install_engine_view_factory_probe() {
         return;
     }
 
-    constexpr uintptr_t kEngineViewRebuildRva = 0x015FE550;
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == nullptr) return;
+    const uintptr_t kEngineViewRebuildRva = contract->rebuild_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineViewRebuildRva : nullptr;
     if (target != nullptr &&
@@ -39983,7 +40011,10 @@ void install_engine_render_proxy_distance_scale_hook() {
         return;
     }
 
-    constexpr uintptr_t kEngineViewCopyRebuildRva = 0x015FF640;
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (contract == nullptr) return;
+    const uintptr_t kEngineViewCopyRebuildRva = contract->copy_rebuild_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr
         ? module + kEngineViewCopyRebuildRva : nullptr;
@@ -43678,6 +43709,8 @@ void ensure_initialized() {
                 "Remastered requires a verified port.");
             return;
         }
+        g_engine_camera_temporal_contract.store(
+            &w3vr::engine_camera::legacy_404, std::memory_order_release);
         g_legacy_engine_layout_accepted.store(true, std::memory_order_release);
         if (g_config.renderdoc_capture_enabled &&
             g_config.renderdoc_streamline_device_bridge) {

@@ -86,6 +86,40 @@ os dados de câmera das versões. As evidências e o fluxo da ferramenta estão 
 [PORT-REMASTERED.md](PORT-REMASTERED.md). São 15 tabelas de classes, 43 referências
 a tabelas e 145 entradas em um grafo limitado, sem ativação em execução.
 
+## Adaptação do histórico de câmera por versão
+
+O histórico da câmera guarda como ela estava na imagem anterior. O jogo usa
+isso para calcular movimentos na imagem. A parte que constrói e grava esse
+histórico passou para `src/engine_camera_temporal.h`, com uma configuração
+própria para 4.04 e outra examinada para 5.00c.
+
+1. Lê só os dados de entrada necessários: posição, direção, tempo e projeção.
+   Recusa dados incompletos, números inválidos e projeções degeneradas.
+2. Pede à função original do jogo para construir o registro numa área temporária.
+   Mantém a ordem dos argumentos e o alinhamento que essas funções podem exigir.
+3. Confere se a função devolveu o registro esperado e o marcou como válido.
+   Um resultado inválido não substitui o histórico anterior.
+4. Grava somente o trecho destinado a esse histórico na versão escolhida.
+   Os dados das versões ficam em posições diferentes dentro da câmera; escrever
+   na posição antiga no Remastered alteraria outro trecho.
+5. Atualiza o histórico daquele olho apenas depois da escrita bem-sucedida.
+
+Escolhi essa divisão porque mudar somente o endereço de uma função deixa
+os acessos antigos aos dados dentro do objeto. Os dois caminhos de histórico
+na DLL agora usam esse módulo, e três endereços de funções de câmera vêm da
+mesma configuração. A configuração do 5.00c permanece sem ativação: outras
+partes da renderização ainda precisam de adaptação. O bloqueio anterior continua.
+
+O teste novo simula a função do jogo. Confere os argumentos e os limites de
+memória, incluindo que a configuração 5.00c conserva intacta a área usada pelo
+histórico antigo. **Esse teste não confirma execução dentro do jogo.**
+Essa rodada de câmera está no projeto local; ainda não foi publicada no fork.
+
+A DLL compilou após a revisão final, e a suíte do PC passou em **98/98 testes**.
+O registro desta rodada está em
+`../artifacts/test-camera-contract-final-20261006.log`. São testes de código e
+contratos simulados; não são uma abertura do jogo nem uma medição de VR.
+
 ## O que o código novo faz, passo a passo
 
 1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede
@@ -185,9 +219,11 @@ Separadamente, os 25 testes Python da análise do Remastered passaram em 06/10.
 Eles conferem blocos encadeados, classes, arquivos truncados, gravações de
 ponteiros globais e falsas instruções em dados. A reanálise do executável
 preservou os 15 registros de nome/callback
-anteriores. Os módulos novos, testes e ferramentas de análise foram publicados
-no fork. As árvores completas de arquivos local/publicada foram comparadas:
-conteúdo idêntico. Os relatórios novos de dados continuam somente no projeto local.
+anteriores. Os módulos de arcos/continuidade e as ferramentas de análise foram
+publicados até o commit `809f2a00fe3285bd7958aa7191943de58bc0b49a`. Naquela
+verificação, as árvores completas local/publicada eram idênticas. A rodada de
+câmera descrita acima acrescenta alterações locais posteriores; aquela comparação
+não as cobre. Os relatórios novos de dados continuam somente no projeto local.
 
 Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
 corretas no headset e não medem Novigrad. O registro completo está em

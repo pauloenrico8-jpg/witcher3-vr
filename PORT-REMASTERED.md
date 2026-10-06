@@ -1,6 +1,7 @@
 # Adaptação para Remastered 5.00c — evidências de renderização
 
-Estado em 06/10/2026: análise estática, sem liberar o mod no jogo.
+Estado em 06/10/2026: análise estática e início da adaptação do código de câmera,
+sem liberar o mod no jogo.
 “Estática” significa ler o programa como um arquivo, sem executar suas funções.
 O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico e pelo menos 60 FPS reais em Novigrad.
@@ -117,6 +118,46 @@ Os 15 registros de nomes/callbacks do relatório anterior foram reanalisados com
 o novo tratamento de blocos e fluxo. Seus candidatos permaneceram iguais.
 Registro local: `../artifacts/remastered-callback-controlflow-evidence.json`.
 
+## Primeiro acesso de câmera adaptado por versão
+
+`src/engine_camera_temporal.h` reúne a construção e a escrita do registro da
+câmera anterior. Esse registro ocupa `0xB0` bytes. O contrato 4.04 guarda-o em
+`+0x460`; o contrato examinado para 5.00c guarda-o em `+0x530`. Isso não define
+o layout completo da câmera, do frame ou do descritor da cena.
+
+No chamador `0x022B6337`, o destino é passado em RCX, o tempo em XMM1, posição
+em R8 e orientação em R9. Os cinco argumentos na pilha são, em ordem:
+FOV (`+0x1C` da câmera), aspecto (`+0x28`), plano próximo (`+0x30`), plano
+distante (`+0x34`) e escala de projeção (`+0x2C`). O construtor `0x02288F00`
+devolve o destino, marca o primeiro byte e escreve até o campo em `+0xAC`.
+Essa ordem corresponde ao tipo de chamada usado pelo projeto antigo.
+
+Os dois caminhos de histórico por olho em `dxgi_proxy.cpp` agora usam esse
+módulo. Leem apenas o prefixo de entrada de `0x38` bytes, preservam quatro
+componentes nos vetores, recusam entradas não finitas/projeções degeneradas e
+constroem o resultado num espaço temporário alinhado a 16 bytes. Publicam o
+histórico somente se o construtor devolve esse espaço com a marca válida e se
+a escrita na câmera tem sucesso. Os endereços dos três hooks de construção,
+reconstrução e cópia/reconstrução também vêm do contrato de câmera.
+
+**A inicialização continua escolhendo apenas o contrato 4.04 depois da
+verificação antiga. O contrato 5.00c não é escolhido automaticamente nem
+libera os demais hooks.** Há outros campos e endereços antigos no caminho.
+O módulo novo não confirma compatibilidade completa nem captura memória de
+objetos desconhecidos; seus limites de bytes dependem do objeto correto fornecido
+pelo hook nativo. A validação por intervalo não substitui essa identidade.
+
+O teste `engine_camera_temporal_contract` usa uma função nativa simulada para
+conferir a ordem dos argumentos, alinhamento, entrada truncada, valores inválidos,
+resultados incompletos e limites da escrita. Confere todos os bytes fora do
+registro das duas versões; o caso 5.00c preserva a área antiga `+0x460`.
+Não executa as funções do jogo.
+
+Evidência estática desta revisão, com identificadores dos blocos e chamadas:
+`../artifacts/remastered-temporal-contract-evidence.json`, somente local.
+A DLL compilou; a suíte completa passou em 98/98 na revisão final.
+Log: `../artifacts/test-camera-contract-final-20261006.log`.
+
 ## Limites que continuam abertos
 
 - As tabelas identificam classes, mas não provam todos os campos, argumentos,
@@ -157,6 +198,7 @@ python scripts/analyze-remastered-rendering.py `
   --inspect-rva 0x02288F00 --call-depth 1
 ```
 
-O próximo passo é revisar o contrato das funções candidatas e os campos da
-câmera/descritor antes de adaptar os acessos do código. Não liberar o bloqueio
-da versão apenas porque uma função foi localizada.
+O próximo passo é adaptar os demais campos de câmera e fechar os contratos de
+criação/cópia/envio do frame, incluindo a vida útil dos comandos. Os acessos ao
+descritor, constantes de renderização e escrita de jitter ainda usam layout
+antigo. Não liberar o bloqueio da versão pelo contrato temporal isolado.
