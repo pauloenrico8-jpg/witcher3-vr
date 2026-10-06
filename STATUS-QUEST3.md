@@ -78,6 +78,14 @@ Ainda não existe verificação em execução para qualquer um desses candidatos
 Esse inventário não inclui todos os campos de objetos ou endereços escritos
 diretamente em outras expressões; não é uma porcentagem de conclusão do port.
 
+A análise de 06/10 acrescentou a identificação das classes pelo compilador e
+o tratamento dos blocos separados de uma função. Ela distingue o callback
+`GetCameraDirection` do diretor de câmera daquele da classe `CCamera`, encontrou
+uma cadeia de execução de renderização e confirmou acessos incompatíveis entre
+os dados de câmera das versões. As evidências e o fluxo da ferramenta estão em
+[PORT-REMASTERED.md](PORT-REMASTERED.md). São 15 tabelas de classes, 43 referências
+a tabelas e 145 entradas em um grafo limitado, sem ativação em execução.
+
 ## O que o código novo faz, passo a passo
 
 1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede
@@ -146,6 +154,12 @@ fora da pasta de trabalho no ambiente restrito. Foram repetidos com `TEMP` e
 Essa alteração valeu apenas para os processos de teste e não mudou a instalação
 do jogo nem as configurações do Windows. A suíte completa foi repetida nesse
 ambiente para registrar o resultado de 95/95.
+
+Separadamente, os 22 testes Python da análise do Remastered passaram em 06/10.
+Eles conferem blocos encadeados, classes, arquivos truncados e falsas instruções
+em dados. A reanálise do executável preservou os 15 registros de nome/callback
+anteriores. Esses testes e relatórios novos estão locais; não há publicação
+destas alterações no fork neste momento.
 
 Esses testes não usam o Quest, não abrem The Witcher 3, não comprovam imagens
 corretas no headset e não medem Novigrad. O registro completo está em
