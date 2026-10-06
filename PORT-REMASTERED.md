@@ -780,3 +780,69 @@ teste de jogo/Quest/FPS ou instalação. Próximo: COM/device/queue ownership,
 identidade moderna da lista e epochReset, submissão/fence e término GPU,
 desligamento/reinit/troca do plugin antes de separar ids/históricos por olho.
 Não presumir que o unwrap QI legado do Streamline esteja portado para2.14.1.
+
+## Identidade moderna e referências COM próprias
+
+`modern_dlss_ownership.h/.cpp` diferencia uma associação CPU de referências
+COM adquiridas. Resolve somente endpoints nativos, recusando Unknown e
+RenderDoc. Conserva um resultado com referências próprias de command list,
+device, quatro Resources e suas identidades canônicas IUnknown. QI, SDK ou
+cadeia inválida não devolvem uma posse parcial. ReShade usa a passagem de
+interface previamente conferida. Nenhum campo privado de wrapper é lido.
+
+Uma análise independente do componente instalado confirmou a classe
+D3D12GraphicsCommandList: GUID `5B2662FB-EB28-4AEC-819E-1C1B4DE060F6`
+em77938, a quinta classe de slGetNativeInterface, e a vtable782F0. Slots
+QI23400/AddRef234C0/Release234F0/GetDevice23720/GetType23730/Close23740/
+Reset23750. QI23400 compara as duas metades do marcador ADEC44E2...
+em23435/23442 com778F0/778F8. O ramo correspondente devolve base com AddRef
+e S_OK sem consultar estadoSDK. A busca anterior de LEA/MOV não encontrou
+essas instruções CMP: era parcial, não prova de ausência. O fallback de
+interfaces desconhecidas ainda tem salto indireto não resolvido234B0.
+
+O verificador em memória exige tabela e slots exatos, os dois GUIDs, export
+slGetNativeInterface7EA0 e SHA256 dos179bytes de QI23400..234B3:
+`b3d0fde6f9ae0173c10dd926161a7e8aa9c74a810dec2a427ccddcdfaf5cac6f`.
+Não guarda autorização entre unload/reinit; mudança/hook/corrupção falha
+fechada. Só após essa verificação o resolver usa a QI do marcador nesta
+classe moderna. Isso não extrapola o contrato a outros objetos Streamline.
+Fontes públicas: [classe de comandos](https://github.com/NVIDIA-RTX/Streamline/blob/main/source/core/sl.interposer/d3d12/d3d12CommandList.h)
+e [QI e Reset](https://github.com/NVIDIA-RTX/Streamline/blob/main/source/core/sl.interposer/d3d12/d3d12CommandList.cpp).
+Evidência do binário efetivo permanece exclusivamente local em
+`../artifacts/remastered-modern-streamline-command-base-evidence.json`.
+
+A alternativa slGetNativeInterface tem dois argumentos e retorna referência
+adicionada inclusive no fallback com o próprio input. Só é chamada com
+capacidade explícita de inicialização/lifetime e serialização com o host;
+o hook do jogo não fornece essa capacidade. Ref devolvida com erro é retirada,
+self/ciclo/Unknown/depth excessiva recusados. Nunca usa a passagem genérica
+legada que devolve Unknown intacto. A
+[API oficial](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_core_api.h)
+declara GetNativeInterface não thread safe. Os testes dessa alternativa
+usam modelos IUnknown; não inicializam nem executam o SDK instalado.
+
+Aquisição exige recibo CPU completo, viewport nativo5531D, DIRECT command
+list e dispositivos nativos com mesma identidade IUnknown. Recursos com a
+mesma identidade canônica são recusados. GetDesc deve ser Tex2D, formato
+conhecido, tamanho suficiente para a extent, array1/mips presentes/sample1/
+quality0; output exige ALLOW_UNORDERED_ACCESS. Referências não atestam estado
+de barreiras ou conteúdo imutável. Token opaco e dados originais intactos.
+O hook só faz aquisições temporárias em diagnósticos limitados; elas não
+alimentam GPU tickets, completion/cache legado, reentrada ou históricos.
+
+`fence_reached` exige destino positivo/finito e conclusão diferente de
+UINT64_MAX. Esse valor sinaliza perda do dispositivo, conforme
+[D3D12 GetCompletedValue](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12fence-getcompletedvalue).
+Não transforma sucesso SDK, retorno de Execute ou AddRef em conclusãoGPU.
+
+Probe opcional `w3vr_modern_dlss_ownership_gpu`: hardware RTX4070Ti, quatro
+texturas reais, associações CPU fabricadas no laboratório. Confere alias,
+extent insuficiente, ausênciaUAV, buffer em vez de Tex2D e dispositivo WARP
+diferente. Executa24cópias GPU com Signal/Event/GetCompletedValue/readback;
+solta refs do chamador e conserva as adquiridas até a fence. Reset só após
+completion. Não carrega Streamline/ReShade/jogo e não valida DLSS/Quest/FPS.
+Log exclusivamente local `../artifacts/modern-dlss-ownership-gpu-20261006.log`.
+DLL compilada e107/107CTest em11,13s: resultados finais em
+`../artifacts/modern-dlss-ownership-port-validation.json`. Gate5c fechado.
+Próximo: recording epochs/Close/Execute/fence por endpoint, retenção até
+GPU retirement e lifecycle do plugin antes de isolar ids/históricos por olho.
