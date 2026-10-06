@@ -639,3 +639,80 @@ Próximo: examinar o getter de opções e seu setter dinâmico, localizar o
 receptor/rota real de avaliação e verificar IDs de viewport, limites e
 históricos separados. Não usar `id | eye`: ids ímpares podem colidir. O gate
 global e a reentrada moderna permanecem fechados até o port completo.
+
+## Pipeline real, receptores e opções dinâmicas: continuação de 6 de outubro
+
+As referências E8 brutas só foram promovidas após decodificação de instruções
+com seus donos unwind e duas tabelas verificadas de nove entradas. A entrada
+real é `01C02720`; as tabelas `01C035D0`/`01C035F4`, JMPs `01C027C5`/`01C028A8`,
+reutilizam a definição da base em `01C02796`. O analisador acompanha aliases
+parciais de registradores, chamadas e encontros dos caminhos conhecidos.
+Chamadas invalidam bases voláteis; no ABI Windows x64, registradores salvos
+pelo callee conservam a definição. Recalcula a prova após novos destinos;
+um caminho que sobrescreve a base faz a análise falhar. Uma referência bruta,
+fragmento isolado ou LEA para outro endereço não é prova de tabela.
+
+O chamador verificado `01C07980` chama em `01C08489`, RETURN `01C0848E`, com
+RCX=pipeline, RDX=descritor, R8D/R9D=índices, DWORD quinto na pilha e BYTE
+sexto na pilha. Testa AL. O hook moderno preserva esses seis argumentos e o
+resultado BYTE, sem a assinatura antiga de sete argumentos/float/retorno32.
+Nenhum significado adicional dos três índices é presumido. O chamador ainda
+tem JMP não resolvido `01C0887A`; não afirmar cobertura de todos os seus caminhos.
+`01D2B640` permanece sem hook de DLSS e sem assinatura presumida.
+
+Na tabela principal, modo6 entra em `01C034C3`. O getter virtual nativo usa
+o objeto de `05A51950` e slot C0; seu resultado real vai para RSI. Os novos
+hooks NÃO invocam esse getter por conta própria. Observam os receptores
+passados aos métodos: preparo `01B78CE0`, CALL `01C034FC`, RETURN `01C03501`;
+avaliação DLSS `01B77EB0`, CALL `01C0354B`, RETURN `01C03550`. A outra chamada
+de preparo (RETURN `01C02890`) pertence a uma rota diferente e não recebe a
+associação deste modo. RR segue CALL `01C03535`, RETURN `01C0353A`, e é excluído
+deste escopo de DLSS comum pelo byte descritor+F73C. O modo vem de pipeline+74.
+
+O preparo recebe três argumentos; a avaliação recebe cinco, com o índice
+quinto na pilha. O chamador examinado ignora seus retornos. O encaminhador
+conserva RAX inteiro como payload opaco: não interpreta bool/status/sucesso,
+nem presume que eles tenham a mesma semântica de retorno do SDK. Estado+180
+é o id real de viewport, lido em preparo, avaliação e builder. O escopo exige
+o mesmo descritor, estado, contexto de recursos, C40/C44, id e par/geração/olho;
+confere os índices 1 e 3 do pipeline na avaliação. Chamadas desconhecidas
+suspendem a associação e restauram a anterior ao retornar. Uma divergência
+na rota conhecida invalida o escopo. Tags aparecem no preparo E na avaliação.
+Os logs podem associar a chamada CPU à rota, mas nunca publicam conclusão GPU.
+O recibo de constantes também exige viewport igual ao estado nativo observado.
+
+`slGetFeatureFunction` IAT `02984D18` tem ABI `(feature, name*, function**)`.
+O getter de `slDLSSSetOptions` retorna em `01ED31B5`; o setter indireto de
+duas referências `(viewport*, options*)` retorna em `01ED31CA`. O pacote
+Options é versão3, GUID `6AC826E4-4C61-4101-A92D-638D421057B8`; só o header
+32 bytes/next nulo é interpretado. Campos de opções/presets ficam intactos.
+`slDLSSGetOptimalSettings` é outra função, não um setter de viewport.
+
+O instalador do SDK agora exige quatro hooks em conjunto: constantes, tags,
+avaliação e getter. O setter é ligado ao endereço retornado pelo SDK somente
+se pertencer ao módulo sl.dlss.dll. Para a cache já preenchida, a rota nativa
+de avaliação faz uma consulta ao getter original, após existir o dispositivo.
+Isso intercepta o destino sem ler/escrever a cache `05DC00D0` nem trocar o
+ponteiro que o jogo recebeu. Não chama o setter adicionalmente. Falha ou
+troca de destino mantém readiness de opções false; retirada falha conserva
+o trampoline necessário. Os três hooks nativos também são uma transação.
+Os guards120/124/128, cache168..178 e cooldown17C não recebem escrita.
+
+Assinaturas públicas conferidas na
+[API Streamline](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_core_api.h)
+e no [DLSS](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_dlss.h).
+O getter é thread safe e exige dispositivo previamente definido; opções e
+avaliação seguem as chamadas originais do jogo, sem introduzir execução paralela.
+Os offsets e sites do jogo vêm do executável local identificado, não do SDK
+atual sozinho. Nenhum cabeçalho de terceiros foi incorporado ao projeto.
+
+Validação: DLL compilada, 105/105 CTest (11,71s), 50/50 Python e nova conferência
+da entrada/chamador no executável. Logs `../artifacts/*modern-dlss-pipeline*20261006.log`.
+Evidências `remastered-modern-dlss-pipeline-owner-evidence.json`,
+`remastered-modern-dlss-pipeline-recheck.json`, `remastered-modern-dlss-options-getter-evidence.json`
+e `remastered-modern-dlss-options-construction-evidence.json` permanecem locais.
+O gate global rejeita 5.00c; nada instalado, nenhum teste de jogo/Quest/FPS.
+Próximo: origem/alocação dos ids nativos em estado+180, liberação de recursos
+por viewport e ciclo de vida/históricos com conclusão GPU. Não usar `id | eye`
+nem ativar ids novos/reentrada sem essas provas. Demais hooks de câmera,
+culling, efeitos e gameplay continuam pendentes para o objetivo completo.
