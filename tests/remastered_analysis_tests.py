@@ -224,5 +224,106 @@ class ControlFlowTests(unittest.TestCase):
         self.assertEqual(refs[0]["UnwindRangeBeginRva"], "0x00001100")
 
 
+class DirectCallLeafTests(unittest.TestCase):
+    def leaf_image(self, code=b"\xc3", target=0x1150):
+        image = fixture()
+        image.data[:6] = b"\xe8" + struct.pack("<i", target - 0x1005) + b"\xc3"
+        if target == 0x1150:
+            offset = image.offset(target)
+            image.data[offset:offset + len(code)] = code
+        return image
+
+    def test_checked_call_and_both_reference_retention_paths(self):
+        # MOV pointer; store; conditional LOCK INC through it; RET.
+        image = self.leaf_image(bytes.fromhex("488b024889014885c07403f0ff00c3"))
+        fact = analysis.direct_call_leaf_facts(image, 0x1000)
+        self.assertEqual(fact["ValidatedDirectCallTargetRva"], "0x00001150")
+        self.assertIsNone(fact["PrimaryEntryRva"])
+        self.assertTrue(fact["CompleteLeafControlFlow"])
+        self.assertEqual(fact["ReturnSites"], ["0x0000115E"])
+        self.assertFalse(fact["ObjectLayoutVerified"])
+        self.assertFalse(fact["RuntimeVerified"])
+        self.assertIsNone(image.primary_function_rva(0x1150))
+
+    def test_does_not_decode_after_leaf_return(self):
+        fact = analysis.direct_call_leaf_facts(self.leaf_image(bytes.fromhex("c3e800000000")), 0x1000)
+        self.assertEqual(len(fact["Instructions"]), 1)
+        self.assertTrue(fact["CompleteLeafControlFlow"])
+
+    def test_call_after_caller_return_is_rejected(self):
+        image = self.leaf_image()
+        image.data[:7] = b"\xc3\xe8" + struct.pack("<i", 0x1150 - 0x1006) + b"\xc3"
+        with self.assertRaisesRegex(ValueError, "reached direct CALL"):
+            analysis.direct_call_leaf_facts(image, 0x1001)
+
+    def test_call_inside_immediate_is_rejected(self):
+        image = self.leaf_image()
+        image.data[:11] = bytes.fromhex("48b8e800000000000000c3")
+        with self.assertRaisesRegex(ValueError, "reached direct CALL"):
+            analysis.direct_call_leaf_facts(image, 0x1002)
+
+    def test_non_executable_or_recorded_target_is_rejected(self):
+        for target in [0x2000, 0x1080]:
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "Target must"):
+                analysis.direct_call_leaf_facts(self.leaf_image(target=target), 0x1000)
+
+    def test_callsite_without_unwind_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "checked caller"):
+            analysis.direct_call_leaf_facts(self.leaf_image(), 0x1150)
+
+    def test_stack_and_nonvolatile_integer_vector_writes_are_rejected(self):
+        for code in ["4883ec08c3", "4889c3c3", "0f28f0c3", "4154c3", "e800000000c3", "c20800"]:
+            with self.subTest(code=code):
+                fact = analysis.direct_call_leaf_facts(self.leaf_image(bytes.fromhex(code)), 0x1000)
+                self.assertFalse(fact["CompleteLeafControlFlow"])
+                self.assertEqual(fact["Problems"][0]["Reason"], "Not a stack-preserving x64 leaf")
+
+    def test_branch_into_instruction_is_rejected(self):
+        fact = analysis.direct_call_leaf_facts(self.leaf_image(bytes.fromhex("b80102030474fac3")), 0x1000)
+        self.assertFalse(fact["CompleteLeafControlFlow"])
+        self.assertEqual(fact["Problems"][0]["Reason"], "Branch into instruction bytes")
+
+    def test_jump_is_reported_without_following_target(self):
+        for code in ["e980000000c3", "ffe0c3"]:
+            with self.subTest(code=code):
+                fact = analysis.direct_call_leaf_facts(self.leaf_image(bytes.fromhex(code)), 0x1000)
+                self.assertFalse(fact["CompleteLeafControlFlow"])
+                self.assertEqual(len(fact["Instructions"]), 1)
+                self.assertEqual(len(fact["StoppedJumps"]), 1)
+                self.assertEqual(fact["Problems"], [])
+
+    def test_out_of_window_conditional_path_is_not_complete(self):
+        fact = analysis.direct_call_leaf_facts(self.leaf_image(bytes.fromhex("74fdc3")), 0x1000)
+        self.assertFalse(fact["CompleteLeafControlFlow"])
+        self.assertEqual(fact["Problems"][0]["Reason"], "Outside bounded leaf window")
+
+    def test_budgets_are_enforced(self):
+        image = self.leaf_image(bytes.fromhex("9090c3"))
+        fact = analysis.direct_call_leaf_facts(image, 0x1000, max_instructions=1)
+        self.assertEqual(fact["Problems"][0]["Reason"], "Instruction budget exhausted")
+        fact = analysis.direct_call_leaf_facts(image, 0x1000, max_bytes=1)
+        self.assertEqual(fact["Problems"][0]["Reason"], "Outside bounded leaf window")
+        for budget in [0, 65537]:
+            with self.assertRaises(ValueError):
+                analysis.direct_call_leaf_facts(image, 0x1000, max_bytes=budget)
+
+    def test_truncated_file_and_next_unwind_range_stop_decode(self):
+        image = self.leaf_image(bytes.fromhex("488b02488901c3"))
+        image.data = image.data[:image.offset(0x1151)]
+        with self.assertRaisesRegex(ValueError, "outside file-backed"):
+            analysis.direct_call_leaf_facts(image, 0x1000)
+        image = self.leaf_image(bytes.fromhex("488b02488901c3"))
+        image.sections[0] = (".text", 0x1000, 0x151, 0, 0x20000000)
+        fact = analysis.direct_call_leaf_facts(image, 0x1000)
+        self.assertFalse(fact["CompleteLeafControlFlow"])
+        self.assertEqual(fact["Problems"][0]["Reason"], "Cannot decode file-backed instruction")
+        image = self.leaf_image(bytes.fromhex("488b02488901c3"))
+        image.starts.append(0x1152)
+        image.starts.sort()
+        fact = analysis.direct_call_leaf_facts(image, 0x1000)
+        self.assertEqual(fact["BoundedWindowEndRva"], "0x00001152")
+        self.assertFalse(fact["CompleteLeafControlFlow"])
+
+
 if __name__ == "__main__":
     unittest.main()
