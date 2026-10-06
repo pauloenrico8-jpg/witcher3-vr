@@ -12,6 +12,9 @@ do tig3rmast3r, versão v0.9.8v2, commit
 oferece controles de movimento. A cópia local foi separada na linha de trabalho
 `quest3-motion-controls`. O fork foi criado na conta
 [pauloenrico8-jpg/witcher3-vr](https://github.com/pauloenrico8-jpg/witcher3-vr).
+O código de leitura dos controles, os testes simulados e as ferramentas de
+análise e instalação foram publicados na
+[linha quest3-motion-controls](https://github.com/pauloenrico8-jpg/witcher3-vr/tree/quest3-motion-controls).
 
 Seu jogo Steam está instalado em
 `E:\SteamLibrary\steamapps\common\The Witcher 3`. O executável DX12 informa
@@ -178,7 +181,6 @@ separadamente. Ainda não há resultados para nenhum desses critérios.
 - Integrar trajetória, contato, dano e bloqueio ao combate do jogo.
 - Confirmar a ativação de mods e a abertura do jogo com a instalação limpa;
   conferir o complemento recomendado e possíveis conflitos.
-- Publicar as mudanças na linha de desenvolvimento do fork e conferir a cópia.
 - Validar no Quest 3 e medir Novigrad na máquina identificada.
 
 O objetivo completo do pedido continua pendente. Não há garantia de 60 FPS nem
