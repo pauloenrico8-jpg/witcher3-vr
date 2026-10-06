@@ -158,6 +158,51 @@ Evidência estática desta revisão, com identificadores dos blocos e chamadas:
 A DLL compilou; a suíte completa passou em 98/98 na revisão final.
 Log: `../artifacts/test-camera-contract-final-20261006.log`.
 
+## Rota de envio de comandos de cena
+
+`src/engine_frame_submission.h` prepara a rota nativa examinada em 5.00c.
+O envio do frame duplicado em `dxgi_proxy.cpp` agora escolhe a rota pelo
+contrato já publicado na inicialização. **Apenas 4.04 continua sendo escolhido;
+a rota Remastered permanece sem ativação.** A rota antiga conserva o envio
+com seu receptor original e a liberação da referência criada pela fábrica.
+
+A rota nova executa estas etapas:
+
+1. Confere se o renderizador conhecido está presente e se as chamadas exigidas
+   estão disponíveis. Recusa a rota incompleta antes de alocar um comando.
+2. Usa `0x00395D80`, o alocador de comandos do jogo. Ele fornece um comando de
+   `0x18` bytes com dados da fila antes do objeto. Um objeto criado com `new`
+   não teria esses dados e não serviria para o despacho nativo.
+3. Recusa resultado nulo e o objeto estático `0x05C88BF0`. Duas referências
+   no alocador e uma no despachante apontam para esse mesmo objeto; o
+   despachante o exclui. Não construir nele um comando que retenha o frame.
+4. Chama `0x02297670` para construir o comando na alocação nativa, com o frame
+   em seu campo `+8` e objeto auxiliar nulo, como no produtor `CGame` examinado.
+   O construtor incrementa a referência ao frame antes do envio.
+5. Chama `0x022925E0` para despachar essa mesma alocação. Essa função usa dados
+   da fila antes do comando e não devolve uma confirmação de imagem renderizada.
+6. Libera a referência própria recebida da fábrica. A referência do comando
+   permanece separada; o destrutor nativo `0x00890B60` a libera pelo slot 2.
+
+Se faltar uma dependência ou a alocação falhar, o código libera a referência
+própria ao frame sem construir ou despachar o comando. Retira as identidades
+do par incompleto e aplica o intervalo de tentativa já usado pelo produtor.
+O resultado "despachado" descreve o retorno da chamada; não comprova execução
+da fila, conclusão na placa de vídeo nem imagens corretas no Quest.
+
+Os testes simulam a referência mantida pelo comando, conclusão imediata ou
+posterior, dependências ausentes e o objeto estático inválido. Não executam
+o alocador nem o despachante reais. A identificação do slot de liberação foi
+obtida da tabela do frame e dos chamadores; o método `0x0228E930` não tem registro
+de recuperação de pilha, e a ferramenta não infere seu corpo por proximidade.
+
+Evidência local: `../artifacts/remastered-frame-command-contract-evidence.json`.
+Ainda é necessário adaptar o descritor completo, as etapas de preparação do
+produtor e os demais caminhos de câmera/renderização antes de escolher 5.00c.
+Essa rota isolada não substitui essas etapas nem comprova VR em execução.
+A DLL compilou e a suíte completa passou em 99/99, com log em
+`../artifacts/test-frame-submission-20261006.log`.
+
 ## Limites que continuam abertos
 
 - As tabelas identificam classes, mas não provam todos os campos, argumentos,

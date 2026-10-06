@@ -27,6 +27,7 @@
 #include "hand_pose_history.h"
 #include "legacy_engine_preflight.h"
 #include "engine_camera_temporal.h"
+#include "engine_frame_submission.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
@@ -40351,6 +40352,56 @@ size_t copy_readable_scene_descriptor(
     return copied_bytes;
 }
 
+bool remastered_command_renderer_ready(uintptr_t module) {
+    if (module == 0) return false;
+    __try {
+        const auto renderer = *reinterpret_cast<const uintptr_t*>(module +
+            w3vr::frame_submission::renderer_global_rva);
+        return renderer != 0 && *reinterpret_cast<const uintptr_t*>(renderer) ==
+            module + w3vr::frame_submission::renderer_vtable_rva;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Called only for the separately owned duplicate frame. Selection follows the
+// camera contract already published by initialization, which still authorizes
+// ONLY legacy 4.04. This new command branch must not bypass the full port gate.
+bool submit_engine_duplicate_frame(uintptr_t module, void* render_context,
+    void* frame) {
+    if (frame == nullptr) return false;
+    const auto* vtable = *reinterpret_cast<void***>(frame);
+    const auto release = reinterpret_cast<w3vr::frame_submission::ReleaseFrame>(
+        vtable[2]);
+    const auto* contract = g_engine_camera_temporal_contract.load(
+        std::memory_order_acquire);
+    if (module != 0 && contract == &w3vr::engine_camera::legacy_404 &&
+        render_context != nullptr) {
+        constexpr uintptr_t kLegacySceneEnqueueRva = 0x01621FC0;
+        const auto enqueue = reinterpret_cast<EngineSceneEnqueueFn>(
+            module + kLegacySceneEnqueueRva);
+        enqueue(render_context, frame);
+        release(frame);
+        return true;
+    }
+    if (module != 0 && contract == &w3vr::engine_camera::remastered_500c) {
+        w3vr::frame_submission::NativeCommandRoute route{};
+        route.allocate = reinterpret_cast<w3vr::frame_submission::AllocateCommand>(
+            module + w3vr::frame_submission::command_allocator_rva);
+        route.construct = reinterpret_cast<w3vr::frame_submission::ConstructCommand>(
+            module + w3vr::frame_submission::command_constructor_rva);
+        route.dispatch = reinterpret_cast<w3vr::frame_submission::DispatchCommand>(
+            module + w3vr::frame_submission::command_dispatch_rva);
+        route.unavailable_command = reinterpret_cast<void*>(
+            module + w3vr::frame_submission::unavailable_command_rva);
+        route.renderer_ready = remastered_command_renderer_ready(module);
+        return w3vr::frame_submission::submit_owned_frame(route, frame, release) ==
+            w3vr::frame_submission::Result::dispatched;
+    }
+    release(frame);
+    return false;
+}
+
 void* __fastcall hook_engine_frame_data_factory(void* render_context, void* render_settings, void* scene_descriptor) {
     w3vr::pipeline_flight::CpuScope flight_cpu{
         w3vr::pipeline_flight::Phase::FrameFactory};
@@ -40784,14 +40835,21 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                     duplicate_asymmetric_tag,
                     *duplicate_factory_capture);
             }
-            constexpr uintptr_t kEngineSceneEnqueueRva = 0x01621FC0;
-            auto enqueue = reinterpret_cast<EngineSceneEnqueueFn>(module + kEngineSceneEnqueueRva);
-            enqueue(render_context, right_frame_data);
-
-            using ReleaseFrameDataFn = void(__fastcall*)(void*);
-            auto* vtable = *reinterpret_cast<void***>(right_frame_data);
-            auto release = reinterpret_cast<ReleaseFrameDataFn>(vtable[2]);
-            release(right_frame_data);
+            const bool duplicate_dispatched = submit_engine_duplicate_frame(
+                module, render_context, right_frame_data);
+            if (!duplicate_dispatched) {
+                // Remove incomplete eye identities after the helper consumed
+                // the private reference. Never expose this pair as complete.
+                {
+                    std::scoped_lock lock{g_engine_dual_frame_mutex};
+                    g_engine_dual_frame_eyes.erase(right_frame_data);
+                    g_engine_dual_frame_eyes.erase(result);
+                }
+                g_engine_pair_retry_present.store(present + 2,
+                    std::memory_order_relaxed);
+                log_line("Engine duplicate command unavailable; pair=%llu skipped",
+                    static_cast<unsigned long long>(pair_id));
+            }
 
             // Snapshot copies were taken after both originals and before
             // enqueue. Formatting is deferred until the duplicate is enqueued
@@ -40803,7 +40861,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 emit_asymmetric_frame_factory(*duplicate_factory_capture);
             }
 
-            if (g_config.runtime_diagnostics &&
+            if (duplicate_dispatched && g_config.runtime_diagnostics &&
                 g_engine_dual_render_log_count.fetch_add(1) < 2) {
                 log_line("Engine dual render queued present=%llu left=%p right=%p descriptor=%p",
                     static_cast<unsigned long long>(present),

@@ -120,6 +120,37 @@ O registro desta rodada está em
 `../artifacts/test-camera-contract-final-20261006.log`. São testes de código e
 contratos simulados; não são uma abertura do jogo nem uma medição de VR.
 
+## Envio da cena e duração dos dados
+
+Uma cena precisa continuar disponível enquanto a placa de vídeo e o jogo a
+processam. A parte nova em `src/engine_frame_submission.h` prepara o envio
+usado no Remastered, com este fluxo:
+
+1. Confere as funções e o renderizador antes de começar.
+2. Pede ao jogo uma área própria para seu comando de renderização. Recusa
+   falhas e um objeto especial que o jogo não despacha.
+3. Coloca a cena nesse comando. O jogo mantém uma referência adicional à cena:
+   é um registro que impede que ela seja destruída enquanto o comando a usa.
+4. Envia o comando e libera somente a referência criada pela nossa chamada
+   à fábrica de cenas. O comando libera sua própria referência ao terminar.
+5. Se falhar antes do envio, libera os dados que pertencem à nossa chamada
+   e retira o par incompleto da identificação dos olhos.
+
+Essa divisão foi necessária porque o envio no 5.00c usa objetos e dados de fila
+que diferem da passagem antiga. Uma área criada pelo próprio mod não contém
+os dados internos que o jogo exige para esses comandos.
+
+O envio do olho duplicado agora passa por essa escolha de rota. **A rota nova
+do 5.00c continua sem ativação**, junto do bloqueio geral. Ainda faltam o
+descritor completo da cena, a preparação do produtor e outros campos e chamadas.
+Os testes de duração dos dados são simulados: nenhum frame do jogo foi enviado
+pelo novo código nesta rodada. Esta mudança também permanece somente local.
+
+A DLL desta rodada compilou e a suíte completa passou em **99/99 testes**.
+Registro: `../artifacts/test-frame-submission-20261006.log`. Esse resultado
+verifica o código no PC, incluindo as funções simuladas; não demonstra VR
+jogável nem desempenho no save de Novigrad.
+
 ## O que o código novo faz, passo a passo
 
 1. Quando o mod base cria sua ligação com o sistema de VR, a parte nova pede
