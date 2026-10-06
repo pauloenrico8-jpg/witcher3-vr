@@ -467,6 +467,39 @@ Logs locais: `../artifacts/build-camera-layout-final-20261006.log` e
 `../artifacts/test-camera-layout-final-20261006.log`. O relatório novo
 `../artifacts/remastered-camera-layout-evidence.json` permanece local.
 
+## Rota da câmera durante o desenho normal: 6 de outubro
+
+Encontrei a chamada normal do ajuste de câmera. A ferramenta anterior não
+seguia uma tabela de escolhas da versão nova e, por isso, tinha encontrado
+apenas as chamadas de supersampling e desenho 2D. Esse limite foi corrigido;
+os relatórios antigos continuam sendo evidência parcial.
+
+O código novo funciona assim:
+
+1. A ferramenta confere a comparação que limita as escolhas e os destinos
+   da tabela antes de segui-los. Uma tabela truncada, um destino em outra
+   função ou bytes confundidos com instruções são recusados.
+2. O mod usa a versão aceita para escolher a função de ajuste da câmera e
+   reconhecer quem a chamou. A atualização da cena normal recebe seu próprio
+   tratamento. A restauração de valores e o desenho 2D não recebem novamente
+   o deslocamento necessário para posicionar a imagem de um olho.
+3. A conferência usa as posições novas do jitter atual, sem confundi-las com
+   o jitter da imagem anterior. A dica de centralização da versão antiga não
+   é reutilizada na nova. As capturas de auditoria antigas ficam na versão antiga.
+4. O bloqueio de compatibilidade permanece antes da instalação dos hooks,
+   as funções que permitem ao mod interceptar o trabalho do jogo. Ainda não
+   foi liberada execução em Remastered 5.00c.
+
+Também identifiquei a função nova que prepara as constantes, os números que
+o jogo envia à placa de vídeo para desenhar a imagem. Ela mudou de endereço
+e usa outra posição para guardar o identificador da imagem. Adaptar essa
+função e os dados anteriores da câmera é o próximo passo.
+
+A DLL foi compilada; 103/103 CTest e 43/43 testes Python passaram. As verificações finais desta rodada estão registradas
+no relatório local `../artifacts/normal-camera-switch-port-validation.json`.
+Nenhum teste desta etapa comprova VR no Quest, combate físico ou 60 FPS.
+Os novos dados extraídos do executável continuam locais.
+
 ## Trabalho que falta
 
 - Adaptar e verificar os pontos internos de renderização e de jogo para 5.00c.

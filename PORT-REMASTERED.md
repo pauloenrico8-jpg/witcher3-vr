@@ -437,20 +437,24 @@ não foram estabelecidos como um contrato novo de escrita ou culling.
 
 `022B51E0` tem o ABI observado de cinco argumentos: RCX descritor, XMM1 e
 XMM2 valores, R9D largura e quinto argumento altura em entrada RSP+28.
-Grava os mesmos valores nas duas câmeras e reconstrói ambas. As três chamadas
-diretas verificadas têm propósitos distintos:
+Grava os mesmos valores nas duas câmeras e reconstrói ambas. A análise inicial
+seguia somente três chamadas. A atualização abaixo resolve uma tabela de modos
+e encontra também a chamada da cena normal. As quatro chamadas verificadas
+têm propósitos distintos:
 
 | Retorno após CALL | Classe primária verificada / propósito |
 |---|---|
+| 01C14BD1 | Core normal 01C13630: jitter atual calculado para a cena |
 | 01D59287 | RenderUberSampleNormalTaskBatch: aplicar amostra |
 | 01D59880 | A mesma tarefa: restaurar valores capturados antes do loop |
 | 01D59D27 | RenderFinal2DTaskBatch: substituição opcional de valores |
 
 As tabelas primárias são `037A6C20` (slot 2 -> `01D590A0`) e `037A6C00`
 (slot 2 -> `01D59CD0`), verificadas por COL/RTTI, isto é, registros de tipos
-do executável. Essas chamadas não substituem as oito rotas antigas. O mapa
-registra seus propósitos, mas a instalação do escritor e a autoridade
-temporal/culling antiga continuam recusando o contrato Remastered.
+do executável. Essas chamadas não substituem uma a uma as oito rotas antigas.
+A instalação usa a entrada correspondente ao contrato aceito pela inicialização;
+o preflight continua recusando Remastered. Os registros de autoridade/culling
+antigos não foram autorizados para a versão nova.
 
 Os snapshots e três verificadores de campos das câmeras agora usam o mapa;
 o registro da fábrica guarda o mapa junto com a amostra. Leituras truncadas
@@ -470,9 +474,59 @@ verificada `0394FA88`, CRenderCommand_TakeUberScreenshot. Essa rota de
 captura também não deve ser promovida à rota temporal da imagem normal.
 Sua evidência continua local em `../artifacts/remastered-inline-jitter-candidate.json`.
 
-Próximo passo: seguir RenderNormalEpilogueTaskBatch (`01D57F90`), sua chamada
-`01D583BF -> 01C21200` e as rotas de preparação da imagem normal; conferir
-argumentos, destino de jitter e dados de shader antes de portar o escritor.
+Essa etapa inicial foi seguida pela investigação abaixo.
 O comando normal chama o core `01C13630` em `01D0554C`: o retorno correto
 é `01D05551`, corrigindo a anotação anterior do handoff. Os demais hooks de
 câmera, constantes, caches dos efeitos e recursos continuam pendentes.
+
+## Rota temporal normal e tabelas de modos: 6 de outubro
+
+O analisador agora segue somente uma forma verificada de tabela de desvios:
+comparação sem sinal limitada a até 256 entradas, ramo de fallback, base da
+imagem, leitura de RVAs de 32 bits, soma com a base e salto. Todos os destinos
+devem ficar nos trechos da mesma função, fora dos bytes da tabela. Tabelas
+truncadas, destinos de outras funções e instruções sobrepostas são recusados.
+Outras formas de salto continuam marcadas como não resolvidas.
+
+No core `01C13630`, o salto `01C14B72` usa nove entradas em `01C15854`.
+Os modos 0/1 seguem `01C14C0C`; 2..8 seguem `01C14B74`. Não foi inferido um
+nome de backend para todos esses números. Nessa segunda rota:
+
+1. `01C03F10` calcula jitter para o índice renderer+7F0, e outra chamada
+   calcula o índice anterior. O descritor é frame+10, provado em `01C13B1B`.
+2. `01C14BCC` chama `022B51E0` com jitter atual e dimensões desc+BDC/BE0.
+   O retorno é **01C14BD1**, não o endereço da CALL.
+3. Depois do retorno, o core grava jitter anterior em desc+4E0/4E4 e suas
+   dimensões em desc+4E8/4EC. Não confundir esses campos com o jitter atual
+   desc+4D0/AB0, nem com o registro histórico desc+540.
+4. `01C14C21` chama `01B799C0` com estado renderer+C0, descritor e flag R8B.
+   Essa função usa frame-id desc+C44 e guarda o identificador em estado+120.
+   Copia uma câmera privada antes de montar as constantes; a reentrada e os
+   demais campos do estado ainda precisam ser adaptados e verificados.
+
+O hook do escritor agora escolhe entrada, lista de retornos e campos de jitter
+por contrato. O retorno normal novo pode participar da rota; as três chamadas
+de supersampling/restauração/Final2D não recebem outro deslocamento óptico.
+A dica antiga de valor já centralizado continua exclusiva de 4.04. A conferência
+do escritor lê jitter atual em desc+410/920 para 4.04 e desc+4D0/AB0 para 5.00c.
+As capturas antigas de auditoria ficam restritas a 4.04. Isso prepara o hook,
+mas **não libera a inicialização em 5.00c nem comprova a projeção no jogo**.
+
+RenderNormalEpilogueTaskBatch chama `01C21200`, mas suas reconstruções
+`01C236FD/01C23733` usam uma cópia privada na pilha (RBP+9B0), obtida em
+`01C236C3`. Elas não escrevem as duas câmeras vivas da cena e não foram
+promovidas a uma rota normal de escrita.
+
+Evidência local: `../artifacts/remastered-normal-camera-switch-evidence.json`.
+Ela não foi publicada. Os relatórios antigos mantêm sua condição de evidência
+parcial; o número inicial de três chamadas não era uma prova de completude.
+Validação: DLL compilada, 103/103 CTest e 43/43 testes Python passaram.
+Os seis testes Python novos exercitam chamadas escondidas atrás da tabela,
+limites, base errada, outro dono e sobreposições. O teste de câmera confere
+as quatro classificações, a recusa de retornos de restauração/2D e a separação
+entre campos atuais, anteriores e da versão antiga. Todos usam dados do PC;
+nenhum mede execução no jogo ou no headset.
+
+Próximo passo: adaptar a preparação das constantes `01B799C0`, distinguir
+estado/renderizador/descritor, verificar a escrita do jitter anterior e portar
+as demais leituras e matrizes do frame builder. O bloqueio global permanece.
