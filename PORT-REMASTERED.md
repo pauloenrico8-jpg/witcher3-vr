@@ -9,60 +9,47 @@ o foco passou a ser concluir o mod VR. Menções anteriores à meta são histór
 
 ## Entrada e epílogo normais — checkpoint de 7 de outubro
 
-`engine_render_core.h`/`dxgi_proxy.cpp` selecionam core5c01C13630 e
-RETURNnormal01D05551 (CALL01D0554C em comando01D054E0), preservando ABIvoid de
-TRÊS argumentos RCXrenderer/RDXframe/R8scene, inclusive sceneNULL. Seleção4.04
-mantém1D86400 e corpo legado. Moderno usa corpo dedicado sem as antigas escritas
-em matrizes/descritores, fallbacks ou publicação de task/image completion.
+`engine_render_core.h` e `dxgi_proxy.cpp` acrescentam uma passagem própria para
+as duas entradas modernas: a função principal de desenho e a tarefa normal que
+continua esse desenho. A passagem principal preserva os três argumentos originais
+(renderizador, quadro e cena); a tarefa preserva seu único argumento. Cada função
+original é chamada uma vez. A versão antiga mantém seu caminho separado.
 
-A tarefa normal RenderNormalEpilogueTaskBatch tem VTprincipal037A6C40, slot2
-01D57F90, ABIvoid/UM argumento this. Leitura de prefixo30bytes confere o tipo
-exato e lê renderer+10/frame+28; não confundir scene+18 ou descriptorframe+10.
-VT037A6C20 é RenderUberSampleNormalTaskBatch, slot2=01D590A0: não é aceita.
-CoreCALL01C150F1 chega a01D2B640, que constrói as duas classes de tarefa.
-LEAs normais01D2C004/01D2C37B e prologue/fields da função real foram reconferidos.
-01D2B640 foi identificado como emissor de tarefas, NÃO entrada do DLSS. R13 é
-reusado: começa como descriptor e em01D2C2F3 recupera frame salvo da RDX nativa.
+O código só aceita uma identificação de olho com a sequência moderna de cópias
+concluída, geração atual e quadro, par e visão válidos. Cada retorno moderno da
+fábrica apaga a identificação antiga daquele endereço antes de registrar outra.
+Isso reduz herança por reuso; não prova a vida útil de outros objetos do jogo.
+Na tarefa posterior, o tipo e o pequeno registro de entrada são conferidos antes
+de usar a identificação do quadro. Tipos desconhecidos e supersampling são
+rejeitados para essa identificação, mas recebem a chamada original intacta.
 
-As duas passagens exigem label de fábrica com cópias modernas concluídas,
-geração corrente, frame/par/eye/view válidos. Cada retorno moderno de fábrica
-apaga o registro antigo daquele endereço antes de poder ser novamente rotulado.
-Isso não é prova de ownership para outras alocações/destruição. Ambos os escopos
-mascaram labels externos desconhecidos, restauram TODOS os campos de visão,
-projeção/pose/flags/auditframe após a chamada, inclusive unwind C++ (não SEH).
-A tarefa encaminha this uma vez e não inventa o callerRVA do core para si.
+Os dois escopos conservam e restauram todos os dados temporários de olho, visão,
+projeção e cabeça. Chamadas aninhadas desconhecidas recebem estado vazio. As
+correções antigas de câmera e os anúncios antigos de conclusão não são usados
+por essas entradas modernas. O retorno do processador não prova que a placa de
+vídeo terminou de desenhar a imagem.
 
-Installer verifica dois prefixos de16bytes e VTslot2, cria ambos antes de ativar,
-publica readiness somente após ambas ativações. Falhas fecham admissão, tentam
-desativar entradas já ativadas e conservam trampolines sem remove/null/retry.
-Não resolve lifecycle/unload/barreira de threads ou o conjunto completo de hooks.
-Preflight global permanece byte-a-byte igual/5c rejeitada; nada instalado.
+A instalação confere as duas entradas e a ligação da tarefa, cria os dois
+encaminhamentos antes de ativá-los e só anuncia prontidão com ambos ativados.
+Falhas parciais fecham a admissão e conservam os encaminhamentos originais.
+Isso ainda não resolve a parada e remoção seguras de todas as ligações do mod.
 
-Consumidores reconferidos LOCALMENTE: epílogo normalCALL01D583BF->01C21200 e
-CALL01D5845E->01C07980. Em01C21200, common camera emitter01C75250 recebe câmera
-frame+20 emCALL01C217FB, count1 e slot nativo; private/restoreCALL01C23750/01C237DA.
-Toda01C21200 NÃO é apenas uma câmera privada. Emitter usa matrizes câmera2C0/300,
-transform40, previousflag530/position540/transform560 ou fallbackcurrent; monta
-payload360bytes e copia sincronicamente via01EDD600/3688D0 antes do retorno nas
-rotas examinadas. Slotguardado no homeRSP20 vira headerptrRBP458, NÃO outputptr.
-GPU completion/resources/ownership seguem NÃO provados. Camera stride5E0 no
-loop de seis matrizes; essas seis entradas não são olhos HMD.
+DLL compilada; **107/107 CTest em 8,83 segundos**. Casos com dados fabricados
+verificam argumentos de 64 bits, cena vazia, dois olhos, geração/par, sequência
+incompleta, chamadas aninhadas, leitura curta, tipo incorreto e restauração após
+exceção de C++. Não executaram o jogo, funções nativas do jogo, instalação/falhas
+do MinHook, imagens reais na placa de vídeo nem o Quest.
 
-A câmera secundária5F0 fornece posição/matrizes40/180/340 a014A5D50 nos receptores
-+4BC/+794, no core e01CE5970. Função tem SETE argumentos e calcula dados
-geométricos; classe/nome/toda semântica de visibilidade ainda não provados.
-Não reutilizar hookAABB legado de dois argumentos. Functor01C765A0->01C75C60
-faz dados ambientais/dimensões; não confundir com emissor principal de câmera.
+O controle global de compatibilidade continua igual: **5.00c fechada; nada
+instalado**. A pose do headset ainda não é aplicada por estas entradas. Próximo:
+transformação das câmeras sem dupla aplicação, matrizes, visibilidade, efeitos,
+ordem/vida útil das tarefas e recursos, parada segura e comprovação de duas
+imagens novas por quadro. Depois integrar mãos, armas e combate físico ao jogo.
+Não há meta obrigatória de FPS; DLSS continua complementar.
 
-DLL compilada SHA BD8F09D7BF98C92EA53D31C902FFD10B1CB5E9F67241B8CA0DA844FC65B95F74;
-107/107 CTest8,83s, logs build/test-render-core-epilogue-20261007.log. Casos
-fabricados verificam ABI64bits/NULL, eye/gen/par, lineage ausente, nesting,
-truncação/tipo/offsets e unwind. Nenhum jogo/Native/MinHook/GPUdeJogo/Quest rodado.
-Recibo LOCAL render-core-epilogue-port-validation.json, análise reproduzir:
-`python ..\artifacts\analyze-normal-camera-consumers.py`. Novos relatórios Native
-somente locais; autorização anterior cobre apenas QUATRO antigos. Próximo:
-transformação scratch/frame sem dupla aplicação, matrizes/visibilidade/efeitos,
-ordem/lifetime/lifecycle, recursos e DOIS olhos NOVOS por quadro. Não reabrir5c.
+Os detalhes da análise do executável, logs e recibos novos ficam somente locais.
+A autorização anterior de publicação de diagnósticos cobre apenas os quatro
+relatórios antigos. Recibo local: `../artifacts/render-core-epilogue-port-validation.json`.
 
 ## Contexto das cópias normais — checkpoint de 7 de outubro
 
