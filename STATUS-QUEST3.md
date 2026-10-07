@@ -6,6 +6,39 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Convivência com os comandos gráficos antigos — 7 de outubro
+
+O observador novo agora pode trabalhar com os caminhos de Reset e Execute
+que o próprio mod já instalou. Reset começa uma gravação de tarefas da placa;
+Execute envia essas tarefas. O fluxo ficou assim:
+
+1. O caminho antigo guarda uma ligação com sua função original depois que
+   sua instalação dá certo. Essa ligação é publicada de modo seguro para
+   as atividades paralelas do programa.
+2. A parte nova só usa a ligação se o endereço pertencer à função nativa
+   correta do Direct3D. Um objeto intermediário não vale como essa prova.
+3. Observa antes e depois, preservando a chamada original uma única vez.
+   O caminho antigo continua fazendo suas atualizações de estado.
+4. Se a ligação deixa de valer, a observação para. Ao retirar o observador,
+   o código conserva a instalação antiga e sua função original.
+
+Escolhi compartilhar o caminho que conhecemos para evitar duas instalações
+disputando a mesma função. Instalações desconhecidas continuam recusadas.
+As tarefas internas do ReShade continuam isoladas: seguem diretamente para
+o caminho original e invalidam a observação nova, pois ela seria incompleta.
+
+A DLL compilou e passaram **107/107 testes em 11,69 segundos**. Na RTX 4070 Ti
+passaram **27 cópias reais**, incluindo uma cópia pelo caminho compartilhado.
+Nesse caso houve um Close, dois Reset e um Execute observados, cada chamada
+encaminhada uma vez. Os pixels foram conferidos após a confirmação própria
+da placa; o caminho antigo continuou funcionando depois da retirada nova.
+
+Isso ainda não ativa o VR no Witcher. Falta comprovar a parada e a ordem das
+chamadas do jogo, conectar o registro de produção e separar os recursos dos
+olhos. Recibos e olhos no teste são fabricados; Witcher, DLSS e Quest não foram
+executados. Nada foi instalado; o bloqueio de 5.00c continua fechado.
+Evidência somente local: `../artifacts/modern-dlss-cooperative-hooks-port-validation.json`.
+
 ## Observação das funções nativas da GPU — 6 de outubro
 
 Agora existe `modern_dlss_native_hooks`, uma entrada nas funções reais que
