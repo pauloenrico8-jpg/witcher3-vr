@@ -113,6 +113,20 @@ int main() try {
     {
         auto owned = m::acquire(receipt, classify);
         require(bool(owned) && owned.command.Get() == command.Get(), "native acquisition");
+        auto queue_owned = m::acquire_queue(queue.Get(), classify);
+        require(bool(queue_owned) && m::compatible_queue_device(queue_owned, owned) &&
+            !queue_owned.gpu_completion_verified, "native queue acquisition/device match");
+        ComPtr<ID3D12CommandQueue> independent_queue;
+        check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&independent_queue)), "independent queue");
+        auto independent = m::acquire_queue(independent_queue.Get(), classify);
+        require(bool(independent) && m::compatible_queue_device(independent, owned) &&
+            independent.queue_identity.Get() != queue_owned.queue_identity.Get(),
+            "independent queues collapsed to device identity");
+        auto compute_desc = queue_desc; compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        ComPtr<ID3D12CommandQueue> compute_queue;
+        check(device->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute_queue)), "compute queue");
+        require(m::acquire_queue(compute_queue.Get(), classify).failure == m::Failure::Interface,
+            "non DIRECT queue admitted");
         require(!owned.gpu_completion_verified, "ownership is not GPU completion");
         auto bad = receipt; bad.bindings[1].resource.native = bad.bindings[0].resource.native;
         require(m::acquire(bad, classify).failure == m::Failure::AliasedResource, "alias rejection");
@@ -129,14 +143,22 @@ int main() try {
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)), "second adapter for rejection");
         ComPtr<ID3D12Device> other_device;
         check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&other_device)), "second device");
+        ComPtr<ID3D12CommandQueue> other_queue;
+        check(other_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&other_queue)), "foreign queue");
+        auto foreign_queue = m::acquire_queue(other_queue.Get(), classify);
+        require(bool(foreign_queue) && !m::compatible_queue_device(foreign_queue, owned), "foreign queue device matched");
         auto foreign = texture(other_device.Get());
         bad = receipt; bad.bindings[0].resource.native = reinterpret_cast<std::uint64_t>(foreign.Get());
         require(m::acquire(bad, classify).failure == m::Failure::Device, "foreign device rejection");
         std::puts("PASS real-resource admission and alias/dimension/size/UAV/device rejection");
+        std::puts("PASS real queue ownership: DIRECT only, distinct identities, same/foreign device checks");
     }
     auto upload = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     auto initial = m::acquire(receipt, classify);
+    auto submission_queue = m::acquire_queue(queue.Get(), classify);
+    require(bool(submission_queue) && m::compatible_queue_device(submission_queue, initial), "submission queue ownership");
+    queue.Reset(); // All loop submissions use only the acquired native queue.
     recording::Ledger ledger(initial);
     initial = {};
     require(!ledger.open_stamp() && ledger.epoch() == 0, "unknown initial recording admitted");
@@ -226,9 +248,10 @@ int main() try {
             ID3D12Fence* gate; std::uint64_t value;
             ~Unblock() { gate->Signal(value); }
         } unblock{gate.Get(), value};
-        check(queue->Wait(gate.Get(), value), "queue wait before submission");
-        queue->ExecuteCommandLists(1, lists);
-        check(queue->Signal(fence.Get(), value), "signal after real submission");
+        require(m::compatible_queue_device(submission_queue, submitted), "submitted device mismatch");
+        check(submission_queue.queue->Wait(gate.Get(), value), "queue wait before submission");
+        submission_queue.queue->ExecuteCommandLists(1, lists);
+        check(submission_queue.queue->Signal(fence.Get(), value), "signal after real submission");
         require(!m::fence_reached(fence->GetCompletedValue(), value), "gate did not delay GPU work");
         auto* next_allocator = iteration & 1 ? allocator.Get() : alternate_allocator.Get();
         check(next_allocator->Reset(), "unused allocator reset");
