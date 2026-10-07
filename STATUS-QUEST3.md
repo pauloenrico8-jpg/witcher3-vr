@@ -6,6 +6,38 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Centro da projeção e escrita da pose — 7 de outubro
+
+O caminho que reconstrói a câmera agora usa as posições de memória da versão
+escolhida para o centro da imagem e suas dimensões. “Projeção” é o cálculo que
+transforma o mundo 3D na imagem vista por um olho. O fluxo ficou assim:
+
+1. Seleciona o formato conhecido da câmera. Se não reconhecer, encaminha a
+   chamada original sem tentar modificar esses dados.
+2. Grava o centro como dois valores com casas decimais e largura/altura como
+   dois números inteiros. O caminho manual também passou a preservar esse tipo.
+3. Depois da reconstrução, lê as dimensões na posição correta para conferir o
+   resultado. A cópia usada pelos marcadores recebe a mesma posição por versão.
+4. Ao ajustar um olho com orientação inclinada, copia somente o tamanho de
+   câmera registrado para a versão e grava apenas posição e rotação: seis
+   valores. Conserva campo de visão, matrizes, histórico e dados vizinhos.
+
+Escolhi limitar a escrita porque a rotina anterior copiava de volta um bloco
+inteiro de 2.048 bytes, apesar de mudar somente a pose. Também limitei as cópias
+locais de marcadores e da base dos olhos ao tamanho registrado da câmera.
+
+A DLL compilou e passaram **107/107 testes em 9,07 segundos**. Os novos casos
+conferem dimensões inteiras, preservação dos demais bytes, campos inválidos,
+leituras curtas e as duas câmeras internas de um único descritor. São dados
+preparados para teste; essas duas câmeras não são imagens do headset.
+
+**5.00c continua bloqueado e nada foi instalado.** Faltam o contexto das duas
+etapas de cópia da câmera normal, demais matrizes/efeitos, renderização dos
+dois olhos por quadro e integração física com o jogo. As outras rotas de câmera
+não foram declaradas adaptadas. Leituras protegidas e limites de tamanho não
+comprovam vida útil dos objetos, ordem das tarefas nem escrita atômica.
+Evidência local: `../artifacts/camera-projection-port-validation.json`.
+
 ## Funções de cabeça e autoridade da câmera por versão — 7 de outubro
 
 A adaptação agora escolhe nove funções de cabeça e câmera conforme a versão

@@ -33655,14 +33655,15 @@ bool apply_native_canted_eye_transform(
     const HmdCameraPoseSnapshot& pose,
     int eye,
     std::array<float, 512>* cyclopean_rebuilt_out = nullptr) {
-    if (view == nullptr || g_engine_view_rebuild == nullptr ||
+    const auto* camera_layout = selected_engine_camera_layout();
+    if (camera_layout == nullptr || view == nullptr || g_engine_view_rebuild == nullptr ||
         !native_canted_eye_pose_available(pose, eye)) {
         return false;
     }
 
     std::array<float, 512> source{};
     if (!safe_copy_engine_view_snapshot(
-            view, source.data(), sizeof(source))) {
+            view, source.data(), camera_layout->camera_bytes)) {
         return false;
     }
     std::array<float, 512> cyclopean_basis = source;
@@ -33721,8 +33722,14 @@ bool apply_native_canted_eye_transform(
             return false;
         }
     }
-    return safe_write_engine_view_snapshot(
-        view, transformed.data(), sizeof(transformed));
+    const w3vr::engine_camera_layout::PoseFields final_pose{
+        {transformed[0], transformed[1], transformed[2]},
+        {transformed[4], transformed[5], transformed[6]}};
+    __try {
+        return w3vr::engine_camera_layout::write_pose(
+            {reinterpret_cast<uint8_t*>(view), camera_layout->camera_bytes},
+            camera_layout, final_pose);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) {
@@ -37171,7 +37178,37 @@ bool prepare_engine_per_eye_native_temporal_history(
     return true;
 }
 
+bool read_engine_projection_fields(const float* view,
+    const w3vr::engine_camera_layout::Layout* layout,
+    w3vr::engine_camera_layout::ProjectionFields& fields) {
+    if (view == nullptr || layout == nullptr) return false;
+    __try {
+        return w3vr::engine_camera_layout::read_projection(
+            {reinterpret_cast<const uint8_t*>(view), layout->camera_bytes}, layout, fields);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool write_engine_projection_fields(float* view,
+    const w3vr::engine_camera_layout::Layout* layout,
+    const w3vr::engine_camera_layout::ProjectionFields& fields) {
+    if (view == nullptr || layout == nullptr) return false;
+    __try {
+        return w3vr::engine_camera_layout::write_projection(
+            {reinterpret_cast<uint8_t*>(view), layout->camera_bytes}, layout, fields);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 void __fastcall hook_engine_view_rebuild(float* view) {
+    const auto* camera_layout = selected_engine_camera_layout();
+    if (camera_layout == nullptr) {
+        g_engine_view_rebuild(view);
+        return;
+    }
+    const auto center_index = camera_layout->jitter / sizeof(float);
+    const auto viewport_index = camera_layout->viewport / sizeof(float);
+    const auto alternate_fov_index = camera_layout->alternate_fov / sizeof(float);
+    // Caller/ownership and the remaining matrices still require the 5.00c
+    // port. Selecting field placement does not relax the global preflight.
     constexpr uintptr_t kViewFactoryReturnRva = 0x0162196D;
     constexpr uintptr_t kViewCopyRebuildReturnRva = 0x015FF863;
     const float cinema_projection_aspect = g_config.cinema_aspect_ratio;
@@ -37340,8 +37377,8 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         __try {
             uint32_t viewport_width{};
             uint32_t viewport_height{};
-            memcpy(&viewport_width, view + 0x102, sizeof(viewport_width));
-            memcpy(&viewport_height, view + 0x103, sizeof(viewport_height));
+            memcpy(&viewport_width, view + viewport_index, sizeof(viewport_width));
+            memcpy(&viewport_height, view + viewport_index + 1, sizeof(viewport_height));
             const auto* bytes = reinterpret_cast<const uint8_t*>(view);
             log_line(
                 "Projection class present=%llu caller=0x%llX eye=%d kind=%s "
@@ -37352,8 +37389,8 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                 g_engine_factory_eye,
                 view[7] == 0.0f ? "ortho" : "perspective",
                 view[0], view[1], view[2], view[7], view[10], view[11], view[12], view[13],
-                view[0x11a], bytes[0x2B4], bytes[0x2B5], bytes[0x2B6],
-                view[0x100], view[0x101], viewport_width, viewport_height);
+                view[alternate_fov_index], bytes[0x2B4], bytes[0x2B5], bytes[0x2B6],
+                view[center_index], view[center_index + 1], viewport_width, viewport_height);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             log_line("Projection class probe read fault present=%llu view=%p",
                 static_cast<unsigned long long>(present), view);
@@ -37533,9 +37570,14 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                     frozen_fov, native_asymmetric_factory_render_width,
                     native_asymmetric_factory_render_height, descriptor) &&
             safe_copy_asymmetric_authority(
-                reinterpret_cast<const uint8_t*>(view) + 0x400,
+                reinterpret_cast<const uint8_t*>(view) + camera_layout->jitter,
                 native_asymmetric_marker_center_viewport.data(),
-                native_asymmetric_marker_center_viewport.size())) {
+                native_asymmetric_marker_center_viewport.size()) &&
+            write_engine_projection_fields(view, camera_layout, {
+                {descriptor.redengine_center_offset_px_x,
+                    descriptor.redengine_center_offset_px_y},
+                {native_asymmetric_factory_render_width,
+                    native_asymmetric_factory_render_height}})) {
             // Auxiliary jobs can snapshot the global camera at this factory
             // rebuild, before the frame-local V1044 writer runs. Express the
             // exact raw-FOV optical center using the real bounded render
@@ -37544,18 +37586,11 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             // extent. The two extent fields are uint32, not floating-point.
             view[7] = descriptor.vertical_fov_degrees;
             view[10] = descriptor.aspect;
-            view[0x100] = descriptor.redengine_center_offset_px_x;
-            view[0x101] = descriptor.redengine_center_offset_px_y;
-            memcpy(
-                view + 0x102, &native_asymmetric_factory_render_width,
-                sizeof(native_asymmetric_factory_render_width));
-            memcpy(
-                view + 0x103, &native_asymmetric_factory_render_height,
-                sizeof(native_asymmetric_factory_render_height));
+
             native_asymmetric_factory_expected_fov = view[7];
             native_asymmetric_factory_expected_aspect = view[10];
-            native_asymmetric_factory_expected_center_x = view[0x100];
-            native_asymmetric_factory_expected_center_y = view[0x101];
+            native_asymmetric_factory_expected_center_x = view[center_index];
+            native_asymmetric_factory_expected_center_y = view[center_index + 1];
             native_asymmetric_factory_expected_viewport_width =
                 native_asymmetric_factory_render_width;
             native_asymmetric_factory_expected_viewport_height =
@@ -37576,7 +37611,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                     static_cast<unsigned long long>(
                         g_engine_producer_pair_id),
                     g_engine_factory_eye, view[7], view[10],
-                    view[0x100], view[0x101],
+                    view[center_index], view[center_index + 1],
                     native_asymmetric_factory_render_width,
                     native_asymmetric_factory_render_height,
                     frozen_fov.angleLeft,
@@ -37904,7 +37939,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         g_config.hmd_freelook && g_engine_menu_state.load() == 0 &&
         safe_copy_engine_view_snapshot(
             view, world_marker_camera_view.data(),
-            sizeof(world_marker_camera_view));
+            camera_layout->camera_bytes);
     if (world_marker_camera_valid &&
         native_asymmetric_marker_projection_valid) {
         world_marker_camera_view[7] = native_asymmetric_marker_fov;
@@ -38240,17 +38275,15 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     if (!native_asymmetric_factory_projection_applied &&
         hmd_scene_camera && !suppress_hmd_camera && native_projection_ready &&
         g_game_render_width > 0 && g_game_render_height > 0) {
-        view[0x100] = render_right_eye
-            ? static_cast<float>(g_config.engine_native_projection_shift_px)
-            : -static_cast<float>(g_config.engine_native_projection_shift_px);
-        view[0x101] = 0.0f;
-        view[0x102] = static_cast<float>(g_game_render_width);
-        view[0x103] = static_cast<float>(g_game_render_height);
-        if (world_marker_camera_valid) {
-            world_marker_camera_view[0x100] = view[0x100];
-            world_marker_camera_view[0x101] = view[0x101];
-            world_marker_camera_view[0x102] = view[0x102];
-            world_marker_camera_view[0x103] = view[0x103];
+        const w3vr::engine_camera_layout::ProjectionFields projection{
+            {render_right_eye
+                ? static_cast<float>(g_config.engine_native_projection_shift_px)
+                : -static_cast<float>(g_config.engine_native_projection_shift_px), 0.0f},
+            {g_game_render_width, g_game_render_height}};
+        if (write_engine_projection_fields(view, camera_layout, projection) &&
+            world_marker_camera_valid) {
+            world_marker_camera_valid = write_engine_projection_fields(
+                world_marker_camera_view.data(), camera_layout, projection);
         }
     }
     const float runtime_eye_baseline =
@@ -38323,7 +38356,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             std::array<float, 512> stereo_basis_view{};
             const float* stereo_right = view + 0xA0;
             if (safe_copy_engine_view_snapshot(
-                    view, stereo_basis_view.data(), sizeof(stereo_basis_view)) &&
+                    view, stereo_basis_view.data(), camera_layout->camera_bytes) &&
                 safe_rebuild_shadow_view(stereo_basis_view.data())) {
                 stereo_right = stereo_basis_view.data() + 0xA0;
             }
@@ -38359,7 +38392,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         // exact center/viewport bytes captured before factory injection, then
         // let its private rebuild regenerate the centered matrices.
         memcpy(
-            world_marker_camera_view.data() + 0x100,
+            world_marker_camera_view.data() + center_index,
             native_asymmetric_marker_center_viewport.data(),
             native_asymmetric_marker_center_viewport.size());
     }
@@ -38457,17 +38490,11 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         view, caller_rva, temporal_scene_camera);
     g_engine_view_rebuild(view);
     if (native_asymmetric_factory_projection_applied) {
-        uint32_t native_asymmetric_factory_post_width{};
-        uint32_t native_asymmetric_factory_post_height{};
+        w3vr::engine_camera_layout::ProjectionFields post_projection{};
         const bool native_asymmetric_factory_post_extent_valid =
-            safe_copy_asymmetric_authority(
-                view + 0x102,
-                &native_asymmetric_factory_post_width,
-                sizeof(native_asymmetric_factory_post_width)) &&
-            safe_copy_asymmetric_authority(
-                view + 0x103,
-                &native_asymmetric_factory_post_height,
-                sizeof(native_asymmetric_factory_post_height));
+            read_engine_projection_fields(view, camera_layout, post_projection);
+        const auto native_asymmetric_factory_post_width = post_projection.viewport[0];
+        const auto native_asymmetric_factory_post_height = post_projection.viewport[1];
         const bool native_asymmetric_factory_post_valid =
             native_asymmetric_factory_slot != nullptr &&
             native_asymmetric_factory_slot->pair_id.load(
@@ -38478,11 +38505,11 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                 native_asymmetric_factory_expected_fov) <= 0.0001f &&
             std::fabs(view[10] -
                 native_asymmetric_factory_expected_aspect) <= 0.000001f &&
-            std::isfinite(view[0x100]) &&
-            std::isfinite(view[0x101]) &&
-            std::fabs(view[0x100] -
+            std::isfinite(view[center_index]) &&
+            std::isfinite(view[center_index + 1]) &&
+            std::fabs(view[center_index] -
                 native_asymmetric_factory_expected_center_x) <= 0.000001f &&
-            std::fabs(view[0x101] -
+            std::fabs(view[center_index + 1] -
                 native_asymmetric_factory_expected_center_y) <= 0.000001f &&
             native_asymmetric_factory_post_extent_valid &&
             native_asymmetric_factory_post_width ==
@@ -38514,7 +38541,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                         g_engine_factory_eye,
                         view[7], native_asymmetric_factory_expected_fov,
                         view[10], native_asymmetric_factory_expected_aspect,
-                        view[0x100], view[0x101],
+                        view[center_index], view[center_index + 1],
                         native_asymmetric_factory_expected_center_x,
                         native_asymmetric_factory_expected_center_y,
                         native_asymmetric_factory_post_width,

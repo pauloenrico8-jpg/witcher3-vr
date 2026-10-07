@@ -82,6 +82,56 @@ inline bool read_fields(std::span<const std::uint8_t> view,
     return true;
 }
 
+// Current optical-center/jitter floats followed by INTEGER input dimensions.
+// A known layout checks byte placement only, not ownership or native lifetime.
+struct ProjectionFields {
+    std::array<float, 2> center_px{};
+    std::array<std::uint32_t, 2> viewport{};
+};
+static_assert(sizeof(ProjectionFields) == 16);
+static_assert(offsetof(ProjectionFields, viewport) == 8);
+inline bool projection_range(std::size_t bytes, const Layout* layout) {
+    return (layout == &legacy_404 || layout == &remastered_500c) &&
+        bytes >= layout->camera_bytes && layout->jitter <= bytes &&
+        sizeof(ProjectionFields) <= bytes - layout->jitter &&
+        layout->viewport == layout->jitter + sizeof(ProjectionFields::center_px);
+}
+inline bool read_projection(std::span<const std::uint8_t> view,
+    const Layout* layout, ProjectionFields& result) {
+    if (!projection_range(view.size(), layout)) return false;
+    ProjectionFields candidate{};
+    std::memcpy(&candidate, view.data() + layout->jitter, sizeof(candidate));
+    result = candidate;
+    return true;
+}
+inline bool write_projection(std::span<std::uint8_t> view,
+    const Layout* layout, const ProjectionFields& fields) {
+    if (!projection_range(view.size(), layout) ||
+        !std::isfinite(fields.center_px[0]) || !std::isfinite(fields.center_px[1]) ||
+        fields.viewport[0] == 0 || fields.viewport[1] == 0) return false;
+    // All validation happens before a single bounded copy. This is not an
+    // atomic native store, a page-access guarantee, or a render capability.
+    std::memcpy(view.data() + layout->jitter, &fields, sizeof(fields));
+    return true;
+}
+
+struct PoseFields {
+    std::array<float, 3> position{};
+    std::array<float, 3> rotation_degrees{};
+};
+// The six source pose floats have the same placement in both examined versions.
+// Keep position W, FOV, matrices, projection, history and adjacent objects intact.
+inline bool write_pose(std::span<std::uint8_t> view,
+    const Layout* layout, const PoseFields& pose) {
+    if ((layout != &legacy_404 && layout != &remastered_500c) ||
+        view.size() < layout->camera_bytes) return false;
+    for (float value : pose.position) if (!std::isfinite(value)) return false;
+    for (float value : pose.rotation_degrees) if (!std::isfinite(value)) return false;
+    std::memcpy(view.data(), pose.position.data(), sizeof(pose.position));
+    std::memcpy(view.data() + 0x10, pose.rotation_degrees.data(), sizeof(pose.rotation_degrees));
+    return true;
+}
+
 enum class WriterPurpose { unknown, normal_temporal, supersample_apply, supersample_restore,
     final_2d_override };
 
