@@ -1,5 +1,6 @@
 #include "modern_dlss_ownership.h"
 #include "modern_dlss_recording.h"
+#include "modern_dlss_retirement.h"
 #include <dxgi1_6.h>
 #include <cstdio>
 #include <cstring>
@@ -8,7 +9,16 @@
 namespace m = w3vr::modern_dlss_ownership;
 namespace r = w3vr::engine_dlss_resources;
 namespace recording = w3vr::modern_dlss_recording;
+namespace retirement = w3vr::modern_dlss_retirement;
 using Microsoft::WRL::ComPtr;
+
+// Explicit failure seam: this HRESULT is SIMULATED. Remaining queue work,
+// retry Signal, private fences, early Reset and pixel copies are physical.
+bool fail_signal_once = true;
+HRESULT probe_signal(ID3D12CommandQueue* queue, ID3D12Fence* fence, std::uint64_t value) {
+    if (fail_signal_once) { fail_signal_once = false; return E_FAIL; }
+    return queue->Signal(fence, value);
+}
 
 void require(bool value, const char* step) {
     if (!value) throw std::runtime_error(step);
@@ -198,6 +208,13 @@ int main() try {
         std::puts("PASS real failed Reset/Close and foreign native command rejection");
     }
     auto* original_output = textures[3].Get();
+    retirement::Timeline timeline(submission_queue, probe_signal);
+    require(bool(timeline), "native private-fence timeline");
+    ComPtr<ID3D12CommandQueue> unrelated_queue;
+    check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&unrelated_queue)), "other retirement queue");
+    auto unrelated_owned = m::acquire_queue(unrelated_queue.Get(), classify);
+    retirement::Timeline unrelated(unrelated_owned);
+    require(bool(unrelated), "independent private-fence timeline");
     for (unsigned iteration = 0; iteration < 24; ++iteration) {
         const auto stamp = ledger.open_stamp();
         require(bool(stamp) && stamp.epoch == iteration + 1ull, "current recording stamp");
@@ -231,16 +248,39 @@ int main() try {
         require(bool(batch) && batch.evaluations.size() == 1 && !batch.gpu_completion_verified,
             "closed batch is not GPU completion");
         require(!ledger.take_closed(stamp), "batch taken twice");
-        auto& submitted = batch.evaluations[0];
-        if (iteration == 0) {
-            // Release all caller-held texture refs. The acquired record alone
-            // must keep these real GPU objects alive through execution/fence.
-            for (auto& object : textures) object.Reset();
-        }
+        auto held = retirement::retain(std::move(batch));
+        require(bool(held), "retain immutable recording");
+        // Copy already closed lab references into a dormant handle, never
+        // admitted to a timeline. Successful Reset must abandon it as well.
+        recording::ClosedRecording dormant_batch;
+        dormant_batch.stamp = held.get()->stamp;
+        dormant_batch.evaluations = held.get()->evaluations;
+        auto dormant = retirement::retain(std::move(dormant_batch));
+        const auto& submitted = held.get()->evaluations[0];
+        // Release every caller-held texture ref in every iteration.
+        for (auto& object : textures) object.Reset();
         require(submitted.resources[3].Get() == original_output, "output identity changed");
         ID3D12CommandList* lists[]{submitted.command.Get()};
-        const std::uint64_t value = iteration + 1;
-        require(!m::fence_reached(fence->GetCompletedValue(), value), "future fence incorrectly completed");
+        IUnknown* ids[]{submitted.command_identity.Get()};
+        if (iteration == 0) {
+            std::array<retirement::Ticket, 64> reserved;
+            for (auto& item : reserved) {
+                item = timeline.prepare(held, stamp, submission_queue, ids);
+                require(bool(item), "bounded pre-Execute reservation");
+            }
+            require(!timeline.prepare(held, stamp, submission_queue, ids), "reservation capacity exceeded");
+            for (const auto& item : reserved) require(timeline.cancel(item), "safe pre-Execute cancellation");
+            require(timeline.pending() == 0 && !timeline.find(stamp), "cancel retained unused recording");
+        }
+        const auto ticket = timeline.prepare(held, stamp, submission_queue, ids);
+        require(bool(ticket) && timeline.status(ticket) == retirement::Status::Prepared,
+            "prepare before Execute");
+        require(!timeline.prepare(held, stamp, unrelated_owned, ids), "wrong queue accepted on same device");
+        require(unrelated.status(ticket) == retirement::Status::Unknown && !unrelated.cancel(ticket),
+            "foreign private fence accepted ticket");
+        IUnknown* absent[]{submission_queue.queue_identity.Get()};
+        require(!timeline.prepare(held, stamp, submission_queue, absent), "command absent from Execute array admitted");
+        const std::uint64_t value = iteration * 2ull + 1;
         // Hold actual GPU execution behind a CPU-signalled gate. Reset uses a
         // DIFFERENT allocator while this exact old batch is still in flight.
         // Always unblock on exceptions so an assertion cannot hang the GPU.
@@ -250,25 +290,82 @@ int main() try {
         } unblock{gate.Get(), value};
         require(m::compatible_queue_device(submission_queue, submitted), "submitted device mismatch");
         check(submission_queue.queue->Wait(gate.Get(), value), "queue wait before submission");
+        require(timeline.before_execute(ticket) && !timeline.before_execute(ticket) &&
+            !timeline.cancel(ticket), "submission retained once before forward");
         submission_queue.queue->ExecuteCommandLists(1, lists);
-        check(submission_queue.queue->Signal(fence.Get(), value), "signal after real submission");
-        require(!m::fence_reached(fence->GetCompletedValue(), value), "gate did not delay GPU work");
+        result = timeline.after_execute(ticket);
+        if (iteration == 0) {
+            require(FAILED(result) && timeline.status(ticket) == retirement::Status::Quarantined &&
+                !timeline.release_completed(ticket) && !timeline.prepare(held, stamp, submission_queue, ids),
+                "failed Signal released resources or allowed new admission");
+            check(timeline.retry_signal(ticket), "retry real queue Signal after simulated failure");
+            std::puts("PASS simulated Signal failure quarantines ownership; real retry uses a new value");
+        } else check(result, "private Signal after real submission");
+        require(FAILED(timeline.after_execute(ticket)) && FAILED(timeline.retry_signal(ticket)),
+            "duplicate completion Signal admitted");
+        // An unrelated fence can advance arbitrarily on another DIRECT queue.
+        // It must not retire the private fence of this gated submission.
+        check(unrelated_owned.queue->Signal(fence.Get(), value + 1000), "unrelated fence advance");
+        check(fence->SetEventOnCompletion(value + 1000, event), "unrelated fence event");
+        require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "unrelated fence timeout");
+        require(timeline.status(ticket) == retirement::Status::Pending &&
+            !timeline.release_completed(ticket) && !timeline.completed_recording(ticket),
+            "another queue/fence prematurely completed submission");
+        // Replay after the first completion must still own textures before any
+        // successful Reset. Iteration 1 starts/ends in COPY_SOURCE for replay.
+        if (iteration == 1) {
+            check(gate->Signal(value), "release first replay submission");
+            check(timeline.completion_event(ticket, event), "first replay fence event");
+            require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0 &&
+                timeline.release_completed(ticket), "first replay completion");
+            held = {};
+            auto replay = timeline.find(stamp);
+            require(bool(replay), "completed recording lost replay ownership");
+            const auto replay_ticket = timeline.prepare(replay, stamp, submission_queue, ids);
+            check(submission_queue.queue->Wait(gate.Get(), value + 1), "replay queue gate");
+            require(timeline.before_execute(replay_ticket), "replay prepare");
+            submission_queue.queue->ExecuteCommandLists(1, lists);
+            check(timeline.after_execute(replay_ticket), "replay private Signal");
+            check(gate->Signal(value + 1), "release replay");
+            check(timeline.completion_event(replay_ticket, event), "replay event");
+            require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0 &&
+                timeline.release_completed(replay_ticket), "replay retirement");
+            held = timeline.find(stamp);
+            require(bool(held), "second completion discarded replayable recording");
+            textures = held.get()->evaluations[0].resources; // Replay already completed.
+            unblock.value = value + 1;
+            std::puts("PASS actual repeated Execute retains recording after first private fence completion");
+        }
         auto* next_allocator = iteration & 1 ? allocator.Get() : alternate_allocator.Get();
         check(next_allocator->Reset(), "unused allocator reset");
         result = command->Reset(next_allocator, nullptr); check(result, "Reset while old batch pending");
         require(ledger.after_reset(result) && ledger.epoch() == stamp.epoch + 1,
             "new recording epoch after early Reset");
+        retirement::observe_reset(ledger.open_stamp());
+        require(!timeline.find(stamp) && !timeline.prepare(held, stamp, submission_queue, ids),
+            "successful Reset allowed replay of old recording");
+        require(!unrelated.prepare(dormant, stamp, unrelated_owned, ids),
+            "Reset missed dormant handle outside every timeline");
+        dormant = {};
         auto stale = m::acquire(receipt, classify);
         require(!ledger.record(std::move(stale), stamp) && bool(stale) && ledger.pending() == 0,
             "stale producer crossed real Reset");
         stale = {};
-        require(bool(batch) && batch.stamp == stamp && submitted.resources[3].Get() == original_output,
+        require(bool(held) && held.get()->stamp == stamp && submitted.resources[3].Get() == original_output,
             "Reset discarded submitted ownership");
-        check(gate->Signal(value), "CPU release submission gate");
-        check(fence->SetEventOnCompletion(value, event), "completion event");
-        require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "GPU fence timeout");
-        const auto completed = fence->GetCompletedValue();
-        require(m::fence_reached(completed, value), "exact fence not reached");
+        // All caller recording refs now released. Timeline entries alone keep
+        // GPU objects alive in pending iterations; copy refs for next iteration
+        // only after a verified completion below.
+        held = {};
+        check(gate->Signal(unblock.value), "CPU release submission gate");
+        retirement::Recording completed_recording;
+        if (iteration != 1) {
+            check(timeline.completion_event(ticket, event), "private completion event");
+            require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "GPU private fence timeout");
+            require(timeline.status(ticket) == retirement::Status::Complete, "exact private fence not reached");
+            completed_recording = timeline.completed_recording(ticket);
+            require(bool(completed_recording), "completed resource access");
+        }
         check(device->GetDeviceRemovedReason(), "device remains available");
         D3D12_RANGE range{0, 4096};
         check(readback->Map(0, &range, &data), "readback after fence");
@@ -279,11 +376,91 @@ int main() try {
         readback->Unmap(0, &no_read);
         // Reacquire the caller refs before the record retires; the next Reset
         // reuses the command object but starts a different recording.
-        textures = submitted.resources;
+        if (iteration != 1) textures = completed_recording.get()->evaluations[0].resources;
+        if (iteration != 1) require(timeline.release_completed(ticket), "completed ticket release");
+        completed_recording = {};
+        require(timeline.pending() == 0, "submission entry leak");
+    }
+    {
+        require(retirement::orphan_count() == 0, "unexpected preexisting orphan");
+        ComPtr<ID3D12CommandAllocator> orphan_allocator;
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&orphan_allocator)), "orphan allocator");
+        ComPtr<ID3D12GraphicsCommandList> orphan_command;
+        check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, orphan_allocator.Get(),
+            nullptr, IID_PPV_ARGS(&orphan_command)), "orphan command");
+        auto orphan_receipt = receipt; orphan_receipt.command = orphan_command.Get();
+        std::array<ComPtr<ID3D12Resource>, 4> orphan_textures;
+        for (std::size_t i = 0; i < orphan_textures.size(); ++i) {
+            orphan_textures[i] = texture(device.Get());
+            orphan_receipt.bindings[i].resource.native = reinterpret_cast<std::uint64_t>(orphan_textures[i].Get());
+        }
+        auto orphan_proof = m::acquire(orphan_receipt, classify);
+        require(bool(orphan_proof), "orphan acquisition");
+        recording::Ledger orphan_ledger(orphan_proof);
+        orphan_proof = {};
+        check(orphan_command->Close(), "orphan initial close");
+        result = orphan_command->Reset(orphan_allocator.Get(), nullptr); check(result, "orphan first Reset");
+        require(orphan_ledger.after_reset(result), "orphan recording epoch");
+        const auto orphan_stamp = orphan_ledger.open_stamp();
+        auto orphan_evaluation = m::acquire(orphan_receipt, classify);
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = upload.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 256};
+        D3D12_TEXTURE_COPY_LOCATION target{};
+        target.pResource = orphan_evaluation.resources[3].Get();
+        target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        transition(orphan_command.Get(), target.pResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        orphan_command->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+        transition(orphan_command.Get(), target.pResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        source.pResource = readback.Get();
+        orphan_command->CopyTextureRegion(&source, 0, 0, 0, &target, nullptr);
+        require(orphan_ledger.record(std::move(orphan_evaluation), orphan_stamp), "orphan ownership transfer");
+        result = orphan_command->Close(); check(result, "orphan Close");
+        require(orphan_ledger.after_close(result), "orphan close observation");
+        auto held = retirement::retain(orphan_ledger.take_closed(orphan_stamp));
+        require(bool(held), "orphan closed recording");
+        for (auto& object : orphan_textures) object.Reset();
+        struct Unblock { ID3D12Fence* gate; ~Unblock() { gate->Signal(1000); } } unblock{gate.Get()};
+        {
+            retirement::Timeline doomed(submission_queue);
+            IUnknown* ids[]{held.get()->evaluations[0].command_identity.Get()};
+            const auto ticket = doomed.prepare(held, orphan_stamp, submission_queue, ids);
+            ID3D12CommandList* lists[]{orphan_command.Get()};
+            check(submission_queue.queue->Wait(gate.Get(), 1000), "orphan gate");
+            require(doomed.before_execute(ticket), "orphan retain before Execute");
+            submission_queue.queue->ExecuteCommandLists(1, lists);
+            check(doomed.after_execute(ticket), "orphan private Signal");
+            check(doomed.completion_event(ticket, event), "orphan event registration");
+            held = {}; // QueueState alone owns all four lab textures.
+            require(doomed.status(ticket) == retirement::Status::Pending, "orphan GPU gate");
+        } // Destructor must move its already allocated state to quarantine.
+        require(retirement::orphan_count() == 1 && retirement::collect_orphans() == 0,
+            "destructor released an in-flight recording");
+        check(gate->Signal(1000), "release orphan GPU work");
+        require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "orphan completion timeout");
+        void* data{}; D3D12_RANGE range{0, 4096};
+        check(readback->Map(0, &range, &data), "orphan readback");
+        for (unsigned row = 0; row < 16; ++row)
+            for (unsigned column = 0; column < 64; ++column)
+                require(static_cast<unsigned char*>(data)[row * 256 + column] == 0x31 + 23,
+                    "orphan pixel mismatch");
+        D3D12_RANGE no_write{0, 0}; readback->Unmap(0, &no_write);
+        // Completion retires the submission, but the closed command remains
+        // replayable and must still own textures even after timeline deletion.
+        require(retirement::collect_orphans() == 0 && retirement::orphan_count() == 1,
+            "orphan lost replayable recording after completion");
+        check(orphan_allocator->Reset(), "orphan allocator after completion");
+        result = orphan_command->Reset(orphan_allocator.Get(), nullptr); check(result, "orphan new Reset");
+        require(orphan_ledger.after_reset(result), "orphan new epoch");
+        retirement::observe_reset(orphan_ledger.open_stamp());
+        require(retirement::collect_orphans() == 1 && retirement::orphan_count() == 0,
+            "completed and abandoned orphan did not retire");
+        std::puts("PASS physical copy survives timeline destruction; orphan retains replay until successful Reset");
     }
     CloseHandle(event);
-    std::puts("PASS 24 real GPU copies: closed batches, early Reset, stale rejection, exact fence and readback");
-    std::puts("GAME=false HEADSET=false NATIVE_DLSS=false NOVIGRAD_FPS_MEASURED=false");
+    std::puts("PASS 26 real GPU copies: 24 recordings, one replay and one orphan; exact private fences/readback");
+    std::puts("GAME=false HEADSET=false NATIVE_DLSS=false STEREO_IMAGE=false");
     return 0;
 } catch (const std::exception& error) {
     std::printf("FAIL %s\n", error.what());
