@@ -6,6 +6,40 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Funções de cabeça e autoridade da câmera por versão — 7 de outubro
+
+A adaptação agora escolhe nove funções de cabeça e câmera conforme a versão
+verificada do jogo. “Autoridade da câmera” significa identificar qual câmera
+está controlando a visão, para não confundir a câmera de jogo com uma cena.
+O código segue este fluxo:
+
+1. Escolhe o conjunto de endereços da versão reconhecida. Um conjunto
+   desconhecido não recebe endereços para chamar.
+2. Na 5.00c, confere os primeiros bytes de cada função antes de preparar a
+   ligação. Se diferirem, recusa aquela ligação e preserva a função original.
+3. Lê o estado de controle manual na posição correta da 5.00c. A posição mudou;
+   outros campos examinados continuam no mesmo lugar. Não desloca tudo junto.
+4. Identifica o tipo principal da câmera ativa. Partes secundárias do mesmo
+   objeto e outros tipos de câmera não recebem essa identificação.
+5. Continua encaminhando as chamadas existentes para as funções originais.
+   Estas leituras não escrevem nos estados de câmera nem ativam o VR.
+
+Escolhi separar endereços e campos por versão porque reutilizar os valores da
+4.04 poderia ler dados errados ou chamar outra função. Dois métodos tinham o
+mesmo nome; selecionei o que pertence ao grupo normal do diretor de câmeras.
+
+A DLL compilou e passaram **107/107 testes em 6,81 segundos**, incluindo versões
+não reconhecidas, bytes divergentes, leituras curtas e a posição antiga usada
+como armadilha. Esses casos usam dados preparados para teste. A evidência do
+executável foi obtida por leitura do arquivo: não executei as funções no jogo.
+
+**Nada foi instalado e 5.00c continua bloqueado.** Esta etapa não comprova vida
+útil dos objetos, ordem entre tarefas do jogo, poses no Quest, imagens nos dois
+olhos ou combate físico. A prioridade seguinte é adaptar o caminho normal de
+câmera, matrizes e desenho do mundo que a primeira integração estéreo precisa.
+DLSS continua complementar. A meta de FPS em Novigrad permanece cancelada.
+Evidência local: `../artifacts/camera-authority-port-validation.json`.
+
 ## Identificação preservada ao recriar o observador — 7 de outubro
 
 A lista gráfica pode continuar existindo enquanto o componente que a acompanha

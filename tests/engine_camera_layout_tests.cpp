@@ -1,4 +1,5 @@
 #include "engine_camera_layout.h"
+#include "engine_camera_authority.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -171,8 +172,94 @@ void test_selection_and_writer_route_gate() {
         "Current jitter confused with frame offsets or previous jitter +4E0");
 }
 
+void test_native_authority_version_and_unknowns() {
+    namespace authority = w3vr::engine_camera_authority;
+    namespace camera = w3vr::engine_camera;
+    const auto copied = camera::remastered_500c;
+    const auto* old = authority::selected(&camera::legacy_404);
+    const auto* modern = authority::selected(&camera::remastered_500c);
+    require(old && modern && authority::selected(nullptr) == nullptr &&
+        authority::selected(&copied) == nullptr,
+        "Unknown camera contract acquired callback entries");
+    // Independent observations: callback registration and normal CameraDirector
+    // group, not the second entity method with the same script name.
+    constexpr std::array<std::uintptr_t, 9> entries{
+        0x02102690, 0x02251A40, 0x02103880, 0x021038A0, 0x0226CDB0,
+        0x01E07620, 0x0237A0A0, 0x02271A80, 0x0237A1C0};
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto* entry = authority::entry(modern, static_cast<authority::Callback>(i));
+        require(entry && entry->rva == entries[i] && !entry->signature.empty(),
+            "Remastered callback entry missing or lacks examined bytes");
+    }
+    require(authority::entry(nullptr, authority::Callback::head) == nullptr &&
+        authority::entry(modern, authority::Callback::count) == nullptr &&
+        authority::entry(modern, static_cast<authority::Callback>(999)) == nullptr,
+        "Invalid callback defaults to a native address");
+    require(authority::entry(old, authority::Callback::head)->rva == 0x01C4B550 &&
+        authority::entry(old, authority::Callback::bone_matrix)->rva == 0x0152E600 &&
+        authority::entry(old, authority::Callback::direction)->rva == 0x0161BBC0,
+        "Legacy native head or director routes changed");
+    require(authority::entry(modern, authority::Callback::direction)->rva != 0x02470440,
+        "An unrelated same-named script method owns the director");
+    // These were separate fields in the native getters/setter, not a uniform
+    // version delta. A trap at +259 simulates a nearby unrelated word.
+    std::vector<std::uint8_t> object(0x270, 0);
+    object[0x259] = 1;
+    object[0x269] = 0;
+    int value = -1;
+    require(authority::read_flag(object, modern->manual_control, value) && value == 0,
+        "Modern manual camera state came from obsolete +259");
+    require(authority::read_flag(object, old->manual_control, value) && value == 1,
+        "Legacy manual-control placement changed");
+    object[0x269] = 0x80;
+    require(authority::read_flag(object, modern->manual_control, value) && value == 1,
+        "Nonzero native manual flag was not recognized");
+    const auto unchanged = object;
+    value = -1;
+    require(!authority::read_flag(std::span<const std::uint8_t>(object).first(0x269),
+        modern->manual_control, value) && value == -1 &&
+        !authority::read_flag(object, std::numeric_limits<std::size_t>::max(), value) && value == -1,
+        "Missing or overflowing authority field fabricated a camera state");
+    require(object == unchanged && modern->actor_gameplay == 0x2F3 &&
+        modern->actor_cutscene == 0x2F2 && modern->game_cutscene == 0x11F &&
+        modern->director_entries == 0x58 && modern->director_count == 0x60 &&
+        modern->entry_stride == 0x28 && modern->native_camera == 0,
+        "Authority reads wrote data or shifted fields that did not move");
+    require(authority::is_custom_camera(&camera::remastered_500c, 0x03805378) &&
+        !authority::is_custom_camera(&camera::remastered_500c, 0x038058A0) &&
+        !authority::is_custom_camera(&camera::remastered_500c, 0x038058D0) &&
+        !authority::is_custom_camera(&camera::remastered_500c, 0x02D645B0) &&
+        authority::is_custom_camera(&camera::legacy_404, 0x02D645B0) &&
+        !authority::is_custom_camera(nullptr, 0) &&
+        !authority::is_custom_camera(&copied, 0x03805378),
+        "Secondary subobject, legacy type, or unknown profile became custom-camera authority");
+}
+
+void test_native_authority_entry_mismatch() {
+    namespace authority = w3vr::engine_camera_authority;
+    // Exact observed actor getter: script cursor +30, flag +2F3, byte output.
+    const std::array<std::uint8_t, 20> getter{0x48,0xFF,0x42,0x30,0x4D,0x85,0xC0,
+        0x74,0x0A,0x0F,0xB6,0x81,0xF3,0x02,0x00,0x00,0x41,0x88,0x00,0xC3};
+    const auto& entry = authority::remastered_500c.entries[
+        static_cast<std::size_t>(authority::Callback::actor_gameplay)];
+    require(authority::signature_matches(entry, getter), "Examined actor getter rejected");
+    for (std::size_t i = 0; i < getter.size(); ++i) {
+        auto mutated = getter;
+        mutated[i] ^= 0x80;
+        require(!authority::signature_matches(entry, mutated),
+            "Different native getter accepted");
+        require(!authority::signature_matches(entry,
+            std::span<const std::uint8_t>(getter).first(i)), "Truncated native entry accepted");
+    }
+    require(!authority::signature_matches(authority::Entry{0, getter}, getter) &&
+        !authority::signature_matches(authority::Entry{entry.rva, {}}, getter),
+        "Missing entry or evidence became a byte-verified callback");
+}
+
 int main() {
     test_remastered_native_fixture();
     test_legacy_fixture_and_failed_reads();
     test_selection_and_writer_route_gate();
+    test_native_authority_version_and_unknowns();
+    test_native_authority_entry_mismatch();
 }
