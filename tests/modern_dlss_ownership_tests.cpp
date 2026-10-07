@@ -147,6 +147,10 @@ int main() {
     require(queue.refs == 1);
     require(m::resolve_native(&queue, iid, classify).failure == m::Failure::Interface);
     require(m::acquire_queue(nullptr, classify).failure == m::Failure::Input);
+    require(m::acquire_command(nullptr, classify).failure == m::Failure::Input);
+    const auto unknown_queries = unknown.queries;
+    require(m::acquire_command(&unknown, classify).failure == m::Failure::UnknownOwner &&
+        unknown.queries == unknown_queries && unknown.refs == 1);
     require(!m::compatible_queue_device({}, {}));
     // Empty/forged receipts never enter COM. Opaque tokens are not read.
     w3vr::engine_dlss_resources::CpuResourceReceipt receipt;

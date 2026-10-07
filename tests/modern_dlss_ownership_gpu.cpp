@@ -1,6 +1,8 @@
 #include "modern_dlss_ownership.h"
 #include "modern_dlss_recording.h"
 #include "modern_dlss_retirement.h"
+#include "modern_dlss_native_hooks.h"
+#include <MinHook.h>
 #include <dxgi1_6.h>
 #include <cstdio>
 #include <cstring>
@@ -10,7 +12,80 @@ namespace m = w3vr::modern_dlss_ownership;
 namespace r = w3vr::engine_dlss_resources;
 namespace recording = w3vr::modern_dlss_recording;
 namespace retirement = w3vr::modern_dlss_retirement;
+namespace native_hooks = w3vr::modern_dlss_native_hooks;
 using Microsoft::WRL::ComPtr;
+
+struct ProbeEvents {
+    recording::Ledger* ledger{};
+    const IUnknown* command{};
+    bool reset_accepted{}, close_accepted{}, failed_reset_seen{}, failed_close_seen{};
+    bool try_busy_uninstall{}, busy_uninstall_refused{};
+};
+struct ActiveSubmission {
+    retirement::Timeline* timeline{};
+    retirement::Ticket ticket;
+    const IUnknown* queue{};
+    UINT count{};
+    ID3D12CommandList* const* array{};
+    bool before{}, after{}, mismatch{};
+    HRESULT result{E_PENDING};
+};
+thread_local ActiveSubmission* active_submission{};
+void command_observer(void* context, const m::OwnedCommand& command, native_hooks::Operation operation,
+    native_hooks::Moment moment, HRESULT result) noexcept {
+    auto& events = *static_cast<ProbeEvents*>(context);
+    if (moment == native_hooks::Moment::Before) {
+        if (events.try_busy_uninstall && operation == native_hooks::Operation::Reset) {
+            events.try_busy_uninstall = false;
+            events.busy_uninstall_refused = !native_hooks::uninstall();
+        }
+        return;
+    }
+    if (FAILED(result)) {
+        if (operation == native_hooks::Operation::Reset) events.failed_reset_seen = true;
+        else events.failed_close_seen = true;
+    }
+    if (command.command_identity.Get() != events.command) return;
+    if (operation == native_hooks::Operation::Reset)
+        events.reset_accepted = events.ledger->after_reset(result);
+    else if (events.ledger->open_stamp()) // Bootstrap Close has no known epoch.
+        events.close_accepted = events.ledger->after_close(result);
+}
+void execute_observer(void*, const m::OwnedQueue& queue, native_hooks::Moment moment,
+    UINT count, ID3D12CommandList* const* array) noexcept {
+    auto* submission = active_submission;
+    if (!submission) return;
+    if (queue.queue_identity.Get() != submission->queue || count != submission->count ||
+        array != submission->array) { submission->mismatch = true; return; }
+    if (moment == native_hooks::Moment::Before)
+        submission->before = submission->timeline->before_execute(submission->ticket);
+    else {
+        submission->result = submission->timeline->after_execute(submission->ticket);
+        submission->after = true;
+    }
+}
+HRESULT observed_execute(retirement::Timeline& timeline, retirement::Ticket ticket,
+    const m::OwnedQueue& queue, UINT count, ID3D12CommandList* const* array) {
+    ActiveSubmission observation{&timeline, ticket, queue.queue_identity.Get(), count, array};
+    active_submission = &observation;
+    queue.queue->ExecuteCommandLists(count, array);
+    active_submission = nullptr;
+    if (!observation.before || !observation.after || observation.mismatch) {
+        // Never cancel after an original Execute might have run. Preserve
+        // the test's ownership conservatively before reporting a missing hook.
+        if (!observation.before) timeline.before_execute(ticket);
+        timeline.after_execute(ticket);
+        throw std::runtime_error("native Execute callback missing or arguments changed");
+    }
+    return observation.result;
+}
+using ForeignReset = HRESULT (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+ForeignReset foreign_original{};
+unsigned foreign_calls{};
+HRESULT STDMETHODCALLTYPE foreign_reset(ID3D12GraphicsCommandList* command, ID3D12CommandAllocator* allocator,
+    ID3D12PipelineState* pipeline) {
+    ++foreign_calls; return foreign_original(command, allocator, pipeline);
+}
 
 // Explicit failure seam: this HRESULT is SIMULATED. Remaining queue work,
 // retry Signal, private fences, early Reset and pixel copies are physical.
@@ -137,6 +212,16 @@ int main() try {
         check(device->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute_queue)), "compute queue");
         require(m::acquire_queue(compute_queue.Get(), classify).failure == m::Failure::Interface,
             "non DIRECT queue admitted");
+        ComPtr<ID3D12CommandAllocator> compute_allocator;
+        ComPtr<ID3D12GraphicsCommandList> compute_command;
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            IID_PPV_ARGS(&compute_allocator)), "compute allocator");
+        check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, compute_allocator.Get(),
+            nullptr, IID_PPV_ARGS(&compute_command)), "compute command");
+        const auto rejected_command = m::acquire_command(compute_command.Get(), classify);
+        require(rejected_command.failure == m::Failure::Interface && !rejected_command.command &&
+            !rejected_command.device, "compute command admitted or leaked partial ownership");
+        check(compute_command->Close(), "compute probe close");
         require(!owned.gpu_completion_verified, "ownership is not GPU completion");
         auto bad = receipt; bad.bindings[1].resource.native = bad.bindings[0].resource.native;
         require(m::acquire(bad, classify).failure == m::Failure::AliasedResource, "alias rejection");
@@ -170,12 +255,34 @@ int main() try {
     require(bool(submission_queue) && m::compatible_queue_device(submission_queue, initial), "submission queue ownership");
     queue.Reset(); // All loop submissions use only the acquired native queue.
     recording::Ledger ledger(initial);
+    const auto command_id = initial.command_identity.Get();
     initial = {};
     require(!ledger.open_stamp() && ledger.epoch() == 0, "unknown initial recording admitted");
+    require(MH_Initialize() == MH_OK, "MinHook initialization");
+    struct UninstallNative {
+        ~UninstallNative() { if (native_hooks::uninstall(true)) MH_Uninitialize(); }
+    } native_cleanup;
+    ProbeEvents events{&ledger, command_id};
+    const native_hooks::Observer observer{&events, command_observer, execute_observer};
+    auto native_command = m::acquire_command(command.Get(), classify);
+    require(bool(native_command), "endpoint before producer without invented receipt");
+    auto* reset_target = (*reinterpret_cast<void***>(command.Get()))[10];
+    require(MH_CreateHook(reset_target, reinterpret_cast<void*>(foreign_reset),
+        reinterpret_cast<void**>(&foreign_original)) == MH_OK, "foreign reset reservation");
+    require(!native_hooks::install(native_command, submission_queue, classify, observer) &&
+        !native_hooks::ready(), "native install ignored target collision");
+    require(MH_EnableHook(reset_target) == MH_OK, "failed install removed foreign hook");
+    check(command->Close(), "foreign initial Close");
+    check(command->Reset(allocator.Get(), nullptr), "foreign original Reset");
+    require(foreign_calls == 1, "foreign original forwarded more than once");
+    require(MH_DisableHook(reset_target) == MH_OK && MH_RemoveHook(reset_target) == MH_OK, "foreign cleanup");
+    require(native_hooks::install(native_command, submission_queue, classify, observer) &&
+        native_hooks::ready(), "three native endpoint hooks installed");
+    std::puts("PASS native endpoint transaction: foreign collision preserved, three observers activated");
     check(command->Close(), "close initial unobserved recording");
     auto result = command->Reset(allocator.Get(), nullptr);
     check(result, "initial observed reset");
-    require(ledger.after_reset(result), "initial reset observation");
+    require(events.reset_accepted && ledger.epoch() == 1, "actual native Reset starts first epoch");
     // Real failing Close and Reset on a separate native command list must not
     // supply a usable recording. No failure is injected into the main queue.
     {
@@ -243,7 +350,7 @@ int main() try {
         duplicate = {};
         require(!ledger.take_closed(stamp), "open list admitted for submission");
         result = command->Close(); check(result, "close command list");
-        require(ledger.after_close(result), "close observation");
+        require(events.close_accepted, "actual native Close observation");
         auto batch = ledger.take_closed(stamp);
         require(bool(batch) && batch.evaluations.size() == 1 && !batch.gpu_completion_verified,
             "closed batch is not GPU completion");
@@ -290,10 +397,8 @@ int main() try {
         } unblock{gate.Get(), value};
         require(m::compatible_queue_device(submission_queue, submitted), "submitted device mismatch");
         check(submission_queue.queue->Wait(gate.Get(), value), "queue wait before submission");
-        require(timeline.before_execute(ticket) && !timeline.before_execute(ticket) &&
-            !timeline.cancel(ticket), "submission retained once before forward");
-        submission_queue.queue->ExecuteCommandLists(1, lists);
-        result = timeline.after_execute(ticket);
+        result = observed_execute(timeline, ticket, submission_queue, 1, lists);
+        require(!timeline.before_execute(ticket) && !timeline.cancel(ticket), "native observer retained before original");
         if (iteration == 0) {
             require(FAILED(result) && timeline.status(ticket) == retirement::Status::Quarantined &&
                 !timeline.release_completed(ticket) && !timeline.prepare(held, stamp, submission_queue, ids),
@@ -323,9 +428,7 @@ int main() try {
             require(bool(replay), "completed recording lost replay ownership");
             const auto replay_ticket = timeline.prepare(replay, stamp, submission_queue, ids);
             check(submission_queue.queue->Wait(gate.Get(), value + 1), "replay queue gate");
-            require(timeline.before_execute(replay_ticket), "replay prepare");
-            submission_queue.queue->ExecuteCommandLists(1, lists);
-            check(timeline.after_execute(replay_ticket), "replay private Signal");
+            check(observed_execute(timeline, replay_ticket, submission_queue, 1, lists), "native replay private Signal");
             check(gate->Signal(value + 1), "release replay");
             check(timeline.completion_event(replay_ticket, event), "replay event");
             require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0 &&
@@ -339,7 +442,7 @@ int main() try {
         auto* next_allocator = iteration & 1 ? allocator.Get() : alternate_allocator.Get();
         check(next_allocator->Reset(), "unused allocator reset");
         result = command->Reset(next_allocator, nullptr); check(result, "Reset while old batch pending");
-        require(ledger.after_reset(result) && ledger.epoch() == stamp.epoch + 1,
+        require(events.reset_accepted && ledger.epoch() == stamp.epoch + 1,
             "new recording epoch after early Reset");
         retirement::observe_reset(ledger.open_stamp());
         require(!timeline.find(stamp) && !timeline.prepare(held, stamp, submission_queue, ids),
@@ -428,9 +531,7 @@ int main() try {
             const auto ticket = doomed.prepare(held, orphan_stamp, submission_queue, ids);
             ID3D12CommandList* lists[]{orphan_command.Get()};
             check(submission_queue.queue->Wait(gate.Get(), 1000), "orphan gate");
-            require(doomed.before_execute(ticket), "orphan retain before Execute");
-            submission_queue.queue->ExecuteCommandLists(1, lists);
-            check(doomed.after_execute(ticket), "orphan private Signal");
+            check(observed_execute(doomed, ticket, submission_queue, 1, lists), "native orphan private Signal");
             check(doomed.completion_event(ticket, event), "orphan event registration");
             held = {}; // QueueState alone owns all four lab textures.
             require(doomed.status(ticket) == retirement::Status::Pending, "orphan GPU gate");
@@ -458,6 +559,17 @@ int main() try {
             "completed and abandoned orphan did not retire");
         std::puts("PASS physical copy survives timeline destruction; orphan retains replay until successful Reset");
     }
+    require(events.failed_reset_seen && events.failed_close_seen, "native observer missed failed HRESULTs");
+    check(command->Close(), "final native Close");
+    events.try_busy_uninstall = true;
+    check(command->Reset(allocator.Get(), nullptr), "Reset while observer requests cleanup");
+    require(events.busy_uninstall_refused && !native_hooks::ready(), "busy cleanup removed active trampoline");
+    const auto native_stats = native_hooks::stats();
+    require(native_stats.execute == 26 && native_stats.before == native_stats.after, "native forwarding/event counts mismatch");
+    require(native_hooks::uninstall(true) && !native_hooks::ready(), "quiescent native cleanup");
+    std::printf("PASS actual native hooks: Close=%llu Reset=%llu Execute=%llu balanced_events=%llu; exact original array/count/queue\n",
+        native_stats.close, native_stats.reset, native_stats.execute, native_stats.before);
+    std::puts("PASS native Reset/Close drive Ledger; native Execute callbacks retain and Signal private fences");
     CloseHandle(event);
     std::puts("PASS 26 real GPU copies: 24 recordings, one replay and one orphan; exact private fences/readback");
     std::puts("GAME=false HEADSET=false NATIVE_DLSS=false STEREO_IMAGE=false");
