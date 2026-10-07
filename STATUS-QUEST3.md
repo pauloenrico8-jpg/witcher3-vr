@@ -1,8 +1,46 @@
 # Witcher 3 VR para Quest 3 — estado do desenvolvimento
 
 **Ainda não existe uma versão jogável deste projeto com mãos e combate físico.**
-Não há medição de FPS em Novigrad. O arquivo compilado está na pasta de
+O usuário cancelou a meta de 60 FPS em Novigrad em 06/10: o foco é concluir o VR,
+com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
+Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
+
+## Retenção das texturas até o término da GPU — 6 de outubro
+
+Uma textura é um objeto que guarda pixels. Mantê-la viva evita que o jogo
+destrua esse objeto enquanto a placa de vídeo ainda precisa dele. O novo
+`modern_dlss_retirement` segue este fluxo:
+
+1. Guarda a gravação antes do envio e confirma a fila exata, a placa e a
+   presença da lista no conjunto de tarefas que o chamador pretende enviar.
+2. Antes do envio, marca que a GPU poderá usar os recursos. Depois do envio,
+   pede uma confirmação numerada própria dessa fila, chamada fence.
+3. Só libera o envio quando essa confirmação termina. Uma confirmação de
+   outra fila não serve. Se o pedido falhar, conserva tudo e bloqueia novos
+   envios acompanhados; uma tentativa posterior usa outro número.
+4. Conserva a gravação mesmo após a conclusão, porque a mesma lista fechada
+   pode ser reenviada. Um Reset real bem-sucedido encerra essa possibilidade;
+   envios antigos ainda pendentes conservam suas próprias referências.
+5. Se o componente for destruído antes disso, transfere o estado já alocado
+   para uma área de retenção. Falha sem recuperação ou remoção do dispositivo
+   não libera referências por suposição; pode retê-las até o processo terminar.
+
+Escolhi confirmações próprias para impedir que números iguais de filas
+diferentes sejam confundidos. A retenção não congela os pixels nem comprova
+uma imagem correta de VR. O futuro adaptador do jogo precisa acompanhar as
+operações reais na ordem correta; este componente ainda não está ligado aos
+pontos de envio do Witcher e não executa nem altera a lista enviada.
+
+A DLL compilou e passaram **107/107 testes em 12,38 segundos**. O teste
+independente na RTX 4070 Ti passou **26 cópias reais**: 24 gravações, um
+reenvio e uma cópia que sobreviveu ao encerramento do componente. Recusou
+fila diferente da mesma placa, confirmação externa, gravação antiga e
+reservas acima do limite. Uma falha de Signal foi **simulada**; a nova
+tentativa, as esperas, as confirmações e a conferência dos pixels foram reais.
+Os recibos e olhos são fabricados para o teste: não há chamada real ao DLSS,
+execução no jogo ou teste no Quest. Nada foi instalado; o bloqueio de 5.00c
+continua fechado. Evidência local: `../artifacts/modern-dlss-retirement-port-validation.json`.
 
 ## Proteção contra reaproveitamento de gravações — 6 de outubro
 
@@ -419,15 +457,9 @@ no PC. A falta de bateria não impede essas etapas.
 
 Depois de existir uma versão que abra no jogo, será necessário conectar o Quest
 para conferir profundidade nos dois olhos, movimentos da cabeça, posição das
-mãos, espada, contato, bloqueios e transmissão pelo Virtual Desktop. Só então
-o save de Novigrad será útil para medir a meta de desempenho em VR.
-
-O critério de desempenho deverá contar imagens novas do jogo para ambos os
-olhos: pelo menos 60 por segundo, ou no máximo 16,67 ms por par de imagens.
-Também será necessário observar quedas, tempo do processador, placa de vídeo
-e transmissão. Imagens repetidas ou geradas artificialmente não demonstram
-que o jogo atingiu a meta solicitada. A taxa do headset deve ser anotada
-separadamente. Ainda não há resultados para nenhum desses critérios.
+mãos, espada, contato, bloqueios e transmissão pelo Virtual Desktop.
+A antiga meta de desempenho em Novigrad foi cancelada pelo usuário em 06/10.
+A validação no aparelho continua necessária para confirmar que o VR funciona.
 
 ## Preparação da segunda imagem no Remastered
 
@@ -774,7 +806,7 @@ independentes por olho. A posse temporária não abre o bloqueio do Remastered.
 - Integrar trajetória, contato, dano e bloqueio ao combate do jogo.
 - Confirmar a ativação de mods e a abertura do jogo com a instalação limpa;
   conferir o complemento recomendado e possíveis conflitos.
-- Validar no Quest 3 e medir Novigrad na máquina identificada.
+- Validar o funcionamento do VR no Quest 3 pelo Virtual Desktop.
 
-O objetivo completo do pedido continua pendente. Não há garantia de 60 FPS nem
-uma promessa de que basta instalar a DLL atual para jogar.
+O objetivo completo do pedido continua pendente. A DLL atual ainda não permite
+jogar em VR; a antiga meta de 60 FPS em Novigrad deixou de ser um requisito.

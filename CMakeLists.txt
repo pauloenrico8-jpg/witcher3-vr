@@ -44,6 +44,7 @@ add_library(witcher3vr_dxgi SHARED
     src/aer_scheduler.cpp
     src/command_list_identity.cpp
     src/modern_dlss_ownership.cpp
+    src/modern_dlss_retirement.cpp
     src/dxgi_proxy.cpp
     src/dxgi_proxy.def
     src/openxr_eye_geometry.cpp
@@ -84,7 +85,7 @@ if(BUILD_TESTING)
     add_test(NAME modern_dlss_owned_native_identity COMMAND w3vr_modern_dlss_ownership_tests)
     # Optional physical-GPU probe. Does not load the game, Streamline or ReShade.
     add_executable(w3vr_modern_dlss_ownership_gpu
-        tests/modern_dlss_ownership_gpu.cpp src/modern_dlss_ownership.cpp)
+        tests/modern_dlss_ownership_gpu.cpp src/modern_dlss_ownership.cpp src/modern_dlss_retirement.cpp)
     target_include_directories(w3vr_modern_dlss_ownership_gpu PRIVATE src)
     target_compile_definitions(w3vr_modern_dlss_ownership_gpu PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(w3vr_modern_dlss_ownership_gpu PRIVATE d3d12 dxgi dxguid bcrypt)

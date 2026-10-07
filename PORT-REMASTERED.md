@@ -4,7 +4,34 @@ Estado em 06/10/2026: análise estática e início da adaptação do código de 
 sem liberar o mod no jogo.
 “Estática” significa ler o programa como um arquivo, sem executar suas funções.
 O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
-combate físico e pelo menos 60 FPS reais em Novigrad.
+combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
+o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
+
+## Retenção por fila e fence privada — checkpoint de 6 de outubro
+
+`modern_dlss_retirement.h/.cpp` possui gravações compartilhadas imutáveis,
+tickets ancorados na identidade própria da fence e Timeline por OwnedQueue.
+Prepare exige queue/device canônicos exatos, Stamp e command presente no
+array de IDs nativos próprios do envio. BeforeExecute marca possível uso
+ANTES do encaminhamento; AfterExecute só sinaliza APÓS seu retorno. O host
+deve serializar as observações reais e preservar array/chamada original.
+O módulo não chama Execute nem Streamline e ainda NÃO está ligado aos hooks.
+
+Falha de Signal conserva o lote em quarentena e fecha admissão; retry usa um
+novo número finito. UINT64_MAX não conclui trabalho. Fence concluída retira
+somente esse envio; gravações reenviáveis ficam retidas até Reset observado
+com epoch maior. Registro fraco alcança também handles fora de Timeline.
+Destrutor transfere estado com envios ou gravações reenviáveis para uma lista
+intrusiva sem alocar; coleta exige conclusão própria e abandono comprovado.
+Falhas não recuperadas, Execute sem retorno e device removal ficam retidos
+até prova posterior/processo terminar. Isso não resolve ainda o shutdown do
+SDK, a liberação de heaps/allocators do jogo nem thread ordering dos hooks.
+
+DLL compilada, 107/107 CTest (12,38s), 26 cópias físicas RTX4070Ti com reenvio,
+Reset antecipado, fence externa recusada e destruição durante execução.
+Falha de Signal injetada é simulação de HRESULT, não falha real do driver.
+Recibos/olhos fabricados; jogo/SL/DLSS/Quest não executados. Gate5c/reentrada
+fechados. Relatório novo só local; publicação limita-se a código/docs próprios.
 
 ## Ferramenta nova e fluxo
 
