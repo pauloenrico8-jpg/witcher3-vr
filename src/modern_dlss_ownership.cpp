@@ -79,6 +79,32 @@ bool installed_streamline_command_base(const IUnknown* object) noexcept {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+bool installed_streamline_queue_base(const IUnknown* object) noexcept {
+    constexpr std::array<unsigned char, 32> expected{
+        0xac,0xa5,0x53,0xa4,0x52,0x66,0x88,0xd6,0x6f,0x1b,0x90,0x2c,0x1d,0x38,0x27,0xc8,
+        0x05,0xa1,0x40,0x54,0x21,0xc0,0xa6,0x5b,0xde,0x15,0xc9,0x9f,0x64,0x82,0x59,0xbe};
+    constexpr GUID queue_type{0x22C3768E,0xAB10,0x4870,{0xB0,0x3B,0x2B,0x52,0xE2,0x1B,0x10,0x63}};
+    if (!object) return false;
+    const auto module = GetModuleHandleW(L"sl.interposer.dll");
+    if (!module) return false;
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    __try {
+        const auto table = *reinterpret_cast<const std::uintptr_t* const*>(object);
+        if (reinterpret_cast<std::uintptr_t>(table) != base + 0x78588 ||
+            table[0] != base + 0x24BC0 || table[1] != base + 0x24C80 || table[2] != base + 0x24CB0 ||
+            table[7] != base + 0x24CF0 || table[10] != base + 0x24D20 ||
+            table[14] != base + 0x238A0 || table[15] != base + 0x24F20 || table[18] != base + 0x24F40 ||
+            reinterpret_cast<std::uintptr_t>(GetProcAddress(module, "slGetNativeInterface")) != base + 0x7EA0 ||
+            *reinterpret_cast<const GUID*>(base + 0x778F0) != command_list_identity::kStreamlineBase ||
+            *reinterpret_cast<const GUID*>(base + 0x77738) != queue_type) return false;
+        std::array<unsigned char, 32> actual{};
+        const auto status = BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+            reinterpret_cast<unsigned char*>(base + 0x24BC0), 179,
+            actual.data(), static_cast<ULONG>(actual.size()));
+        return status >= 0 && actual == expected;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 NativeInterface resolve_native(IUnknown* input, REFIID iid, Classify classify,
     const StreamlineAccess& sdk) noexcept {
     NativeInterface result{};
@@ -204,6 +230,30 @@ OwnedEvaluation acquire(const engine_dlss_resources::CpuResourceReceipt& input,
     candidate.identity = input.identity;
     candidate.viewport = input.viewport;
     return candidate;
+}
+
+OwnedQueue acquire_queue(IUnknown* input, Classify classify, const StreamlineAccess& sdk) {
+    auto failed = [](Failure reason) {
+        OwnedQueue result{}; result.failure = reason; return result;
+    };
+    auto native = resolve_native(input, __uuidof(ID3D12CommandQueue), classify, sdk);
+    if (!native) return failed(native.failure);
+    OwnedQueue candidate;
+    candidate.queue = take<ID3D12CommandQueue>(native);
+    if (!identity(candidate.queue.Get(), classify, candidate.queue_identity))
+        return failed(Failure::Interface);
+    if (candidate.queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return failed(Failure::Interface);
+    if (FAILED(candidate.queue->GetDevice(IID_PPV_ARGS(&candidate.device))) ||
+        !candidate.device || classify(candidate.device.Get()) != Owner::Native ||
+        !identity(candidate.device.Get(), classify, candidate.device_identity))
+        return failed(Failure::Device);
+    return candidate;
+}
+
+bool compatible_queue_device(const OwnedQueue& queue, const OwnedEvaluation& evaluation) noexcept {
+    return queue && evaluation && queue.device_identity && evaluation.device_identity &&
+        queue.device_identity.Get() == evaluation.device_identity.Get();
 }
 
 bool fence_reached(std::uint64_t completed, std::uint64_t target) noexcept {
