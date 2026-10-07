@@ -7,6 +7,45 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Clock compartilhado por command — checkpoint de 7 de outubro
+
+`modern_dlss_recording.h` mantém Clock por command/device canônicos. Registro
+fraco protegido por SRWLOCK não conserva objetos COM por si; Ledger e Stamp
+retêm o Clock, que conserva as identidades. Stamp tem âncora privada de Clock,
+command e epoch. Um pacote fechado conserva a âncora depois da destruição do
+Ledger: nova aquisição encontra o mesmo contador enquanto dados antigos vivem.
+Quando todas as âncoras acabam, não há stamp antigo válido para colidir; refs
+COM impedem reaproveitar o endereço enquanto ele ainda identifica um stamp.
+
+Novo Ledger pode nascer de OwnedCommand ANTES do produtor. A troca conserva
+epoch e gera novo número de observador; invalida observadores anteriores e
+volta para Unknown. Só Reset observado com SUCCEEDED incrementa o contador
+compartilhado e abre a gravação. Falha Reset deixa Unknown; falha Close deixa
+Broken, inclusive em Ledger recriado. Saturação recusa novas gravações.
+
+Record/take/open conferem observador, epoch e fase sob mutex do Clock.
+Timeline prepare/beforeExecute exigem stamp CURRENT e CLOSED. ObserveReset
+ignora stamp atrasado/Unknown/Broken; GPU já em voo conserva seu pacote e sua
+fence independentemente do estado corrente. Isso não congela pixels nem
+resolve a janela entre validação e chamada original. Host deve serializar
+rebind/Reset/Close/produtor/Execute e comprovar barreira antes de descarregar.
+Registry é interno à imagem do módulo; não trocar stamps entre DLLs nem
+conservar callbacks/stamps através de unload/reload sem lifecycle verificado.
+Roots POD não executam destrutores COM no shutdown; limpeza de nós fracos
+expirados acontece nas aquisições seguintes, sem liberação presumida em DllMain.
+
+Probe destruiu o Ledger antigo com cópia GPU presa numa gate e todos os refs
+externos de texturas retirados. Ledger novo ficou Unknown, reutilizou o Clock,
+Reset real iniciou epoch2 após1; recusou recibo antigo e aviso Reset atrasado,
+conservou a submissão velha até fence própria e readback B8. 28cópias reais,
+107/107 CTest11,96s; DLL compilada. Recibos/olhos e SignalFailure fabricados,
+jogo/SL/DLSS/Quest ausentes; NADA instalado, gate5c/reentrada fechados.
+
+Próximo concreto: lifecycle Host e teardown dos Forwarders globais; remover
+trampolines/liberar module pins/COM apenas fora de DllMain depois da barreira
+real. Depois conectar produtor Ledger e fila Timeline sem atribuir às travas
+internas uma ordem de execução que ainda não foi comprovada no jogo.
+
 ## Delegação aos hooks próprios — checkpoint de 7 de outubro
 
 `modern_dlss_native_hooks::Forwarder` conserva target, função original
