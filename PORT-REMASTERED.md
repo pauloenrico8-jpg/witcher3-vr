@@ -7,6 +7,43 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Contexto das cópias normais — checkpoint de 7 de outubro
+
+`engine_camera_copy_context.h` acompanha fábrica → cópia de descritor → cópia
+individual de câmera → rebuild, sem ler ou reter a memória nativa. Requer contrato
+5.00c reconhecido, produtor normal autorizado, observadores prontos, descritor,
+par válido e olho explícito. Escopos rejeitados também mascaram os anteriores.
+
+Scratch: RETURN01B8067B da cópia00324430, origem igual ao descritor recebido.
+Frame: RETURN01B80709, origem igual ao scratch concluído, destino distinto e
+sem sobreposição. Ambas exigem as duas câmeras em ordem; RETURN00324460/+10 e
+RETURN00324473/+5F0 da câmera228A970, src/dst exatos. RebuildRETURN228AA4F é
+aceito uma vez dentro desse contexto e somente no destino daquela câmera.
+Retorno de camera/descriptor deve ser dst. Resultado da fábrica +10 deve ser o
+último destino observado. São registros internos de UM frame, não olhos HMD.
+
+`dxgi_proxy.cpp` integra as quatro passagens. Modern rebuild e camera copy
+encaminham os originais uma vez e retornam antes das correções legadas. As duas
+invocações da fábrica têm contexto próprio; sequência primária incompleta
+impede duplicação, e duplicata incompleta não arma PendingPair. A classificação
+NÃO autoriza transformação da câmera nem completa a compatibilidade do jogo.
+
+Instalação moderna confere prefixos de16bytes de descriptor/camera/rebuild,
+cria as três passagens antes de ativá-las e publica readiness só ao concluir.
+Em falha parcial, fecha admissão, tenta desativar entradas ativadas e conserva
+trampolines sem remover/null/retry. Não é barreira de unload ou suspensão de
+threads: lifecycle e sincronização Host continuam pendentes. Preflight global
+inalterado ainda rejeita5c; nada instalado no jogo.
+
+DLL compilada;107/107 CTest7,18s. Casos fabricados verificam aninhamento,
+mascaramento, ordem/pointers/returns, falta/repetição de rebuild, sobreposição,
+perfis desconhecidos, prefixos divergentes e unwind C++ (não SEH nativa).
+Nenhuma função do Witcher, GPU de jogo ou Quest foi executada. Recibo LOCAL
+camera-copy-context-port-validation.json; novos relatórios nativos ficam locais.
+Próximo: papéis/consumidores das duas câmeras no core normal, matrizes/culling/
+efeitos e reentrada necessários para DOIS olhos novos por quadro. Pose só com
+contrato de transformação e memória verificado; DLSS opcional, FPS cancelado.
+
 ## Projeção atual e commit restrito da pose — checkpoint de 7 de outubro
 
 `engine_camera_layout::ProjectionFields` mantém dois floats de centro e dois
