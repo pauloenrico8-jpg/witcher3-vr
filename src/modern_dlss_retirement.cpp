@@ -158,7 +158,7 @@ Timeline::~Timeline() {
 Ticket Timeline::prepare(const Recording& recording, r::Stamp actual,
     const m::OwnedQueue& queue, std::span<IUnknown* const> ids) {
     Ticket ticket;
-    if (!state_ || !recording || !actual || !queue ||
+    if (!state_ || !recording || !actual.current(true) || !queue ||
         queue.queue_identity.Get() != state_->queue.queue_identity.Get() ||
         queue.device_identity.Get() != state_->queue.device_identity.Get() ||
         actual != recording.get()->stamp ||
@@ -202,6 +202,7 @@ bool Timeline::before_execute(const Ticket& ticket) {
     Lock guard(state_->lock);
     auto* entry = lookup(*state_, ticket.serial_);
     if (!entry || entry->phase != Status::Prepared || state_->blocked ||
+        !entry->recording->recording.stamp.current(true) ||
         entry->recording->abandoned.load()) return false;
     entry->phase = Status::Executing;
     entry->recording->possibly_submitted.store(true);
@@ -257,7 +258,7 @@ std::size_t Timeline::pending() const {
     Lock guard(state_->lock); return state_->entries.size();
 }
 void observe_reset(r::Stamp stamp) noexcept {
-    if (!stamp) return;
+    if (!stamp.current()) return;
     Lock registry(registry_lock);
     // Also abandon handles retained outside any timeline. A later first
     // submission must not resurrect a recording that already crossed Reset.
