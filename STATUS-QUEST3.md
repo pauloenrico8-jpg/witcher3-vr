@@ -26,8 +26,7 @@ da confirmação da GPU. Também recusou falhas reais de Reset/Close.
 As associações de olho e quadro nesse teste são fabricadas; ele não carrega
 o jogo, Streamline ou o headset. DLL compilada; 107/107 testes em 11,81s.
 
-Essa etapa está salva localmente e aguarda publicação no fork. O componente
-novo ainda não está ligado aos observadores do jogo. Falta verificar todos
+O componente novo ainda não está ligado aos observadores do jogo. Falta verificar todos
 os caminhos reais de Reset/Close/Execute e guardar os pacotes na fila correta
 até seu término, inclusive em falhas. Nenhuma proteção aqui autoriza liberar
 texturas em uso ou chamar um pacote fechado de imagem pronta para VR.
