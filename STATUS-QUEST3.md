@@ -6,6 +6,35 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Identificação preservada ao recriar o observador — 7 de outubro
+
+A lista gráfica pode continuar existindo enquanto o componente que a acompanha
+é recriado. Antes, esse componente começava seu contador de novo; duas gravações
+poderiam receber o mesmo identificador. O código agora segue este fluxo:
+
+1. Mantém o histórico junto da identidade real da lista e da placa. Pacotes de
+   tarefas antigos também guardam esse histórico, mesmo sem o observador antigo.
+2. Ao criar outro observador, conserva o contador e começa com estado desconhecido.
+   Precisa observar um Reset real bem-sucedido para aceitar outra gravação.
+3. A gravação nova recebe o número seguinte. Dados antigos e avisos atrasados
+   não podem ser tratados como parte dessa gravação.
+4. As tarefas já enviadas continuam guardando suas texturas até a confirmação
+   própria da GPU. Trocar o observador não libera recursos ainda em uso.
+
+Escolhi ligar o histórico ao objeto gráfico, em vez de ao componente temporário,
+para evitar reiniciar a identificação por acidente. As travas internas protegem
+esse histórico; ainda não comprovam a ordem das chamadas do Witcher.
+
+A DLL compilou e passaram **107/107 testes em 11,96 segundos**. Na RTX 4070 Ti
+passaram **28 cópias reais**. A nova cópia ficou pendente enquanto destruí e recriei
+o observador; a gravação passou de 1 para 2, recusou dados antigos e os pixels B8
+chegaram corretamente após a confirmação da GPU.
+
+Isso ainda é um teste independente. Recibos e olhos são fabricados; não executa
+Witcher, DLSS ou Quest. Nada foi instalado e 5.00c continua bloqueado. Não comprova
+segurança ao descarregar a DLL nem o funcionamento das mãos e do combate físico.
+Evidência local: `../artifacts/modern-dlss-recording-clock-port-validation.json`.
+
 ## Convivência com os comandos gráficos antigos — 7 de outubro
 
 O observador novo agora pode trabalhar com os caminhos de Reset e Execute
