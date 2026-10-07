@@ -256,10 +256,103 @@ void test_native_authority_entry_mismatch() {
         "Missing entry or evidence became a byte-verified callback");
 }
 
+void test_projection_writes_keep_integer_dimensions_and_other_records() {
+    // Independent native byte offsets; these are two INTERNAL cameras of ONE
+    // descriptor, not two headset images. Deliberately unalign the fixture.
+    std::vector<std::uint8_t> descriptor(1 + 0xBDC + 16, 0x7A);
+    auto expected = descriptor;
+    const std::array<layout::ProjectionFields, 2> fields{{
+        {{17.5f, -20.25f}, {2064, 2208}}, {{-33.5f, 19.125f}, {1832, 1920}}}};
+    for (std::size_t i = 0; i < 2; ++i) {
+        const std::size_t camera = 1 + (i == 0 ? 0x10 : 0x5F0);
+        put(expected, camera + 0x4C0, fields[i].center_px);
+        put(expected, camera + 0x4C8, fields[i].viewport);
+        require(layout::write_projection(std::span<std::uint8_t>(descriptor)
+            .subspan(camera, 0x5E0), &layout::remastered_500c, fields[i]),
+            "Examined modern projection rejected");
+        layout::ProjectionFields read{};
+        require(layout::read_projection(std::span<const std::uint8_t>(descriptor)
+            .subspan(camera, 0x5E0), &layout::remastered_500c, read) &&
+            read.center_px == fields[i].center_px && read.viewport == fields[i].viewport,
+            "Dimensions became floating-point bit patterns or camera fields were mixed");
+    }
+    require(descriptor == expected,
+        "Projection write damaged old +400 matrix bytes, history, or neighbouring camera");
+    std::vector<std::uint8_t> legacy(0x510 + 16, 0x3D);
+    auto legacy_expected = legacy;
+    put(legacy_expected, 0x400, fields[0].center_px);
+    put(legacy_expected, 0x408, fields[0].viewport);
+    require(layout::write_projection(legacy, &layout::legacy_404, fields[0]) &&
+        legacy == legacy_expected, "Legacy projection placement or other fields changed");
+}
+
+void test_failed_projection_is_not_partially_published() {
+    std::vector<std::uint8_t> camera(0x5E0, 0x7A);
+    const auto unchanged = camera;
+    const layout::ProjectionFields fields{{17.5f, -20.25f}, {2064, 2208}};
+    const auto copied_layout = layout::remastered_500c;
+    layout::ProjectionFields result{{-1, -2}, {13, 14}};
+    const auto sentinel = result;
+    for (std::size_t size = 0; size < camera.size(); ++size) {
+        require(!layout::write_projection(std::span<std::uint8_t>(camera).first(size),
+            &layout::remastered_500c, fields) && camera == unchanged,
+            "Truncated camera received partial projection writes");
+        require(!layout::read_projection(std::span<const std::uint8_t>(camera).first(size),
+            &layout::remastered_500c, result) && result.center_px == sentinel.center_px &&
+            result.viewport == sentinel.viewport, "Failed read published partial projection");
+    }
+    for (const auto* profile : {static_cast<const layout::Layout*>(nullptr), &copied_layout}) {
+        require(!layout::write_projection(camera, profile, fields) && camera == unchanged &&
+            !layout::read_projection(camera, profile, result), "Unknown layout wrote projection");
+    }
+    for (std::size_t i = 0; i < 2; ++i) {
+        auto invalid = fields; invalid.viewport[i] = 0;
+        require(!layout::write_projection(camera, &layout::remastered_500c, invalid) &&
+            camera == unchanged, "Zero dimension partially changed camera");
+        for (float bad : {std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::quiet_NaN()}) {
+            invalid = fields; invalid.center_px[i] = bad;
+            require(!layout::write_projection(camera, &layout::remastered_500c, invalid) &&
+                camera == unchanged, "Nonfinite projection partially changed camera");
+        }
+    }
+}
+
+void test_canted_pose_commits_only_six_floats() {
+    for (const auto* profile : {&layout::legacy_404, &layout::remastered_500c}) {
+        std::vector<std::uint8_t> camera(1 + profile->camera_bytes + 64, 0x7A);
+        const layout::PoseFields pose{{4, -8, 16}, {32, -64, 128}};
+        auto expected = camera;
+        put(expected, 1, pose.position); put(expected, 1 + 0x10, pose.rotation_degrees);
+        auto target = std::span<std::uint8_t>(camera).subspan(1, profile->camera_bytes);
+        require(layout::write_pose(target, profile, pose) && camera == expected,
+            "Canted transform rewrote position W, FOV, matrices, projection, history or neighbours");
+        const auto unchanged = camera;
+        for (std::size_t size = 0; size < profile->camera_bytes; ++size) {
+            require(!layout::write_pose(target.first(size), profile, pose) && camera == unchanged,
+                "Incomplete camera received a pose");
+        }
+        for (std::size_t i = 0; i < 6; ++i) {
+            auto invalid = pose;
+            if (i < 3) invalid.position[i] = std::numeric_limits<float>::infinity();
+            else invalid.rotation_degrees[i-3] = std::numeric_limits<float>::quiet_NaN();
+            require(!layout::write_pose(target, profile, invalid) && camera == unchanged,
+                "Nonfinite pose partially changed native fields");
+        }
+        const auto copied = *profile;
+        require(!layout::write_pose(target, nullptr, pose) &&
+            !layout::write_pose(target, &copied, pose) && camera == unchanged,
+            "Unknown camera layout can commit canted pose");
+    }
+}
+
 int main() {
     test_remastered_native_fixture();
     test_legacy_fixture_and_failed_reads();
     test_selection_and_writer_route_gate();
     test_native_authority_version_and_unknowns();
     test_native_authority_entry_mismatch();
+    test_projection_writes_keep_integer_dimensions_and_other_records();
+    test_failed_projection_is_not_partially_published();
+    test_canted_pose_commits_only_six_floats();
 }
