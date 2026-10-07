@@ -32,6 +32,27 @@ até seu término, inclusive em falhas. Nenhuma proteção aqui autoriza liberar
 texturas em uso ou chamar um pacote fechado de imagem pronta para VR.
 Relatório local: `../artifacts/modern-dlss-recording-port-validation.json`.
 
+## Identificação da fila da placa de vídeo — 6 de outubro
+
+Acrescentei uma verificação da fila que recebe os comandos. Ela guarda uma
+referência própria da fila, confirma o dispositivo a que ela pertence e
+recusa tipos de fila que esse caminho ainda não suporta. Duas filas da mesma
+placa mantêm identificações diferentes: uma confirmação de término de uma
+delas não pode ser aproveitada automaticamente pela outra.
+
+O teste na RTX 4070 Ti passou com filas reais: identificações distintas,
+recusa de fila de outro dispositivo, recusa do tipo computação e 24 cópias
+de textura feitas usando a referência adquirida da fila. Os 107 testes
+passaram em 11,75s e a DLL compilou. A identificação da fila da biblioteca
+Streamline instalada foi conferida por análise estática, ou seja, leitura
+do arquivo sem executá-lo. Esse caminho Streamline ainda não foi testado
+com o jogo aberto. Não houve teste no Quest nem medição em Novigrad.
+
+Falta conectar essas referências ao envio real de cada pacote, guardar sua
+confirmação de término específica e tratar falhas e encerramentos. O jogo
+continua sem receber esta DLL. Evidências novas ficam somente locais em
+`../artifacts/modern-dlss-queue-port-validation.json`.
+
 ## O que foi verificado
 
 O ponto de partida é [Witcher3VR](https://github.com/tig3rmast3r/witcher3-vr),
