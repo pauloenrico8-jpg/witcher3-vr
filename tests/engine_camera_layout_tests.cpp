@@ -1,5 +1,6 @@
 #include "engine_camera_layout.h"
 #include "engine_camera_authority.h"
+#include "engine_camera_copy_context.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -346,6 +347,195 @@ void test_canted_pose_commits_only_six_floats() {
     }
 }
 
+namespace copy = w3vr::camera_copy;
+constexpr std::uintptr_t input_desc = 0x100000, scratch_desc = 0x200000, final_frame = 0x300000;
+
+bool run_copy_camera(copy::Context& context, int index, std::uintptr_t destination,
+    std::uintptr_t source, copy::Stage stage, int eye, std::uint64_t pair,
+    bool omit_rebuild = false, bool wrong_return = false) {
+    // Fabricated synchronous callbacks. No native game function, resource,
+    // headset pose or render output is executed by these tests.
+    copy::CameraScope camera(context, index == 0 ? 0x00324460 : 0x00324473,
+        destination + (index == 0 ? 0x10 : 0x5F0),
+        source + (index == 0 ? 0x10 : 0x5F0));
+    if (!omit_rebuild) {
+        const auto route = copy::observe_rebuild(context, 0x0228AA4F, camera.destination);
+        require(route.stage == stage && route.camera_index == index &&
+            route.eye == eye && route.pair == pair, "Rebuild mixed copy stage, internal record or factory eye");
+    }
+    return camera.finish(wrong_return ? camera.destination + 16 : camera.destination);
+}
+
+bool run_copy_descriptor(copy::Context& context, std::uintptr_t caller,
+    std::uintptr_t destination, std::uintptr_t source, copy::Stage stage,
+    int eye, std::uint64_t pair) {
+    copy::DescriptorScope descriptor(context, caller, destination, source);
+    require(run_copy_camera(context, 0, destination, source, stage, eye, pair) &&
+        run_copy_camera(context, 1, destination, source, stage, eye, pair),
+        "Complete camera copy rejected");
+    return descriptor.finish(destination);
+}
+
+void test_normal_copy_lineage_for_both_factory_eyes() {
+    copy::Context context{};
+    for (int eye : {1, 0}) {
+        copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
+            input_desc, 123, eye, true, true);
+        require(copy::observe_rebuild(context, 0x0228AA4F, scratch_desc + 0x10).stage == copy::Stage::unknown,
+            "Rebuild return alone granted a camera route");
+        require(run_copy_descriptor(context, 0x01B8067B, scratch_desc, input_desc,
+            copy::Stage::scratch, eye, 123), "First descriptor copy rejected");
+        require(context.descriptor == nullptr && context.camera == nullptr,
+            "Finished scratch leaked camera pointers");
+        require(run_copy_descriptor(context, 0x01B80709, final_frame + 0x10, scratch_desc,
+            copy::Stage::frame, eye, 123), "Final descriptor copy rejected");
+        require(factory.finish(final_frame), "Returned frame does not match final descriptor");
+        require(!factory.finish(final_frame), "Factory sequence consumed twice");
+    }
+    require(context.factory == nullptr && context.descriptor == nullptr && context.camera == nullptr,
+        "Factory scope leaked borrowed addresses");
+}
+
+void test_unknown_and_nested_copy_scopes_mask_outer_authority() {
+    copy::Context context{};
+    copy::FactoryScope outer(context, &w3vr::engine_camera::remastered_500c,
+        input_desc, 123, 0, true, true);
+    {
+        copy::DescriptorScope descriptor(context, 0x01B8067B, scratch_desc, input_desc);
+        copy::CameraScope camera(context, 0x00324460, scratch_desc + 0x10, input_desc + 0x10);
+        {
+            copy::FactoryScope rejected(context, &w3vr::engine_camera::legacy_404,
+                input_desc, 123, 0, true, true);
+            require(copy::observe_rebuild(context, 0x0228AA4F, scratch_desc + 0x10).stage == copy::Stage::unknown,
+                "Nested rejected factory inherited outer camera");
+        }
+        {
+            copy::DescriptorScope unknown(context, 0x022C65EC, 0x400000, input_desc);
+            copy::CameraScope private_camera(context, 0x00324460, 0x400010, input_desc + 0x10);
+            require(copy::observe_rebuild(context, 0x0228AA4F, 0x400010).stage == copy::Stage::unknown,
+                "Private copy inherited normal factory identity");
+        }
+        {
+            copy::FactoryScope inner(context, &w3vr::engine_camera::remastered_500c,
+                0x700000, 124, 1, true, true);
+            require(run_copy_descriptor(context, 0x01B8067B, 0x800000, 0x700000,
+                copy::Stage::scratch, 1, 124) &&
+                run_copy_descriptor(context, 0x01B80709, 0x900010, 0x800000,
+                    copy::Stage::frame, 1, 124) && inner.finish(0x900000),
+                "Nested accepted factory mixed outer addresses or eye identity");
+        }
+        require(context.factory == &outer && context.descriptor == &descriptor && context.camera == &camera,
+            "Nested scopes failed to restore exact outer context");
+        const auto route = copy::observe_rebuild(context, 0x0228AA4F, scratch_desc + 0x10);
+        require(route.stage == copy::Stage::scratch && camera.finish(scratch_desc + 0x10),
+            "Nested pass-through invalidated valid outer camera");
+        require(run_copy_camera(context, 1, scratch_desc, input_desc, copy::Stage::scratch, 0, 123) &&
+            descriptor.finish(scratch_desc), "Outer descriptor could not complete");
+    }
+    require(run_copy_descriptor(context, 0x01B80709, final_frame + 0x10, scratch_desc,
+        copy::Stage::frame, 0, 123) && outer.finish(final_frame), "Nested flow lost lineage");
+}
+
+void test_copy_context_rejects_missing_mismatched_and_repeated_steps() {
+    for (int failure = 0; failure < 9; ++failure) {
+        copy::Context context{};
+        copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
+            input_desc, 123, 0, true, true);
+        if (failure == 0) {
+            copy::DescriptorScope final_first(context, 0x01B80709, final_frame + 0x10, scratch_desc);
+            require(final_first.stage == copy::Stage::unknown, "Final copy accepted before scratch");
+        } else if (failure == 1) {
+            copy::DescriptorScope wrong_source(context, 0x01B8067B, scratch_desc, input_desc + 16);
+            require(wrong_source.stage == copy::Stage::unknown, "Scratch accepted another descriptor");
+        } else if (failure == 2) {
+            copy::DescriptorScope overlapping(context, 0x01B8067B, input_desc + 32, input_desc);
+            require(overlapping.stage == copy::Stage::unknown, "Overlapping descriptor copy accepted");
+        } else {
+            copy::DescriptorScope descriptor(context, 0x01B8067B, scratch_desc, input_desc);
+            if (failure == 3) {
+                copy::CameraScope reversed(context, 0x00324473, scratch_desc + 0x5F0, input_desc + 0x5F0);
+                require(copy::observe_rebuild(context, 0x0228AA4F, scratch_desc + 0x5F0).stage == copy::Stage::unknown,
+                    "Second internal record accepted first");
+            } else if (failure == 4 || failure == 5) {
+                require(!run_copy_camera(context, 0, scratch_desc, input_desc,
+                    copy::Stage::scratch, 0, 123, failure == 4, failure == 5),
+                    "Missing rebuild or unexpected camera return accepted");
+            } else if (failure == 6 || failure == 7) {
+                copy::CameraScope camera(context, 0x00324460, scratch_desc + 0x10, input_desc + 0x10);
+                const auto target = failure == 6 ? scratch_desc + 0x20 : scratch_desc + 0x10;
+                copy::observe_rebuild(context, 0x0228AA4F, target);
+                require(copy::observe_rebuild(context, 0x0228AA4F, scratch_desc + 0x10).stage == copy::Stage::unknown &&
+                    !camera.finish(scratch_desc + 0x10), "Wrong target or repeated rebuild remained eligible");
+            } else {
+                require(run_copy_camera(context, 0, scratch_desc, input_desc, copy::Stage::scratch, 0, 123) &&
+                    run_copy_camera(context, 1, scratch_desc, input_desc, copy::Stage::scratch, 0, 123),
+                    "Fixture camera copy failed");
+                require(!descriptor.finish(scratch_desc + 16), "Wrong native descriptor return accepted");
+            }
+        }
+        require(!factory.finish(final_frame), "Incomplete or broken lineage accepted a rendered frame");
+    }
+    copy::Context context{};
+    {
+        copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
+            input_desc, 123, 0, true, true);
+        require(run_copy_descriptor(context, 0x01B8067B, scratch_desc, input_desc, copy::Stage::scratch, 0, 123),
+            "Scratch fixture failed");
+        copy::DescriptorScope bad_final(context, 0x01B80709, final_frame + 0x10, input_desc);
+        require(bad_final.stage == copy::Stage::unknown && !factory.finish(final_frame),
+            "Final copy reused input instead of completed scratch");
+    }
+    {
+        copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
+            input_desc, 123, 0, true, true);
+        require(run_copy_descriptor(context, 0x01B8067B, scratch_desc, input_desc, copy::Stage::scratch, 0, 123) &&
+            run_copy_descriptor(context, 0x01B80709, final_frame + 0x10, scratch_desc, copy::Stage::frame, 0, 123),
+            "Complete fixture failed");
+        require(!factory.finish(final_frame + 16), "Native returned frame mismatch accepted");
+    }
+}
+
+void test_abandoned_copy_scope_restores_context() {
+    copy::Context context{};
+    {
+        copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
+            input_desc, 123, 0, true, true);
+        try {
+            copy::DescriptorScope descriptor(context, 0x01B8067B, scratch_desc, input_desc);
+            copy::CameraScope camera(context, 0x00324460, scratch_desc + 0x10, input_desc + 0x10);
+            throw 7; // C++ unwinding only; this is not a native SEH/access-fault test.
+        } catch (int) {}
+        require(context.factory == &factory && !context.descriptor && !context.camera &&
+            factory.phase == copy::Phase::broken && !factory.finish(final_frame),
+            "Abandoned native call scope retained pointers or accepted an incomplete copy");
+    }
+    require(!context.factory && !context.descriptor && !context.camera,
+        "Unwound factory retained borrowed addresses");
+}
+
+void test_copy_context_admission_and_signatures() {
+    copy::Context context{};
+    const auto copied = w3vr::engine_camera::remastered_500c;
+    for (int failure = 0; failure < 10; ++failure) {
+        const auto* contract = failure == 0 ? nullptr : failure == 1 ? &copied :
+            failure == 2 ? &w3vr::engine_camera::legacy_404 : &w3vr::engine_camera::remastered_500c;
+        copy::FactoryScope factory(context, contract,
+            failure == 3 ? 0 : failure == 4 ? UINTPTR_MAX - 15 : input_desc,
+            failure == 5 ? 0 : failure == 6 ? UINT64_MAX : 123,
+            failure == 7 ? 2 : 0, failure != 8, failure != 9);
+        require(!factory.admitted && !factory.finish(final_frame), "Unknown or incomplete producer admission accepted");
+    }
+    for (const auto* signature : {&copy::descriptor_signature, &copy::camera_signature, &copy::rebuild_signature}) {
+        require(copy::signature_matches(*signature, *signature), "Matching native prefix rejected");
+        for (std::size_t i = 0; i < signature->size(); ++i) {
+            auto wrong = *signature; wrong[i] ^= 0x80;
+            require(!copy::signature_matches(*signature, wrong), "Different native prefix accepted");
+            require(!copy::signature_matches(*signature, std::span<const std::uint8_t>(*signature).first(i)),
+                "Truncated native prefix accepted");
+        }
+    }
+}
+
 int main() {
     test_remastered_native_fixture();
     test_legacy_fixture_and_failed_reads();
@@ -355,4 +545,9 @@ int main() {
     test_projection_writes_keep_integer_dimensions_and_other_records();
     test_failed_projection_is_not_partially_published();
     test_canted_pose_commits_only_six_floats();
+    test_normal_copy_lineage_for_both_factory_eyes();
+    test_unknown_and_nested_copy_scopes_mask_outer_authority();
+    test_copy_context_rejects_missing_mismatched_and_repeated_steps();
+    test_copy_context_admission_and_signatures();
+    test_abandoned_copy_scope_restores_context();
 }
