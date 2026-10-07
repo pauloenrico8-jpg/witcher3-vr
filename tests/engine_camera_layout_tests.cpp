@@ -1,6 +1,7 @@
 #include "engine_camera_layout.h"
 #include "engine_camera_authority.h"
 #include "engine_camera_copy_context.h"
+#include "engine_render_core.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -536,7 +537,249 @@ void test_copy_context_admission_and_signatures() {
     }
 }
 
+// Opaque addresses and a manufactured CPU state. No native game calls or GPU
+// work occurs. The same invoke helper is used by the modern production adapter.
+namespace core = w3vr::render_core;
+struct CoreFixtureState {
+    int eye{-1};
+    std::uint32_t generation{};
+    std::uint64_t pair{};
+    std::array<float, 8> view{};
+    bool view_valid{}, exact{};
+    int projection{-1};
+    std::array<float, 20> hmd{};
+    void* audit{};
+    bool operator==(const CoreFixtureState&) const = default;
+};
+CoreFixtureState core_state{}, core_expected{};
+CoreFixtureState read_core_fixture() { return core_state; }
+void apply_core_fixture(const CoreFixtureState& value) { core_state = value; }
+std::array<void*, 3> core_expected_args{}, core_seen_args{};
+int core_calls{}, core_fixture_mode{};
+CoreFixtureState filled_core_state(int eye, std::uint64_t pair) {
+    CoreFixtureState s{eye, 7, pair};
+    for (std::size_t i = 0; i < s.view.size(); ++i) s.view[i] = float(pair + i);
+    for (std::size_t i = 0; i < s.hmd.size(); ++i) s.hmd[i] = float(1000 + pair + i);
+    s.view_valid = s.exact = true; s.projection = eye + 10;
+    s.audit = reinterpret_cast<void*>(std::uintptr_t(0x3456789 + pair));
+    return s;
+}
+#if defined(_MSC_VER)
+#define W3VR_CORE_TEST_CALL __fastcall
+#else
+#define W3VR_CORE_TEST_CALL
+#endif
+void W3VR_CORE_TEST_CALL core_fixture_original(void* renderer, void* frame, void* scene) {
+    ++core_calls;
+    core_seen_args = {renderer, frame, scene};
+    require(core_seen_args == core_expected_args, "Core changed native three-argument ABI");
+    require(core_state == core_expected, "Core state did not match accepted or masked label");
+    if (core_fixture_mode == 1) {
+        core_fixture_mode = 0;
+        const auto outer = core_state;
+        const auto expected = core_expected;
+        core_expected = {};
+        core::FrameLabel inherited{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
+        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01C1DE0E,
+            core_fixture_original, renderer, frame, scene, &inherited, 7,
+            expected, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
+        require(core_state == outer, "Rejected nested core did not restore outer CPU label");
+        core_expected = expected;
+        // A second recognised nested call can use its OWN label/state.
+        const auto inner = filled_core_state(1, 999);
+        core_expected = inner;
+        const core::FrameLabel own{reinterpret_cast<std::uintptr_t>(frame), 7, 999, 1, true, true};
+        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01D05551,
+            core_fixture_original, renderer, frame, scene, &own, 7,
+            inner, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
+        require(core_state == outer, "Accepted nested core did not restore all outer state");
+        core_expected = expected;
+    }
+    if (core_fixture_mode == 2) {
+        core_state = filled_core_state(1, 456); // Simulated work mutates thread state.
+        throw 31; // C++ unwind, NOT native SEH, detour install or unload validation.
+    }
+}
+#undef W3VR_CORE_TEST_CALL
+void test_core_native_arguments_labels_and_restoration() {
+    const auto prior = filled_core_state(1, 88);
+    // Invalid-to-dereference opaque words expose accidental native pointer reads.
+    void* renderer = reinterpret_cast<void*>(std::uintptr_t(0xFEDCBA9876543001ULL));
+    void* frame = reinterpret_cast<void*>(std::uintptr_t(0xEDCBA98765432001ULL));
+    void* scene = reinterpret_cast<void*>(std::uintptr_t(0xDCBA987654321001ULL));
+    for (int eye = 0; eye < 2; ++eye) for (bool null_scene : {false, true}) {
+        core_state = prior; core_calls = 0; core_fixture_mode = 1;
+        core_expected_args = {renderer, frame, null_scene ? nullptr : scene};
+        const auto own = filled_core_state(eye, 123);
+        core_expected = own;
+        const core::FrameLabel label{reinterpret_cast<std::uintptr_t>(frame), 7, 123, eye, true, true};
+        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01D05551,
+            core_fixture_original, renderer, frame, core_expected_args[2], &label, 7,
+            own, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
+        require(core_calls == 3 && core_state == prior,
+            "Core replayed native call or failed to restore complete CPU state");
+    }
+    core_state = prior; core_calls = 0; core_fixture_mode = 2;
+    core_expected_args = {renderer, frame, scene};
+    core_expected = filled_core_state(0, 123);
+    const core::FrameLabel label{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
+    bool caught{};
+    try {
+        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01D05551,
+            core_fixture_original, renderer, frame, scene, &label, 7,
+            core_expected, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
+    } catch (int value) { caught = value == 31; }
+    require(caught && core_calls == 1 && core_state == prior,
+        "Core swallowed native C++ exception or left partial thread state");
+    core_fixture_mode = 0;
+}
+void test_core_private_stale_and_unknown_labels_mask() {
+    void* renderer = reinterpret_cast<void*>(std::uintptr_t(0x1234567891ULL));
+    void* frame = reinterpret_cast<void*>(std::uintptr_t(0x1234567892ULL));
+    void* scene = reinterpret_cast<void*>(std::uintptr_t(0x1234567893ULL));
+    const auto prior = filled_core_state(1, 88);
+    const auto proposed = filled_core_state(0, 123);
+    const auto copied_contract = w3vr::engine_camera::remastered_500c;
+    for (int failure = 0; failure < 14; ++failure) {
+        const auto* contract = failure == 0 ? nullptr : failure == 1 ? &copied_contract :
+            failure == 2 ? &w3vr::engine_camera::legacy_404 : &w3vr::engine_camera::remastered_500c;
+        auto caller = failure == 3 ? std::uintptr_t(0x01C1DE0E) : std::uintptr_t(0x01D05551);
+        core::FrameLabel label{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
+        if (failure == 5) label.frame++;
+        if (failure == 6) label.generation = 6;
+        if (failure == 7) label.generation = 0;
+        if (failure == 8) label.pair = 0;
+        if (failure == 9) label.pair = UINT64_MAX;
+        if (failure == 10) label.eye = -1;
+        if (failure == 11) label.eye = 2;
+        if (failure == 12) label.view_valid = false;
+        if (failure == 13) label.normal_factory_lineage = false;
+        core_expected = {}; core_state = prior; core_calls = 0;
+        core_expected_args = {renderer, frame, scene};
+        core::invoke(contract, caller, core_fixture_original, renderer, frame, scene,
+            failure == 4 ? nullptr : &label, 7, proposed, CoreFixtureState{},
+            read_core_fixture, apply_core_fixture);
+        require(core_calls == 1 && core_state == prior, "Rejected core changed forwarding or leaked state");
+    }
+    const core::FrameLabel good{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
+    require(!core::accepts_label(&w3vr::engine_camera::remastered_500c, 0x1D05551, 0,
+        reinterpret_cast<std::uintptr_t>(frame), &good, 7), "Null renderer accepted as label owner");
+    require(!core::accepts_label(&w3vr::engine_camera::remastered_500c, 0x1D05551,
+        reinterpret_cast<std::uintptr_t>(renderer), 0, &good, 7), "Null frame accepted as label owner");
+}
+void test_core_profile_and_native_prefix() {
+    require(core::selected(&w3vr::engine_camera::legacy_404)->entry == 0x1D86400 &&
+        core::selected(&w3vr::engine_camera::remastered_500c)->entry == 0x1C13630 &&
+        core::selected(&w3vr::engine_camera::remastered_500c)->normal_return == 0x1D05551 &&
+        !core::selected(nullptr), "Core used legacy or unknown entry on modern contract");
+    const auto copy = w3vr::engine_camera::remastered_500c;
+    require(!core::selected(&copy), "Copied unverified temporal contract selected core entry");
+    const std::array<std::uint8_t, 16> independent{
+        0x48,0x8B,0xC4,0x48,0x89,0x50,0x10,0x55,0x53,0x56,0x41,0x54,0x41,0x55,0x41,0x56};
+    require(core::modern_prefix_matches(independent), "Examined modern core bytes rejected");
+    for (std::size_t i = 0; i < independent.size(); ++i) {
+        auto changed = independent; changed[i] ^= 0x80;
+        require(!core::modern_prefix_matches(changed), "Unknown core bytes accepted");
+        require(!core::modern_prefix_matches(std::span<const std::uint8_t>(independent).first(i)),
+            "Truncated modern core entry accepted");
+    }
+}
+
+void* core_expected_task{};
+int epilogue_calls{}, epilogue_mode{};
+#if defined(_MSC_VER)
+#define W3VR_TASK_TEST_CALL __fastcall
+#else
+#define W3VR_TASK_TEST_CALL
+#endif
+void W3VR_TASK_TEST_CALL epilogue_fixture_original(void* task) {
+    ++epilogue_calls;
+    require(task == core_expected_task && core_state == core_expected,
+        "Epilogue changed its one native argument or inherited an unknown eye");
+    if (epilogue_mode == 1) {
+        epilogue_mode = 0;
+        const auto prior_expected = core_expected;
+        const auto outer_state = core_state;
+        core_expected = {};
+        // An unrecognised task inside a recognised task masks the outer label.
+        core::invoke_epilogue(&w3vr::engine_camera::remastered_500c,
+            epilogue_fixture_original, task, nullptr, nullptr, 7,
+            prior_expected, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
+        require(core_state == outer_state, "Nested task did not recover original eye state");
+        core_expected = prior_expected;
+    }
+    if (epilogue_mode == 2) { core_state = filled_core_state(1, 999); throw 47; }
+}
+#undef W3VR_TASK_TEST_CALL
+void test_normal_epilogue_record_and_task_scope() {
+    constexpr std::uintptr_t module = 0x140000000ULL;
+    constexpr std::uintptr_t renderer = 0xA23456789ABC0001ULL, frame = 0xB23456789ABC0002ULL;
+    std::vector<std::uint8_t> prefix(0x48, 0xA7);
+    put(prefix, 0, std::uint64_t(module + 0x037A6C40));
+    put(prefix, 0x10, std::uint64_t(renderer));
+    put(prefix, 0x18, std::uint64_t(0xDEAD000012341234ULL)); // Other owner/scene, not frame.
+    put(prefix, 0x28, std::uint64_t(frame));
+    core::TaskRecord record{};
+    require(core::read_epilogue_record(prefix, module, record) &&
+        record.renderer == renderer && record.frame == frame,
+        "Normal task record confused its native frame with descriptor/scene");
+    const core::TaskRecord sentinel{81, 82};
+    for (std::size_t bytes = 0; bytes < 0x30; ++bytes) {
+        auto out = sentinel;
+        require(!core::read_epilogue_record(std::span<const std::uint8_t>(prefix).first(bytes), module, out) &&
+            out.renderer == 81 && out.frame == 82, "Short task prefix was partially accepted");
+    }
+    for (int failure = 0; failure < 6; ++failure) {
+        auto bytes = prefix; auto base = module; auto out = sentinel;
+        if (failure == 0) put(bytes, 0, std::uint64_t(module + 0x037A6C20)); // UberSample class.
+        if (failure == 1) put(bytes, 0, std::uint64_t(module + 0x037A6C48)); // Not primary table.
+        if (failure == 2) put(bytes, 0x10, std::uint64_t(0));
+        if (failure == 3) put(bytes, 0x28, std::uint64_t(0));
+        if (failure == 4) base = 0;
+        if (failure == 5) base = UINTPTR_MAX - 15;
+        require(!core::read_epilogue_record(bytes, base, out) && out.renderer == 81 && out.frame == 82,
+            "Unknown/incomplete native task was accepted or changed result");
+    }
+    core_expected_task = reinterpret_cast<void*>(std::uintptr_t(0xFACE123456789001ULL));
+    const auto prior = filled_core_state(1, 88);
+    for (int eye = 0; eye < 2; ++eye) {
+        const auto own = filled_core_state(eye, 123);
+        const core::FrameLabel label{frame, 7, 123, eye, true, true};
+        core_state = prior; core_expected = own; epilogue_mode = 1; epilogue_calls = 0;
+        core::invoke_epilogue(&w3vr::engine_camera::remastered_500c, epilogue_fixture_original,
+            core_expected_task, &record, &label, 7, own, CoreFixtureState{},
+            read_core_fixture, apply_core_fixture);
+        require(epilogue_calls == 2 && core_state == prior, "Task scope leaked or replayed original call");
+        for (int failure = 0; failure < 4; ++failure) {
+            auto bad = label;
+            if (failure == 1) bad.frame++;
+            if (failure == 2) bad.generation = 6;
+            if (failure == 3) bad.normal_factory_lineage = false;
+            core_state = prior; core_expected = {}; epilogue_calls = 0;
+            core::invoke_epilogue(failure == 0 ? &w3vr::engine_camera::legacy_404 :
+                &w3vr::engine_camera::remastered_500c, epilogue_fixture_original,
+                core_expected_task, &record, &bad, 7, own, CoreFixtureState{},
+                read_core_fixture, apply_core_fixture);
+            require(epilogue_calls == 1 && core_state == prior, "Rejected task leaked CPU eye label");
+        }
+    }
+    core_state = prior; core_expected = filled_core_state(0, 123); epilogue_calls = 0; epilogue_mode = 2;
+    const core::FrameLabel good{frame, 7, 123, 0, true, true};
+    bool caught{};
+    try {
+        core::invoke_epilogue(&w3vr::engine_camera::remastered_500c, epilogue_fixture_original,
+            core_expected_task, &record, &good, 7, core_expected, CoreFixtureState{},
+            read_core_fixture, apply_core_fixture);
+    } catch (int code) { caught = code == 47; }
+    require(caught && epilogue_calls == 1 && core_state == prior, "Epilogue C++ unwind did not restore state");
+    epilogue_mode = 0;
+}
+
 int main() {
+    test_normal_epilogue_record_and_task_scope();
+    test_core_native_arguments_labels_and_restoration();
+    test_core_private_stale_and_unknown_labels_mask();
+    test_core_profile_and_native_prefix();
     test_remastered_native_fixture();
     test_legacy_fixture_and_failed_reads();
     test_selection_and_writer_route_gate();
