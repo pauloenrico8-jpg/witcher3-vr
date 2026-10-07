@@ -4,6 +4,34 @@
 Não há medição de FPS em Novigrad. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Proteção contra reaproveitamento de gravações — 6 de outubro
+
+Uma lista de comandos é a sequência de tarefas enviada à placa de vídeo.
+O jogo pode reutilizar a mesma lista para outro quadro. Acrescentei uma
+identificação própria do objeto e um número que muda quando começa uma
+gravação nova. O código faz o seguinte:
+
+1. Confirma que é a mesma lista e o mesmo dispositivo da aquisição de texturas.
+2. Só inicia um número novo após o retorno bem-sucedido de Reset, a operação
+   que reabre a lista para gravar. Falha não cria uma gravação válida.
+3. Compara o número capturado antes de produzir a imagem com o número atual;
+   recusa dados antigos, repetidos ou provenientes de outra lista.
+4. Depois de Close, a operação que encerra a gravação, entrega as referências
+   das texturas uma única vez. Uma gravação posterior não apaga esse pacote.
+
+O teste independente na RTX 4070 Ti passou 24 cópias reais: bloqueou
+temporariamente a fila, reutilizou a lista com outro espaço de gravação
+enquanto o trabalho anterior estava pendente e conferiu os pixels depois
+da confirmação da GPU. Também recusou falhas reais de Reset/Close.
+As associações de olho e quadro nesse teste são fabricadas; ele não carrega
+o jogo, Streamline ou o headset. DLL compilada; 107/107 testes em 11,81s.
+
+O componente novo ainda não está ligado aos observadores do jogo. Falta verificar todos
+os caminhos reais de Reset/Close/Execute e guardar os pacotes na fila correta
+até seu término, inclusive em falhas. Nenhuma proteção aqui autoriza liberar
+texturas em uso ou chamar um pacote fechado de imagem pronta para VR.
+Relatório local: `../artifacts/modern-dlss-recording-port-validation.json`.
+
 ## O que foi verificado
 
 O ponto de partida é [Witcher3VR](https://github.com/tig3rmast3r/witcher3-vr),
