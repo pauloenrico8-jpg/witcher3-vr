@@ -51,18 +51,24 @@ struct NativeInterface {
 NativeInterface resolve_native(IUnknown*, REFIID, Classify,
     const StreamlineAccess& = {}) noexcept;
 
-struct OwnedEvaluation {
-    engine_dlss::Identity identity{};
-    std::uint32_t viewport{UINT32_MAX};
+struct OwnedCommand {
     ComPtr<ID3D12GraphicsCommandList> command;
     ComPtr<IUnknown> command_identity;
     ComPtr<ID3D12Device> device;
     ComPtr<IUnknown> device_identity;
+    Failure failure{Failure::None};
+    explicit operator bool() const { return command && failure == Failure::None; }
+};
+// Endpoint acquisition BEFORE a producer, without inventing a resource receipt.
+// This does not prove recording epoch, submission, or texture ownership.
+OwnedCommand acquire_command(IUnknown*, Classify, const StreamlineAccess& = {});
+
+struct OwnedEvaluation : OwnedCommand {
+    engine_dlss::Identity identity{};
+    std::uint32_t viewport{UINT32_MAX};
     std::array<ComPtr<ID3D12Resource>, 4> resources;
     std::array<ComPtr<IUnknown>, 4> resource_identities;
     std::array<D3D12_RESOURCE_DESC, 4> descriptions{};
-    Failure failure{Failure::None};
-    explicit operator bool() const { return command && failure == Failure::None; }
     // COM references prove object lifetime, not immutable contents, Reset
     // generation, queue submission, fence retirement, or an image for VR.
     static constexpr bool gpu_completion_verified = false;

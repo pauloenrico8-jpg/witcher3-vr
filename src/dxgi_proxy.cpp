@@ -32,6 +32,7 @@
 #include "engine_dlss_contract.h"
 #include "engine_dlss_resources.h"
 #include "modern_dlss_ownership.h"
+#include "modern_dlss_native_hooks.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
 #include "engine_scene_factory.h"
@@ -42186,6 +42187,22 @@ int __fastcall hook_remastered_sl_evaluate_feature(uint32_t feature,
     g_remastered_dlss_cpu_tags = {};
     const auto scope_before = g_remastered_dlss_scope;
     const auto identity_before = remastered_dlss_identity();
+    // Capture the actual native endpoint BEFORE the SDK producer. No invented
+    // receipt, token read, borrowed legacy epoch or non-thread-safe SDK API.
+    // This keeps the command/device alive, but cannot prove a recording epoch.
+    w3vr::modern_dlss_ownership::OwnedCommand native_before;
+    if (g_config.runtime_diagnostics && readable && frame_token != nullptr &&
+        feature == w3vr::engine_dlss::dlss &&
+        g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
+        g_remastered_streamline_observers_ready.load(std::memory_order_acquire) &&
+        w3vr::engine_dlss::known_evaluate_return(feature, caller_rva) &&
+        w3vr::engine_dlss::scoped_sdk_call(scope_before, w3vr::engine_dlss::Stage::evaluation,
+            identity_before, snapshot) &&
+        g_remastered_dlss_counter_logs.load(std::memory_order_relaxed) < 32) {
+        native_before = w3vr::modern_dlss_ownership::acquire_command(
+            static_cast<IUnknown*>(command_buffer), classify_command_list_owner,
+            {nullptr, 0, false, w3vr::modern_dlss_ownership::installed_streamline_command_base});
+    }
     const int result = w3vr::engine_dlss::forward(g_remastered_sl_evaluate_feature, call);
     const bool scoped = g_remastered_dlss_native_hooks_ready.load(std::memory_order_acquire) &&
         readable && frame_token != nullptr && feature == w3vr::engine_dlss::dlss &&
@@ -42208,6 +42225,12 @@ int __fastcall hook_remastered_sl_evaluate_feature(uint32_t feature,
         const auto ownership = w3vr::modern_dlss_ownership::acquire(
             cpu_receipt, classify_command_list_owner,
             {nullptr, 0, false, w3vr::modern_dlss_ownership::installed_streamline_command_base});
+        const bool same_endpoint = native_before && ownership &&
+            native_before.command_identity.Get() == ownership.command_identity.Get() &&
+            native_before.device_identity.Get() == ownership.device_identity.Get();
+        log_line("Modern DLSS native endpoint captured_before_sdk=%d same_after_sdk=%d native_endpoint_observers_ready=%d; recording epoch and game queue adapter still unverified",
+            native_before ? 1 : 0, same_endpoint ? 1 : 0,
+            w3vr::modern_dlss_native_hooks::ready() ? 1 : 0);
         log_line("Modern DLSS temporary native ownership accepted=%d reason=%u native_command=%p native_device=%p; recording/submission/GPU completion unverified",
             ownership ? 1 : 0, static_cast<unsigned>(ownership.failure),
             ownership.command.Get(), ownership.device.Get());

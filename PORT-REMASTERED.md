@@ -7,6 +7,49 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Endpoints nativos observados — checkpoint de 6 de outubro
+
+`OwnedCommand/acquire_command` separa aquisição antes do produtor da aquisição
+de texturas após o recibo. Mantém Native DIRECT command/device e identidades
+canônicas; erro não devolve resultado parcial. OwnedEvaluation reutiliza esse
+contrato. No hook moderno SDK, a amostra bounded adquire o endpoint ANTES do
+forward original e compara command/device com o resultado depois. Isso NÃO
+prova epoch de Reset; offsets privados dos wrappers e slGetNativeInterface
+continuam fora dessa autorização. A QI pública de base conferida é a única
+capacidade moderna stateless usada.
+
+`modern_dlss_native_hooks.h/.cpp`: sites Native Close9/Reset10/Execute10,
+provenientes de objetos próprios adquiridos, só código de d3d12/D3D12Core.
+Pin de módulos e âncoras COM mantêm endpoints vivos. Cada callback readquire
+seu objeto real; fila de instalação identifica apenas a função, NÃO substitui
+a fila da chamada. Before usa E_PENDING, After preserva HRESULT verdadeiro.
+Forward uma vez, arrays/argumentos intactos, reentrada suprime só observação.
+Ready falso até TODOS habilitados e em falha. Não usa MH_ApplyQueued para
+evitar aplicar mutações pendentes de outros instaladores. Conflito retorna
+falso e cleanup remove apenas sites próprios; falha retém trampoline/âncoras.
+
+Uninstall default desabilita e retém sites já ativados. Remoção exige prova
+EXTERNA de quiescência de TODAS as chamadas nativas, além de entered0. Isso
+inclui a janela entre salto nativo e incremento do contador. Busy false
+preserva original em voo; não usar em DllMain/observer/lock de gravação.
+Host ainda precisa coordenar suas outras mutações MinHook, hooks legados e
+shutdown/reinit. NÃO há ativação automática do instalador no Witcher.
+
+Probe físico:31Close/31Reset/26Execute,88event pairs; Ledger do objeto principal
+alimentado por callbacks reais e Timeline before/after dos Execute reais.
+Orphan usa mesma entrada Native Execute; contador de CPU/olho é fabricado.
+Conflito de hook reserva Reset, instalação recusa sem remover hook alheio;
+Reset original alheio encaminha uma vez. Uninstall chamado durante Before
+recusa remoção, original termina; retirada final após parada do teste passa.
+26cópias/readback, falhas reais Reset/Close, recusa comandoCOMPUTE e resultado
+parcial passaram. 107/107 CTest14,88s; DLL compilada, NADA instalado.
+Não executa jogo/SL/DLSS/Quest, não prova captura de epoch/thread ordering no
+Witcher ou posse de heaps/allocators. Gate5c/reentrada seguem fechados.
+
+Contratos públicos de [Reset](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-reset),
+[Close](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-close)
+e [MinHook](https://github.com/TsudaKageyu/minhook) foram conferidos nesta etapa.
+
 ## Retenção por fila e fence privada — checkpoint de 6 de outubro
 
 `modern_dlss_retirement.h/.cpp` possui gravações compartilhadas imutáveis,

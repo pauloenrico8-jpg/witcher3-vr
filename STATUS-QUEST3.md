@@ -6,6 +6,45 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Observação das funções nativas da GPU — 6 de outubro
+
+Agora existe `modern_dlss_native_hooks`, uma entrada nas funções reais que
+fecham, reabrem e enviam listas de tarefas. Um hook é uma passagem que permite
+observar uma chamada e continuar para a função original. O código faz isto:
+
+1. Confirma os objetos nativos da placa e conserva suas referências. As
+   funções escolhidas precisam pertencer ao Direct3D do Windows, sem usar
+   a camada intermediária como prova de identidade.
+2. Cria os três observadores e só aceita observações depois de ativar todos.
+   Se já existir outro hook num endereço, recusa o grupo e preserva o outro.
+3. Observa antes e depois, encaminhando a chamada original uma única vez.
+   Mantém a mesma fila, a mesma lista de tarefas, a quantidade e o resultado.
+4. Na retirada, desativa a observação e conserva a passagem original enquanto
+   uma chamada estiver em andamento. Para removê-la, o responsável precisa
+   comprovar que todas as threads — atividades paralelas do programa — pararam
+   de chamar essas funções. Um contador igual a zero, sozinho, não comprova isso.
+
+Escolhi observar a entrada nativa para evitar a confusão entre a lista real
+e seus wrappers, objetos intermediários usados por outros componentes.
+No caminho moderno do Witcher, acrescentei a aquisição da lista **antes** da
+produção pelo SDK, o componente da NVIDIA, e a comparação com a identidade
+depois. Essa comparação ainda não comprova uma gravação nova nem sua execução.
+O instalador nativo não é ativado automaticamente no jogo: ainda faltam a
+coordenação com os hooks antigos, a parada das chamadas e o ciclo de vida.
+
+Na RTX 4070 Ti, os observadores acompanharam **31 Close, 31 Reset e 26 Execute**,
+com 88 pares de eventos antes/depois. Close fecha a gravação; Reset a reabre;
+Execute a envia. O registro passou a receber os resultados reais de Close e
+Reset; os eventos de Execute guardaram os recursos antes da chamada original
+e pediram a confirmação da GPU depois. Passaram as 26 cópias, o reenvio, a
+retenção durante encerramento, as falhas reais de Close/Reset, a recusa de
+conflito e a retirada durante uma chamada ativa.
+
+A DLL compilou; **107/107 testes em 14,88 segundos**. O teste não abre Witcher,
+DLSS ou Quest; recibos e olhos continuam fabricados. Nada foi instalado.
+5.00c continua bloqueado e o mod não está jogável. Evidência exclusivamente
+local: `../artifacts/modern-dlss-native-hooks-port-validation.json`.
+
 ## Retenção das texturas até o término da GPU — 6 de outubro
 
 Uma textura é um objeto que guarda pixels. Mantê-la viva evita que o jogo
