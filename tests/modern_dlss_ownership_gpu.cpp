@@ -82,9 +82,22 @@ HRESULT observed_execute(retirement::Timeline& timeline, retirement::Ticket tick
 using ForeignReset = HRESULT (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
 ForeignReset foreign_original{};
 unsigned foreign_calls{};
+native_hooks::Forwarder legacy_reset_forwarder, legacy_execute_forwarder;
+native_hooks::ExecuteFn foreign_execute_original{};
+unsigned foreign_execute_calls{};
 HRESULT STDMETHODCALLTYPE foreign_reset(ID3D12GraphicsCommandList* command, ID3D12CommandAllocator* allocator,
     ID3D12PipelineState* pipeline) {
-    ++foreign_calls; return foreign_original(command, allocator, pipeline);
+    ++foreign_calls;
+    return legacy_reset_forwarder ? legacy_reset_forwarder.reset(command, allocator, pipeline)
+        : foreign_original(command, allocator, pipeline);
+}
+void STDMETHODCALLTYPE foreign_execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* array) {
+    ++foreign_execute_calls;
+    if (legacy_execute_forwarder) legacy_execute_forwarder.execute(queue, count, array);
+    else foreign_execute_original(queue, count, array);
+}
+void STDMETHODCALLTYPE proxy_execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* array) {
+    queue->ExecuteCommandLists(count, array);
 }
 
 // Explicit failure seam: this HRESULT is SIMULATED. Remaining queue work,
@@ -570,8 +583,107 @@ int main() try {
     std::printf("PASS actual native hooks: Close=%llu Reset=%llu Execute=%llu balanced_events=%llu; exact original array/count/queue\n",
         native_stats.close, native_stats.reset, native_stats.execute, native_stats.before);
     std::puts("PASS native Reset/Close drive Ledger; native Execute callbacks retain and Signal private fences");
+    // This process owns BOTH legacy hooks. Explicit typed delegates share
+    // those successful installations; no unknown owner's trampoline is read.
+    check(command->Close(), "legacy bridge bootstrap Close");
+    auto* execute_target = (*reinterpret_cast<void***>(submission_queue.queue.Get()))[10];
+    require(MH_CreateHook(reset_target, reinterpret_cast<void*>(foreign_reset),
+        reinterpret_cast<void**>(&foreign_original)) == MH_OK && MH_EnableHook(reset_target) == MH_OK,
+        "legacy Reset enabled before delegate publication");
+    legacy_reset_forwarder = native_hooks::reset_forwarder(reset_target, foreign_original);
+    require(MH_CreateHook(execute_target, reinterpret_cast<void*>(foreign_execute),
+        reinterpret_cast<void**>(&foreign_execute_original)) == MH_OK && MH_EnableHook(execute_target) == MH_OK,
+        "legacy Execute enabled before delegate publication");
+    legacy_execute_forwarder = native_hooks::execute_forwarder(execute_target, foreign_execute_original);
+    require(bool(legacy_reset_forwarder) && bool(legacy_execute_forwarder), "legacy delegate allocation");
+    require(!native_hooks::install(native_command, submission_queue, classify, observer) &&
+        !native_hooks::ready(), "cooperation guessed without explicit owner delegates");
+    require(native_hooks::install(native_command, submission_queue, classify, observer,
+        {&legacy_reset_forwarder, &legacy_execute_forwarder}) && native_hooks::ready(),
+        "Close owned and existing native Reset/Execute delegated");
+    require(native_hooks::install(native_command, submission_queue, classify, observer,
+        {&legacy_reset_forwarder, &legacy_execute_forwarder}), "same delegates not idempotent");
+    const auto delegated_start = native_hooks::stats();
+    const auto legacy_reset_start = foreign_calls;
+    const auto legacy_execute_start = foreign_execute_calls;
+    check(allocator->Reset(), "bridge allocator idle Reset");
+    check(command->Reset(allocator.Get(), nullptr), "cooperating observed Reset");
+    require(events.reset_accepted, "delegated Reset did not advance actual Ledger");
+    const auto bridge_stamp = ledger.open_stamp();
+    receipt.identity = {100, 1, 0};
+    auto bridge_evaluation = m::acquire(receipt, classify);
+    require(bool(bridge_evaluation), "bridge real-resource acquisition");
+    void* bridge_data{}; D3D12_RANGE bridge_no_read{0, 0};
+    check(upload->Map(0, &bridge_no_read, &bridge_data), "bridge upload map");
+    std::memset(bridge_data, 0xB7, 4096); upload->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION bridge_source{}, bridge_target{};
+    bridge_source.pResource = upload.Get(); bridge_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    bridge_source.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 256};
+    bridge_target.pResource = bridge_evaluation.resources[3].Get();
+    bridge_target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    transition(command.Get(), bridge_target.pResource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    command->CopyTextureRegion(&bridge_target, 0, 0, 0, &bridge_source, nullptr);
+    transition(command.Get(), bridge_target.pResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    bridge_source.pResource = readback.Get();
+    command->CopyTextureRegion(&bridge_source, 0, 0, 0, &bridge_target, nullptr);
+    require(ledger.record(std::move(bridge_evaluation), bridge_stamp), "bridge ownership recording");
+    check(command->Close(), "bridge observed Close");
+    require(events.close_accepted, "bridge native Close did not close Ledger");
+    auto bridge_held = retirement::retain(ledger.take_closed(bridge_stamp));
+    require(bool(bridge_held), "bridge immutable recording");
+    IUnknown* bridge_ids[]{bridge_held.get()->evaluations[0].command_identity.Get()};
+    ID3D12CommandList* bridge_lists[]{command.Get()};
+    const auto bridge_ticket = timeline.prepare(bridge_held, bridge_stamp, submission_queue, bridge_ids);
+    require(bool(bridge_ticket), "bridge pre-Execute retention");
+    // A wrapper route must remain an unbound pass-through. It cannot be
+    // accepted as a native delegate or hide the native observation beneath it.
+    auto proxy = native_hooks::execute_forwarder(reinterpret_cast<void*>(proxy_execute), proxy_execute);
+    require(bool(proxy) && !native_hooks::Delegates{nullptr, &proxy}.for_site(2),
+        "proxy incorrectly supplied native delegation proof");
+    ActiveSubmission bridge_observation{&timeline, bridge_ticket, submission_queue.queue_identity.Get(), 1, bridge_lists};
+    active_submission = &bridge_observation;
+    proxy.execute(submission_queue.queue.Get(), 1, bridge_lists);
+    active_submission = nullptr;
+    require(bridge_observation.before && bridge_observation.after && !bridge_observation.mismatch,
+        "proxy nesting suppressed actual delegated native observation");
+    check(bridge_observation.result, "bridge private Signal after original");
+    check(timeline.completion_event(bridge_ticket, event), "bridge completion event");
+    require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0 &&
+        timeline.status(bridge_ticket) == retirement::Status::Complete, "bridge private fence timeout");
+    D3D12_RANGE bridge_range{0, 4096};
+    check(readback->Map(0, &bridge_range, &bridge_data), "bridge GPU readback");
+    for (unsigned row = 0; row < 16; ++row)
+        for (unsigned column = 0; column < 64; ++column)
+            require(static_cast<unsigned char*>(bridge_data)[row * 256 + column] == 0xB7,
+                "bridge texture pixel mismatch");
+    readback->Unmap(0, &bridge_no_read);
+    check(command->Reset(allocator.Get(), nullptr), "bridge Reset abandons completed recording");
+    retirement::observe_reset(ledger.open_stamp());
+    require(timeline.release_completed(bridge_ticket) && !timeline.find(bridge_stamp), "bridge retention leak");
+    bridge_held = {};
+    const auto delegated_end = native_hooks::stats();
+    require(foreign_calls - legacy_reset_start == 2 && foreign_execute_calls - legacy_execute_start == 1 &&
+        delegated_end.reset - delegated_start.reset == 2 && delegated_end.close - delegated_start.close == 1 &&
+        delegated_end.execute - delegated_start.execute == 1 &&
+        delegated_end.before - delegated_start.before == 4 && delegated_end.after - delegated_start.after == 4,
+        "cooperating owner forwarded or observed a native operation twice");
+    legacy_execute_forwarder.deactivate();
+    require(!native_hooks::ready(), "lost delegate left readiness open");
+    // All native calls on this single CPU thread have returned. This is a
+    // lab barrier, not evidence of stopped game/render/SDK worker threads.
+    require(native_hooks::uninstall(true), "delegated quiescent cleanup");
+    check(command->Close(), "owner survives observer removal Close");
+    check(command->Reset(allocator.Get(), nullptr), "owner survives observer removal Reset");
+    require(foreign_calls - legacy_reset_start == 3 && native_hooks::stats().reset == delegated_end.reset,
+        "observer cleanup removed owner's hook or original forwarding");
+    legacy_reset_forwarder.deactivate();
+    require(MH_DisableHook(reset_target) == MH_OK && MH_RemoveHook(reset_target) == MH_OK &&
+        MH_DisableHook(execute_target) == MH_OK && MH_RemoveHook(execute_target) == MH_OK,
+        "legacy owners remove their own trampolines after quiescence");
+    legacy_reset_forwarder = {}; legacy_execute_forwarder = {};
+    std::puts("PASS cooperative native hooks: Close=1 Reset=2 Execute=1; owner preserved; proxy route observed once");
     CloseHandle(event);
-    std::puts("PASS 26 real GPU copies: 24 recordings, one replay and one orphan; exact private fences/readback");
+    std::puts("PASS 27 real GPU copies: 24 recordings, one replay, one orphan, one legacy bridge; exact private fences/readback");
     std::puts("GAME=false HEADSET=false NATIVE_DLSS=false STEREO_IMAGE=false");
     return 0;
 } catch (const std::exception& error) {
