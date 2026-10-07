@@ -2258,6 +2258,7 @@ Present1Fn g_present1{};
 ResizeBuffersFn g_resize_buffers{};
 EngineViewportResolutionFn g_engine_viewport_resolution{};
 ExecuteCommandListsFn g_execute_command_lists{};
+w3vr::modern_dlss_native_hooks::Forwarder g_legacy_native_execute_forwarder;
 CreateCommittedResourceFn g_create_committed_resource{};
 CreateDescriptorHeapFn g_create_descriptor_heap{};
 CreateConstantBufferViewFn g_create_cbv{};
@@ -2284,6 +2285,21 @@ SetComputeRootConstantBufferViewFn g_set_compute_root_cbv{};
 SetComputeRoot32BitConstantFn g_set_compute_root_32bit_constant{};
 SetComputeRoot32BitConstantsFn g_set_compute_root_32bit_constants{};
 ResetCommandListFn g_reset_command_list{};
+w3vr::modern_dlss_native_hooks::Forwarder g_legacy_native_reset_forwarder;
+// Preserve the existing owner and its state updates. Unbound/proxy routes
+// call the same original directly; only a validated native delegate observes.
+void forward_legacy_execute(ID3D12CommandQueue* queue, UINT count,
+    ID3D12CommandList* const* array) {
+    if (g_legacy_native_execute_forwarder)
+        g_legacy_native_execute_forwarder.execute(queue, count, array);
+    else g_execute_command_lists(queue, count, array);
+}
+HRESULT forward_legacy_reset(ID3D12GraphicsCommandList* command,
+    ID3D12CommandAllocator* allocator, ID3D12PipelineState* pipeline) {
+    return g_legacy_native_reset_forwarder
+        ? g_legacy_native_reset_forwarder.reset(command, allocator, pipeline)
+        : g_reset_command_list(command, allocator, pipeline);
+}
 SetPipelineStateFn g_set_pipeline_state{};
 SetGraphicsRootSignatureFn g_set_graphics_root_signature{};
 SetGraphicsRootSignatureFn g_set_compute_root_signature{};
@@ -19495,6 +19511,8 @@ void install_reverse_hooks() {
         auto target = method<void*>(g_command_queue, 10);
         if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_execute_command_lists), reinterpret_cast<void**>(&g_execute_command_lists)) == MH_OK &&
             MH_EnableHook(target) == MH_OK) {
+            g_legacy_native_execute_forwarder =
+                w3vr::modern_dlss_native_hooks::execute_forwarder(target, g_execute_command_lists);
             log_line("Reverse hooked ID3D12CommandQueue::ExecuteCommandLists at %p", target);
         }
     }
@@ -19743,6 +19761,8 @@ void install_command_list_hooks() {
                 reinterpret_cast<void*>(&hook_reset_command_list),
                 reinterpret_cast<void**>(&g_reset_command_list)) == MH_OK &&
             MH_EnableHook(target) == MH_OK) {
+            g_legacy_native_reset_forwarder =
+                w3vr::modern_dlss_native_hooks::reset_forwarder(target, g_reset_command_list);
             log_line(
                 "Renderer hooked ID3D12GraphicsCommandList::Reset at %p",
                 target);
@@ -20778,6 +20798,9 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         // opaque immediate submission completely isolated. V23019's attempt to
         // publish AFW here was physically removed: this list is not the wrapper
         // that owns the DLSS producer commands.
+        // This opaque path intentionally has no modern observation. Stop
+        // treating this owner as a complete delegate before forwarding it.
+        g_legacy_native_execute_forwarder.deactivate();
         g_execute_command_lists(queue, num_command_lists, command_lists);
         return;
     }
@@ -20878,7 +20901,7 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         {
             w3vr::pipeline_flight::CpuScope flight_cpu{
                 w3vr::pipeline_flight::Phase::QueueSubmit};
-            g_execute_command_lists(queue, num_command_lists, command_lists);
+            forward_legacy_execute(queue, num_command_lists, command_lists);
         }
         w3vr::pipeline_flight::on_execute(
             queue, num_command_lists, command_lists);
@@ -21092,7 +21115,7 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
     {
         w3vr::pipeline_flight::CpuScope flight_cpu{
             w3vr::pipeline_flight::Phase::QueueSubmit};
-        g_execute_command_lists(queue, num_command_lists, command_lists);
+        forward_legacy_execute(queue, num_command_lists, command_lists);
     }
     w3vr::pipeline_flight::on_execute(
         queue, num_command_lists, command_lists);
@@ -22539,11 +22562,12 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
     ID3D12CommandAllocator* allocator,
     ID3D12PipelineState* initial_state) {
     if (is_reshade_immediate_command_list(command_list)) {
+        g_legacy_native_reset_forwarder.deactivate();
         return g_reset_command_list(
             command_list, allocator, initial_state);
     }
     const HRESULT result =
-        g_reset_command_list(command_list, allocator, initial_state);
+        forward_legacy_reset(command_list, allocator, initial_state);
     if (FAILED(result)) {
         return result;
     }
