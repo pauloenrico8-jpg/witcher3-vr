@@ -7,6 +7,45 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Delegação aos hooks próprios — checkpoint de 7 de outubro
+
+`modern_dlss_native_hooks::Forwarder` conserva target, função original
+tipada e pin do módulo Native. O dono cria a ligação somente após seu próprio
+MH_EnableHook bem-sucedido. Publicação usa atomic shared_ptr; desativação
+fecha readiness, mas NÃO remove o trampoline do dono nem suprime o forward.
+Removê-lo continua exigindo barreira externa de TODAS as chamadas, incluindo
+a janela anterior ao Entry. Não chamar cleanup true em DllMain ou observer.
+
+Install aceita Delegates explícitos para Reset10/Execute10 somente se target,
+tipo e ativação corresponderem aos endpoints Native adquiridos. Close9 fica
+próprio. Não cria/habilita/desabilita/remove os hooks emprestados; no cleanup
+quiescente desassocia-os. Conflito desconhecido continua recusado. Cada
+operação usa os argumentos originais e encaminha UMA vez. Proxy sem módulo
+Native fica unbound e encaminha diretamente, sem incrementar nesting e
+ocultar a observação Native mais abaixo. Idempotência exige as MESMAS ligações.
+
+`dxgi_proxy.cpp` publica Forwarders depois da instalação legada própria e usa
+a ligação nos caminhos normais, preservando todo o estado legado após Reset
+e as publicações após Execute. Caminhos ReShade immediate permanecem opacos:
+deactivate antes do forward DIRETO original; readiness moderna não pode
+permanecer válida com uma rota propositalmente não acompanhada.
+Ainda NÃO chama o instalador Native automaticamente no Witcher, NÃO prova
+barreira/lifecycle/ordenação Host e NÃO conecta produtor Ledger/Timeline.
+
+Probe RTX4070Ti mantém a recusa de conflito e os31/31/26 forwards/88pares da
+etapa anterior; acrescenta hooks próprios já habilitados compartilhados:
+Close1/Reset2/Execute1,4pares Before/After,27ªcópia/readback0xB7/fence privada.
+Proxy intermediário não esconde a observação; readiness fecha ao perder uma
+ligação; cleanup remove apenas Close próprio e Reset do dono ainda encaminha.
+Parada é comprovada só no processo de teste de CPU com uma thread.
+DLL compilada,107/107 CTest11,69s. Recibos/olhos e SignalFailure fabricados;
+GPU/cópias/esperas reais. Jogo/SL/DLSS/Quest ausentes, nada instalado,
+gate5c/reentrada fechados. Relatório novo somente local.
+
+Próximo: epochs persistentes sem colisão entre Ledger recriados, lifecycle e
+barreira Host, registro no produtor e retenção na fila real; depois recursos
+e históricos separados por olho e demais ports de câmera/culling/efeitos.
+
 ## Endpoints nativos observados — checkpoint de 6 de outubro
 
 `OwnedCommand/acquire_command` separa aquisição antes do produtor da aquisição
