@@ -7,6 +7,50 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Entrada e epílogo normais — checkpoint de 7 de outubro
+
+`engine_render_core.h` e `dxgi_proxy.cpp` acrescentam uma passagem própria para
+as duas entradas modernas: a função principal de desenho e a tarefa normal que
+continua esse desenho. A passagem principal preserva os três argumentos originais
+(renderizador, quadro e cena); a tarefa preserva seu único argumento. Cada função
+original é chamada uma vez. A versão antiga mantém seu caminho separado.
+
+O código só aceita uma identificação de olho com a sequência moderna de cópias
+concluída, geração atual e quadro, par e visão válidos. Cada retorno moderno da
+fábrica apaga a identificação antiga daquele endereço antes de registrar outra.
+Isso reduz herança por reuso; não prova a vida útil de outros objetos do jogo.
+Na tarefa posterior, o tipo e o pequeno registro de entrada são conferidos antes
+de usar a identificação do quadro. Tipos desconhecidos e supersampling são
+rejeitados para essa identificação, mas recebem a chamada original intacta.
+
+Os dois escopos conservam e restauram todos os dados temporários de olho, visão,
+projeção e cabeça. Chamadas aninhadas desconhecidas recebem estado vazio. As
+correções antigas de câmera e os anúncios antigos de conclusão não são usados
+por essas entradas modernas. O retorno do processador não prova que a placa de
+vídeo terminou de desenhar a imagem.
+
+A instalação confere as duas entradas e a ligação da tarefa, cria os dois
+encaminhamentos antes de ativá-los e só anuncia prontidão com ambos ativados.
+Falhas parciais fecham a admissão e conservam os encaminhamentos originais.
+Isso ainda não resolve a parada e remoção seguras de todas as ligações do mod.
+
+DLL compilada; **107/107 CTest em 8,83 segundos**. Casos com dados fabricados
+verificam argumentos de 64 bits, cena vazia, dois olhos, geração/par, sequência
+incompleta, chamadas aninhadas, leitura curta, tipo incorreto e restauração após
+exceção de C++. Não executaram o jogo, funções nativas do jogo, instalação/falhas
+do MinHook, imagens reais na placa de vídeo nem o Quest.
+
+O controle global de compatibilidade continua igual: **5.00c fechada; nada
+instalado**. A pose do headset ainda não é aplicada por estas entradas. Próximo:
+transformação das câmeras sem dupla aplicação, matrizes, visibilidade, efeitos,
+ordem/vida útil das tarefas e recursos, parada segura e comprovação de duas
+imagens novas por quadro. Depois integrar mãos, armas e combate físico ao jogo.
+Não há meta obrigatória de FPS; DLSS continua complementar.
+
+Os detalhes da análise do executável, logs e recibos novos ficam somente locais.
+A autorização anterior de publicação de diagnósticos cobre apenas os quatro
+relatórios antigos. Recibo local: `../artifacts/render-core-epilogue-port-validation.json`.
+
 ## Contexto das cópias normais — checkpoint de 7 de outubro
 
 `engine_camera_copy_context.h` acompanha fábrica → cópia de descritor → cópia

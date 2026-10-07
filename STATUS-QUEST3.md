@@ -6,6 +6,63 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Entrada normal e tarefa de desenho da 5.00c — 7 de outubro
+
+Adaptei a entrada principal do renderizador e a tarefa de epílogo normal. O
+renderizador é a parte que transforma a cena do jogo em uma imagem. O epílogo é
+uma tarefa posterior desse desenho; pode trabalhar em outra linha de execução
+(uma sequência de trabalho do processador). Não basta guardar o olho apenas na
+entrada principal, pois esse dado não passa automaticamente para outra linha.
+
+O código funciona assim:
+
+1. Escolhe a entrada pela versão examinada. Na 5.00c usa a entrada real de três
+   argumentos: renderizador, quadro e cena. Encaminha os três uma vez, inclusive
+   quando a cena é vazia. Não executa as correções de memória da entrada antiga.
+2. Aceita uma identificação de olho somente para o quadro encontrado no registro,
+   na geração atual, com par e visão válidos e a sequência moderna de cópias
+   concluída. A fábrica apaga a identificação antiga do endereço que acabou de
+   devolver, antes de guardar uma nova. Isso reduz herança por reuso do endereço;
+   ainda não prova a vida útil de todos os objetos nativos.
+3. Na tarefa posterior, confere seu tipo exato e lê os endereços do renderizador
+   e do quadro nas posições verificadas. A tarefa de supersampling (imagem maior)
+   e tipos desconhecidos não recebem a identificação da tarefa normal.
+4. Durante cada chamada, conserva olho, geração, par, visão, projeção, pose de
+   cabeça e indicadores temporários. Uma chamada desconhecida dentro de outra
+   recebe estado vazio. Quando termina, restaura todos os dados anteriores.
+5. Confere os bytes das duas entradas e a ligação da tarefa normal antes de
+   instalar. Só considera o conjunto pronto quando as duas ativações terminam.
+   Em falha parcial, fecha a admissão e conserva os encaminhamentos originais.
+6. A função original continua desenhando. Voltar de uma chamada do processador
+   não significa que a placa de vídeo terminou a imagem; esta etapa não publica
+   uma conclusão nem aplica a pose do headset.
+
+Escolhi entradas separadas porque a versão antiga tem outras posições de câmera
+na memória e caminhos que anunciam conclusão. Reutilizar aquele corpo inteiro
+poderia escrever nos dados errados ou declarar pronta uma imagem ainda em uso.
+
+A DLL compilou e passaram **107/107 testes em 8,83 segundos**. Os casos novos
+usam dados fabricados: argumentos de 64 bits, cena vazia, dois olhos, chamadas
+aninhadas aceitas/rejeitadas, dados antigos ou incompletos, leitura curta, tipo
+de tarefa incorreto e restauração após exceção de C++. Não executam o Witcher,
+a instalação dos hooks, falhas do MinHook, o headset ou imagens reais de jogo.
+
+A análise estática confirmou o caminho da entrada principal para o emissor de
+tarefas e a tarefa normal que chega aos consumidores da câmera. A função antes
+chamada de candidata de pipeline foi identificada como emissor de tarefas;
+a entrada real de DLSS permanece aquela examinada separadamente. Também
+conferi o bloco de dados de câmera copiado pelo jogo para a placa de vídeo.
+Esses achados e as instruções nativas ficam somente locais em
+`../artifacts/remastered-normal-camera-consumer-evidence.json`.
+
+**Ainda não está jogável: 5.00c e repetição permanecem bloqueados, nada instalado.**
+Faltam a transformação de cabeça nas câmeras internas e suas matrizes, a
+visibilidade, os demais efeitos, a vida útil/ordem das tarefas e recursos e a
+parada segura das ligações. Depois comprovar imagens novas nos dois olhos em
+cada quadro e integrar mãos, armas e combate físico ao jogo. Não existe meta
+obrigatória de FPS; DLSS continua complementar.
+Recibo local: `../artifacts/render-core-epilogue-port-validation.json`.
+
 ## Identificação das duas etapas de cópia da câmera — 7 de outubro
 
 O código agora acompanha o caminho da câmera dentro da criação de um quadro.
