@@ -164,6 +164,8 @@ OwnedEvaluation acquire(const engine_dlss_resources::CpuResourceReceipt& input,
         __uuidof(ID3D12GraphicsCommandList), classify, sdk);
     if (!command) return failed(command.failure);
     candidate.command = take<ID3D12GraphicsCommandList>(command);
+    if (!identity(candidate.command.Get(), classify, candidate.command_identity))
+        return failed(Failure::Interface);
     // Only the observed DIRECT path. Compute/bundle/copy lists need separate
     // queue/lifetime contracts; do not infer one from a successful QI.
     if (candidate.command->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
