@@ -28,6 +28,7 @@
 #include "legacy_engine_preflight.h"
 #include "engine_camera_temporal.h"
 #include "engine_camera_layout.h"
+#include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
 #include "engine_dlss_contract.h"
 #include "engine_dlss_resources.h"
@@ -36869,10 +36870,24 @@ struct NativeCameraAuthoritySnapshot {
     char top_type[64]{"unknown"};
 };
 
-constexpr uintptr_t kNativeCustomCameraVtableRva = 0x02D645B0;
+int native_camera_manual_control(const void* camera) {
+    const auto* profile = w3vr::engine_camera_authority::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    if (profile == nullptr || camera == nullptr) return -1;
+    int value = -1;
+    __try {
+        w3vr::engine_camera_authority::read_flag(
+            {static_cast<const uint8_t*>(camera), profile->manual_control + 1},
+            profile->manual_control, value);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return value;
+}
 
 NativeCameraAuthoritySnapshot read_native_camera_authority_snapshot() {
     NativeCameraAuthoritySnapshot snapshot{};
+    const auto* profile = w3vr::engine_camera_authority::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    if (profile == nullptr) return snapshot;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
 
     snapshot.player =
@@ -36881,9 +36896,9 @@ NativeCameraAuthoritySnapshot read_native_camera_authority_snapshot() {
         __try {
             const auto* bytes =
                 static_cast<const uint8_t*>(snapshot.player);
-            snapshot.player_gameplay_scene = bytes[0x2F3] != 0 ? 1 : 0;
+            snapshot.player_gameplay_scene = bytes[profile->actor_gameplay] != 0 ? 1 : 0;
             snapshot.player_non_gameplay_cutscene =
-                bytes[0x2F2] != 0 ? 1 : 0;
+                bytes[profile->actor_cutscene] != 0 ? 1 : 0;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             snapshot.player = nullptr;
             snapshot.player_gameplay_scene = -1;
@@ -36895,7 +36910,7 @@ NativeCameraAuthoritySnapshot read_native_camera_authority_snapshot() {
     if (snapshot.game != nullptr) {
         __try {
             snapshot.game_non_gameplay_scene =
-                static_cast<const uint8_t*>(snapshot.game)[0x11F] != 0
+                static_cast<const uint8_t*>(snapshot.game)[profile->game_cutscene] != 0
                 ? 1
                 : 0;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -36909,7 +36924,7 @@ NativeCameraAuthoritySnapshot read_native_camera_authority_snapshot() {
     if (snapshot.setter_camera != nullptr) {
         __try {
             snapshot.setter_manual_control =
-                static_cast<const uint8_t*>(snapshot.setter_camera)[0x259] != 0
+                static_cast<const uint8_t*>(snapshot.setter_camera)[profile->manual_control] != 0
                 ? 1
                 : 0;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -36925,15 +36940,15 @@ NativeCameraAuthoritySnapshot read_native_camera_authority_snapshot() {
             const auto* director =
                 static_cast<const uint8_t*>(snapshot.camera_director);
             const auto* camera_entries =
-                *reinterpret_cast<uint8_t* const*>(director + 0x58);
+                *reinterpret_cast<uint8_t* const*>(director + profile->director_entries);
             const int camera_count =
-                *reinterpret_cast<const int*>(director + 0x60);
+                *reinterpret_cast<const int*>(director + profile->director_count);
             if (camera_entries != nullptr &&
                 camera_count > 0 && camera_count <= 64) {
                 snapshot.top_camera =
                     *reinterpret_cast<void* const*>(
                         camera_entries +
-                        static_cast<size_t>(camera_count - 1) * 0x28);
+                        static_cast<size_t>(camera_count - 1) * profile->entry_stride + profile->native_camera);
             }
             if (snapshot.top_camera != nullptr) {
                 const auto vtable =
@@ -36943,11 +36958,11 @@ NativeCameraAuthoritySnapshot read_native_camera_authority_snapshot() {
                     snapshot.top_vtable_rva =
                         vtable - reinterpret_cast<uintptr_t>(module);
                 }
-                snapshot.top_manual_control =
-                    static_cast<const uint8_t*>(
-                        snapshot.top_camera)[0x259] != 0
-                    ? 1
-                    : 0;
+                // Only the examined concrete camera owns this modern flag.
+                // Other camera classes retain unknown manual state.
+                if (profile == &w3vr::engine_camera_authority::legacy_404 ||
+                    snapshot.top_vtable_rva == profile->custom_camera_vtable)
+                    snapshot.top_manual_control = native_camera_manual_control(snapshot.top_camera);
 
                 // MSVC x64 stores the Complete Object Locator immediately
                 // before the vtable. Its image-relative type descriptor points
@@ -37231,8 +37246,9 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     // other gameplay animations can disable control without changing camera.
     const bool native_gameplay_camera_authority =
         factory_perspective_camera &&
-        native_camera_authority.top_vtable_rva ==
-            kNativeCustomCameraVtableRva &&
+        w3vr::engine_camera_authority::is_custom_camera(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire),
+            native_camera_authority.top_vtable_rva) &&
         native_camera_authority.player_non_gameplay_cutscene == 0 &&
         native_camera_authority.game_non_gameplay_scene == 0;
     // [FIX:RENDER-PROXY-FOV-DISTANCE-AUTHORITY V1122 1/4] Capture the native
@@ -39283,7 +39299,7 @@ void __fastcall hook_engine_camera_enable_manual_control(
     if (camera != nullptr) {
         __try {
             before =
-                static_cast<const uint8_t*>(camera)[0x259] != 0 ? 1 : 0;
+                native_camera_manual_control(camera);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             before = -1;
         }
@@ -39296,7 +39312,7 @@ void __fastcall hook_engine_camera_enable_manual_control(
             camera, std::memory_order_release);
         __try {
             after =
-                static_cast<const uint8_t*>(camera)[0x259] != 0 ? 1 : 0;
+                native_camera_manual_control(camera);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             after = -1;
         }
@@ -39493,23 +39509,25 @@ void service_post_loading_auto_recenter(
         static_cast<unsigned long long>(kPostLoadingAutoRecenterDelayMs));
 }
 
-bool native_head_pose_signature_matches(
-    const uint8_t* target,
-    const uint8_t* expected,
-    size_t size) {
-    if (target == nullptr || expected == nullptr || size == 0) {
-        return false;
-    }
+const w3vr::engine_camera_authority::Profile* selected_camera_authority_profile() {
+    return w3vr::engine_camera_authority::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+}
+
+void* native_camera_callback_target(uint8_t* module,
+    const w3vr::engine_camera_authority::Profile* profile,
+    w3vr::engine_camera_authority::Callback callback) {
+    const auto* entry = w3vr::engine_camera_authority::entry(profile, callback);
+    if (module == nullptr || entry == nullptr || entry->rva == 0) return nullptr;
+    auto* target = module + entry->rva;
+    // Legacy authority entries had no extra signature gate. Preserve that
+    // behavior only for the already-selected legacy contract. New entries
+    // always require their examined bytes, in addition to the global gate.
+    if (entry->signature.empty()) return profile == &w3vr::engine_camera_authority::legacy_404 ? target : nullptr;
     __try {
-        for (size_t index = 0; index < size; ++index) {
-            if (target[index] != expected[index]) {
-                return false;
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return true;
+        return w3vr::engine_camera_authority::signature_matches(*entry,
+            {target, entry->signature.size()}) ? target : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
 void install_engine_native_head_pose_hooks() {
@@ -39521,30 +39539,16 @@ void install_engine_native_head_pose_hooks() {
         return;
     }
 
-    constexpr uintptr_t kGetHeadBoneIndexRva = 0x01C4B550;
-    constexpr uintptr_t kGetBoneWorldMatrixRva = 0x0152E600;
-    static constexpr uint8_t kGetHeadBoneIndexPrologue[] = {
-        0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0xFF, 0x42,
-        0x30, 0x48, 0x81, 0xC1, 0x00, 0x02, 0x00, 0x00, 0x49,
-        0x8B, 0xD8, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x38};
-    static constexpr uint8_t kGetBoneWorldMatrixPrologue[] = {
-        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89,
-        0x70, 0x18, 0x48, 0x89, 0x78, 0x20, 0x55, 0x48, 0x8D,
-        0x68, 0xA1, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00};
-    auto* head_target = module + kGetHeadBoneIndexRva;
-    auto* matrix_target = module + kGetBoneWorldMatrixRva;
-    if (!native_head_pose_signature_matches(
-            head_target,
-            kGetHeadBoneIndexPrologue,
-            sizeof(kGetHeadBoneIndexPrologue)) ||
-        !native_head_pose_signature_matches(
-            matrix_target,
-            kGetBoneWorldMatrixPrologue,
-            sizeof(kGetBoneWorldMatrixPrologue))) {
-        log_line(
-            "V9526 native head provider disabled: Witcher 3 4.04 "
-            "script callback signature mismatch head=%p matrix=%p",
-            head_target, matrix_target);
+    const auto* profile = selected_camera_authority_profile();
+    if (profile == nullptr) return;
+    const auto kGetHeadBoneIndexRva = profile->entries[0].rva;
+    const auto kGetBoneWorldMatrixRva = profile->entries[1].rva;
+    auto* head_target = native_camera_callback_target(module, profile,
+        w3vr::engine_camera_authority::Callback::head);
+    auto* matrix_target = native_camera_callback_target(module, profile,
+        w3vr::engine_camera_authority::Callback::bone_matrix);
+    if (head_target == nullptr || matrix_target == nullptr) {
+        log_line("Native head provider disabled: selected callback entry mismatch");
         return;
     }
 
@@ -39612,16 +39616,22 @@ void install_engine_native_camera_authority_hooks() {
         return;
     }
 
-    constexpr uintptr_t kActorIsInGameplaySceneRva = 0x01C4CD70;
-    constexpr uintptr_t kActorIsInNonGameplayCutsceneRva = 0x01C4CD90;
-    constexpr uintptr_t kGameIsPlayingNonGameplaySceneRva = 0x01549800;
-    constexpr uintptr_t kCameraEnableManualControlRva = 0x01F580E0;
-    constexpr uintptr_t kTopmostCameraObjectRva = 0x0161B9C0;
-    constexpr uintptr_t kIsLoadingScreenVideoPlayingRva = 0x0154EED0;
+    const auto* profile = selected_camera_authority_profile();
+    if (profile == nullptr) return;
+    using Callback = w3vr::engine_camera_authority::Callback;
+    const auto rva = [profile](Callback callback) {
+        return w3vr::engine_camera_authority::entry(profile, callback)->rva;
+    };
+    const auto kActorIsInGameplaySceneRva = rva(Callback::actor_gameplay);
+    const auto kActorIsInNonGameplayCutsceneRva = rva(Callback::actor_cutscene);
+    const auto kGameIsPlayingNonGameplaySceneRva = rva(Callback::game_cutscene);
+    const auto kCameraEnableManualControlRva = rva(Callback::manual_control);
+    const auto kTopmostCameraObjectRva = rva(Callback::top_camera);
+    const auto kIsLoadingScreenVideoPlayingRva = rva(Callback::loading_video);
 
     auto* gameplay_scene_target =
-        module + kActorIsInGameplaySceneRva;
-    if (MH_CreateHook(
+        native_camera_callback_target(module, profile, Callback::actor_gameplay);
+    if (gameplay_scene_target != nullptr && MH_CreateHook(
             gameplay_scene_target,
             reinterpret_cast<void*>(
                 &hook_engine_actor_is_in_gameplay_scene),
@@ -39639,8 +39649,8 @@ void install_engine_native_camera_authority_hooks() {
     }
 
     auto* non_gameplay_cutscene_target =
-        module + kActorIsInNonGameplayCutsceneRva;
-    if (MH_CreateHook(
+        native_camera_callback_target(module, profile, Callback::actor_cutscene);
+    if (non_gameplay_cutscene_target != nullptr && MH_CreateHook(
             non_gameplay_cutscene_target,
             reinterpret_cast<void*>(
                 &hook_engine_actor_is_in_non_gameplay_cutscene),
@@ -39658,8 +39668,8 @@ void install_engine_native_camera_authority_hooks() {
     }
 
     auto* global_non_gameplay_target =
-        module + kGameIsPlayingNonGameplaySceneRva;
-    if (MH_CreateHook(
+        native_camera_callback_target(module, profile, Callback::game_cutscene);
+    if (global_non_gameplay_target != nullptr && MH_CreateHook(
             global_non_gameplay_target,
             reinterpret_cast<void*>(
                 &hook_engine_game_is_playing_non_gameplay_scene),
@@ -39679,8 +39689,8 @@ void install_engine_native_camera_authority_hooks() {
     }
 
     auto* loading_video_target =
-        module + kIsLoadingScreenVideoPlayingRva;
-    if (MH_CreateHook(
+        native_camera_callback_target(module, profile, Callback::loading_video);
+    if (loading_video_target != nullptr && MH_CreateHook(
             loading_video_target,
             reinterpret_cast<void*>(
                 &hook_engine_is_loading_screen_video_playing),
@@ -39698,8 +39708,8 @@ void install_engine_native_camera_authority_hooks() {
     }
 
     auto* manual_control_target =
-        module + kCameraEnableManualControlRva;
-    if (MH_CreateHook(
+        native_camera_callback_target(module, profile, Callback::manual_control);
+    if (manual_control_target != nullptr && MH_CreateHook(
             manual_control_target,
             reinterpret_cast<void*>(
                 &hook_engine_camera_enable_manual_control),
@@ -39718,8 +39728,8 @@ void install_engine_native_camera_authority_hooks() {
     }
 
     auto* topmost_camera_target =
-        module + kTopmostCameraObjectRva;
-    if (MH_CreateHook(
+        native_camera_callback_target(module, profile, Callback::top_camera);
+    if (topmost_camera_target != nullptr && MH_CreateHook(
             topmost_camera_target,
             reinterpret_cast<void*>(
                 &hook_engine_topmost_camera_object),
@@ -39787,9 +39797,13 @@ void install_engine_camera_direction_hook() {
     if (!g_config.hmd_freelook || g_engine_camera_direction != nullptr) {
         return;
     }
-    constexpr uintptr_t kEngineCameraDirectionRva = 0x0161BBC0;
+    const auto* profile = selected_camera_authority_profile();
+    if (profile == nullptr) return;
+    const auto kEngineCameraDirectionRva = profile->entries[
+        static_cast<std::size_t>(w3vr::engine_camera_authority::Callback::direction)].rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    auto* target = module != nullptr ? module + kEngineCameraDirectionRva : nullptr;
+    auto* target = native_camera_callback_target(module, profile,
+        w3vr::engine_camera_authority::Callback::direction);
     if (target != nullptr &&
         MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_camera_direction),
             reinterpret_cast<void**>(&g_engine_camera_direction)) == MH_OK &&
@@ -54075,8 +54089,9 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
         !aim_cinema_active &&
         !g_first_person_bridge_boat.load(std::memory_order_relaxed) &&
         aim_hmd_camera_age <= kAimGameplayCameraAge &&
-        aim_native_authority.top_vtable_rva ==
-            kNativeCustomCameraVtableRva &&
+        w3vr::engine_camera_authority::is_custom_camera(
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire),
+            aim_native_authority.top_vtable_rva) &&
         aim_native_authority.player_non_gameplay_cutscene == 0 &&
         aim_native_authority.game_non_gameplay_scene == 0;
     const int previous_aim_gameplay_authority =
