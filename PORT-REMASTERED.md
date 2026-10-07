@@ -7,6 +7,40 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Projeção atual e commit restrito da pose — checkpoint de 7 de outubro
+
+`engine_camera_layout::ProjectionFields` mantém dois floats de centro e dois
+uint32 de dimensões, total16bytes, viewportoffset8. read/write_projection
+aceitam somente os perfis conhecidos e uma câmera completa; recusam truncação
+antes de copiar. Escrita recusa dimensõeszero e centro não finito. Prefixos,
+matrizes, history e outras câmeras permanecem intactos nos testes de bytes.
+
+No hook_engine_view_rebuild, leitura/escrita do centro, captura/restauração de
+marcadores e validação pós-rebuild usam jitter/viewport do layout selecionado:
+4.04 +400/+408;5c +4C0/+4C8. O deslocamento manual parou de gravar float nas
+palavras de dimensõesuint32. Leitura de FOVanterior no log usa alternate_fov.
+Perfil desconhecido encaminha original e retorna antes destas modificações.
+
+`apply_native_canted_eye_transform` captura somente camera_bytes do perfil.
+Antes escrevia de volta sizeof(array<float,512>)=2048bytes. Agora write_pose
+confere valores finitos e grava apenas XYZ+0 e Euler+10, cada um12bytes. Preserva
+positionW+0C/FOV+1C, matrizes, projeção, história e objetos adjacentes. Cópias
+locais de marcadores e stereo_basis no rebuild também usam camera_bytes.
+Não foi portado nem modificado o restante das rotas de efeitos/culling aqui.
+
+DLL compilada;107/107 CTest9,07s. Testes usam offsets independentes, bytes de
+armadilha e câmeras internas de UM descritor; não são olhos HMD. As duas etapas
+nativas de cópia da fábrica ainda exigem contexto/ownership para não reaplicar
+HMD em dados corrigidos. RVAs de caller legados no rebuild continuam pendentes.
+Não substituir esses RVAs por candidatos sem distinguir câmera e estágio.
+
+As proteções SEH tratam falha de acesso; spans verificam intervalos. Nenhuma
+comprova lifetime/ordem/atomicidade das escritas Native. Gate5c/reentrada
+FECHADOS, nada instalado, nenhum teste de jogo/headset. Recibo e relatórios
+nativos novos permanecem LOCAIS em camera-projection-port-validation.json.
+DLSS complementar e FPSNovigrad cancelado; próximo é contexto de cópia/câmera,
+matrizes/visibilidade/efeitos e caminho de DOIS olhos novos por quadro.
+
 ## Cabeça e autoridade da câmera — checkpoint de 7 de outubro
 
 `engine_camera_authority.h` separa nove callbacks e campos somente de leitura
