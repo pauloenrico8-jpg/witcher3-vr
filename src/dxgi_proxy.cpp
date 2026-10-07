@@ -28,6 +28,7 @@
 #include "legacy_engine_preflight.h"
 #include "engine_camera_temporal.h"
 #include "engine_camera_layout.h"
+#include "engine_camera_copy_context.h"
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
 #include "engine_dlss_contract.h"
@@ -2350,6 +2351,13 @@ using EngineViewRebuildFn = void(__fastcall*)(float*);
 EngineViewRebuildFn g_engine_view_rebuild{};
 using EngineViewCopyRebuildFn = float*(__fastcall*)(float*, const float*);
 EngineViewCopyRebuildFn g_engine_view_copy_rebuild{};
+using RemasteredDescriptorCopyFn = void*(__fastcall*)(void*, const void*);
+RemasteredDescriptorCopyFn g_remastered_descriptor_copy{};
+std::atomic<bool> g_remastered_camera_copy_hooks_ready{};
+thread_local w3vr::camera_copy::Context g_remastered_camera_copy_context{};
+std::array<std::atomic<uint64_t>, 5> g_remastered_camera_copy_route_counts{};
+bool install_remastered_camera_copy_hooks();
+
 // The per-eye DLSS temporal record at view+0x460 deliberately carries the
 // previous corrected VR camera. Its +0x08 field is therefore the previous VR
 // FOV, not the native gameplay FOV that the render-distance fix needs. Retain
@@ -37198,9 +37206,34 @@ bool write_engine_projection_fields(float* view,
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+void* __fastcall hook_remastered_descriptor_copy(void* destination, const void* source) {
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    w3vr::camera_copy::DescriptorScope scope(g_remastered_camera_copy_context,
+        reinterpret_cast<uintptr_t>(_ReturnAddress()) - module,
+        reinterpret_cast<uintptr_t>(destination), reinterpret_cast<uintptr_t>(source));
+    void* result = g_remastered_descriptor_copy(destination, source);
+    scope.finish(reinterpret_cast<uintptr_t>(result));
+    return result; // Preserve native refcounts, arrays, arguments and RAX exactly.
+}
+
 void __fastcall hook_engine_view_rebuild(float* view) {
     const auto* camera_layout = selected_engine_camera_layout();
     if (camera_layout == nullptr) {
+        g_engine_view_rebuild(view);
+        return;
+    }
+    if (camera_layout == &w3vr::engine_camera_layout::remastered_500c) {
+        const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const auto route = w3vr::camera_copy::observe_rebuild(
+            g_remastered_camera_copy_context,
+            reinterpret_cast<uintptr_t>(_ReturnAddress()) - module,
+            reinterpret_cast<uintptr_t>(view));
+        const size_t index = route.stage == w3vr::camera_copy::Stage::unknown ? 4u :
+            (route.stage == w3vr::camera_copy::Stage::scratch ? 0u : 2u) + route.camera_index;
+        g_remastered_camera_copy_route_counts[index].fetch_add(1, std::memory_order_relaxed);
+        // Classification is not pose-write authority. Until matrices, culling,
+        // camera roles and the rest of the normal renderer are ported, forward
+        // ALL modern rebuilds once without entering legacy correction paths.
         g_engine_view_rebuild(view);
         return;
     }
@@ -40310,6 +40343,10 @@ void install_engine_view_factory_probe() {
     const auto* contract = g_engine_camera_temporal_contract.load(
         std::memory_order_acquire);
     if (contract == nullptr) return;
+    if (contract == &w3vr::engine_camera::remastered_500c) {
+        install_remastered_camera_copy_hooks();
+        return;
+    }
     const uintptr_t kEngineViewRebuildRva = contract->rebuild_rva;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineViewRebuildRva : nullptr;
@@ -40333,8 +40370,22 @@ void install_engine_view_factory_probe() {
 // gameplay FOV. The temporal record at source+0x468 must remain the corrected
 // per-eye VR history used for DLSS motion. Visible projection, matrices and
 // view+0x2B0 stay untouched.
+float* invoke_remastered_camera_copy(float* destination, const float* source,
+    uintptr_t caller_rva) {
+    w3vr::camera_copy::CameraScope scope(g_remastered_camera_copy_context, caller_rva,
+        reinterpret_cast<uintptr_t>(destination), reinterpret_cast<uintptr_t>(source));
+    float* result = g_engine_view_copy_rebuild(destination, source);
+    scope.finish(reinterpret_cast<uintptr_t>(result));
+    return result;
+}
+
 float* __fastcall hook_engine_render_proxy_distance_scale(
     float* destination, const float* source) {
+    if (selected_engine_camera_layout() == &w3vr::engine_camera_layout::remastered_500c) {
+        const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        return invoke_remastered_camera_copy(destination, source,
+            reinterpret_cast<uintptr_t>(_ReturnAddress()) - module);
+    }
     float* result = g_engine_view_copy_rebuild(destination, source);
 
     constexpr size_t kVisibleFovIndex = 0x1C / sizeof(float);
@@ -40439,7 +40490,63 @@ float* __fastcall hook_engine_render_proxy_distance_scale(
 // backend. Install it for every supported Mode-3 or clean-Mono projection
 // transport; the strict view signature and native-camera validity gate still
 // decide whether an individual view is eligible.
+bool remastered_camera_copy_prefix_matches(const uint8_t* target,
+    std::span<const uint8_t> expected) {
+    if (target == nullptr || expected.empty()) return false;
+    __try {
+        return w3vr::camera_copy::signature_matches(expected, {target, expected.size()});
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool install_remastered_camera_copy_hooks() {
+    if (g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire)) return true;
+    if (g_engine_camera_temporal_contract.load(std::memory_order_acquire) !=
+        &w3vr::engine_camera::remastered_500c) return false;
+    // Keep partial trampolines alive after failure. A zero counter or disabled
+    // entry alone is not an unload barrier for a thread already in this DLL.
+    if (g_remastered_descriptor_copy || g_engine_view_copy_rebuild || g_engine_view_rebuild)
+        return false;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (!module) return false;
+    struct Hook { uintptr_t rva; void* replacement; void** original; std::span<const uint8_t> signature; };
+    const std::array<Hook, 3> hooks{{
+        {w3vr::camera_copy::descriptor_copy_rva, reinterpret_cast<void*>(&hook_remastered_descriptor_copy),
+            reinterpret_cast<void**>(&g_remastered_descriptor_copy), w3vr::camera_copy::descriptor_signature},
+        {w3vr::engine_camera::remastered_500c.copy_rebuild_rva,
+            reinterpret_cast<void*>(&hook_engine_render_proxy_distance_scale),
+            reinterpret_cast<void**>(&g_engine_view_copy_rebuild), w3vr::camera_copy::camera_signature},
+        {w3vr::engine_camera::remastered_500c.rebuild_rva, reinterpret_cast<void*>(&hook_engine_view_rebuild),
+            reinterpret_cast<void**>(&g_engine_view_rebuild), w3vr::camera_copy::rebuild_signature},
+    }};
+    for (const auto& hook : hooks)
+        if (!remastered_camera_copy_prefix_matches(module + hook.rva, hook.signature)) return false;
+    size_t created{}, enabled{};
+    for (const auto& hook : hooks) {
+        if (MH_CreateHook(module + hook.rva, hook.replacement, hook.original) != MH_OK) break;
+        ++created;
+    }
+    if (created == hooks.size()) for (const auto& hook : hooks) {
+        if (MH_EnableHook(module + hook.rva) != MH_OK) break;
+        ++enabled;
+    }
+    if (created != hooks.size() || enabled != hooks.size()) {
+        // No readiness publication, removal, nulling or retry after a partial
+        // install. Forwarders must remain callable until a real stop barrier.
+        for (size_t i = 0; i < enabled; ++i) MH_DisableHook(module + hooks[i].rva);
+        log_line("Remastered camera copy observers incomplete; stereo admission remains closed");
+        return false;
+    }
+    g_remastered_camera_copy_hooks_ready.store(true, std::memory_order_release);
+    log_line("Remastered camera copy observers installed; classification only, no pose writes or version activation");
+    return true;
+}
+
 void install_engine_render_proxy_distance_scale_hook() {
+    if (g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
+        &w3vr::engine_camera::remastered_500c) {
+        install_remastered_camera_copy_hooks();
+        return;
+    }
     if (!g_config.openxr_enabled ||
         !supported_projection_transport_active() ||
         g_engine_view_copy_rebuild != nullptr) {
@@ -41077,6 +41184,19 @@ bool install_remastered_preparation_hooks() {
     return true;
 }
 
+void* invoke_engine_frame_factory_with_camera_context(void* render_context,
+    void* render_settings, void* scene_descriptor, uint64_t pair, int eye,
+    bool normal_producer, bool& sequence_complete) {
+    const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    w3vr::camera_copy::FactoryScope scope(g_remastered_camera_copy_context, contract,
+        reinterpret_cast<uintptr_t>(scene_descriptor), pair, eye, normal_producer,
+        g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire));
+    void* result = g_engine_frame_data_factory(render_context, render_settings, scene_descriptor);
+    sequence_complete = contract != &w3vr::engine_camera::remastered_500c ||
+        scope.finish(reinterpret_cast<uintptr_t>(result));
+    return result;
+}
+
 void* __fastcall hook_engine_frame_data_factory(void* render_context, void* render_settings, void* scene_descriptor) {
     w3vr::pipeline_flight::CpuScope flight_cpu{
         w3vr::pipeline_flight::Phase::FrameFactory};
@@ -41201,7 +41321,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     if (duplicate_render && remastered_factory) {
         auto* scope = g_remastered_producer_scope;
         RemasteredPreparationContext context{};
-        duplicate_render = g_remastered_preparation_hooks_ready.load(std::memory_order_acquire) &&
+        duplicate_render = g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire) &&
+            g_remastered_preparation_hooks_ready.load(std::memory_order_acquire) &&
             caller_rva == w3vr::frame_preparation::factory_return_rva &&
             scope != nullptr && !scope->factory_reserved && scope->pair.available() &&
             read_remastered_preparation_context(module, scope->game, context);
@@ -41372,7 +41493,10 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         g_asymmetric_factory_pair_id = pair_id;
         g_asymmetric_factory_eye = primary_eye;
     }
-    void* result = g_engine_frame_data_factory(render_context, render_settings, scene_descriptor);
+    bool primary_camera_sequence{};
+    void* result = invoke_engine_frame_factory_with_camera_context(
+        render_context, render_settings, scene_descriptor, pair_id, primary_eye,
+        remastered_factory && duplicate_render, primary_camera_sequence);
     if (duplicate_render && asymmetric_factory_audit) {
         g_asymmetric_factory_scene_descriptor =
             previous_asymmetric_factory_scene;
@@ -41380,6 +41504,12 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         g_asymmetric_factory_eye = previous_asymmetric_factory_eye;
     }
     g_engine_factory_eye = previous_eye;
+    if (remastered_factory && duplicate_render && !primary_camera_sequence) {
+        duplicate_render = false;
+        g_engine_pair_retry_present.store(present + 2, std::memory_order_relaxed);
+        if (g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1) < 8)
+            log_line("Remastered primary camera copy lineage incomplete; native frame preserved, duplicate skipped");
+    }
 
     // [FIX:MODE3-AER-SINGLE-PRODUCER V12034 2/2] Feed the natural Mode-3
     // frame into the same immutable frame-data registry already consumed by
@@ -41473,8 +41603,10 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             g_asymmetric_factory_pair_id = pair_id;
             g_asymmetric_factory_eye = duplicate_eye;
         }
-        void* right_frame_data = g_engine_frame_data_factory(
-            render_context, render_settings, right_scene_descriptor->data());
+        bool duplicate_camera_sequence{};
+        void* right_frame_data = invoke_engine_frame_factory_with_camera_context(
+            render_context, render_settings, right_scene_descriptor->data(), pair_id, duplicate_eye,
+            remastered_factory && duplicate_render, duplicate_camera_sequence);
         if (asymmetric_factory_audit) {
             g_asymmetric_factory_scene_descriptor =
                 previous_asymmetric_factory_scene;
@@ -41537,7 +41669,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 auto* scope = g_remastered_producer_scope;
                 const auto* vtable = *reinterpret_cast<void***>(right_frame_data);
                 const auto release = reinterpret_cast<w3vr::frame_submission::ReleaseFrame>(vtable[2]);
-                if (scope != nullptr) {
+                if (scope != nullptr && duplicate_camera_sequence) {
                     scope->pair_id = pair_id;
                     scope->present = present;
                     duplicate_deferred = scope->pair.arm(result, right_frame_data, release,
@@ -41637,7 +41769,7 @@ void install_engine_frame_factory_probe() {
         w3vr::scene_factory::factory_rva(selected_scene_factory_version());
     if (kEngineFrameDataFactoryRva == 0) return;
     if (selected_scene_factory_version() == w3vr::scene_factory::Version::remastered_500c &&
-        !install_remastered_preparation_hooks()) return;
+        (!install_remastered_camera_copy_hooks() || !install_remastered_preparation_hooks())) return;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameDataFactoryRva : nullptr;
     if (target != nullptr &&

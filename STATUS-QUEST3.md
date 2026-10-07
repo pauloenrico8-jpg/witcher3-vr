@@ -6,6 +6,46 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Identificação das duas etapas de cópia da câmera — 7 de outubro
+
+O código agora acompanha o caminho da câmera dentro da criação de um quadro.
+“Contexto” é uma anotação temporária que só vale durante aquela chamada. O fluxo:
+
+1. Abre um contexto para uma criação autorizada de quadro, com o descritor de
+   entrada, o olho e o número do par. Uma chamada dentro de outra recebe contexto
+   próprio e recupera o anterior quando termina.
+2. Identifica a primeira cópia para a área temporária, conferindo origem,
+   destino, local de chamada e ordem. Acompanha as duas câmeras internas dessa
+   cópia; elas pertencem a uma cena e não representam os dois olhos do Quest.
+3. Só aceita a segunda cópia quando sua origem é a área temporária já concluída.
+   Confere as duas reconstruções de câmera e o resultado devolvido pela cópia.
+4. Ao terminar, confere que a cópia final está dentro do quadro realmente
+   devolvido. Uma sequência incompleta impede a admissão do quadro adicional;
+   o resultado original da primeira criação continua sendo encaminhado.
+5. Na 5.00c, a reconstrução observada segue para a função original uma vez.
+   Ainda não aplica pose de cabeça nem entra nas correções antigas de câmera.
+
+Escolhi acompanhar toda a sequência porque o mesmo endereço de reconstrução
+aparece nas duas etapas e nas duas câmeras. Ele sozinho não identifica a origem
+nem permite saber se uma futura correção de cabeça já foi aplicada. As ligações
+novas só são consideradas prontas depois das três instalações bem-sucedidas,
+com conferência de bytes. Uma instalação parcial mantém a admissão fechada e
+conserva as funções de encaminhamento; ainda falta resolver sua parada completa.
+
+A DLL compilou e passaram **107/107 testes em 7,18 segundos**. Os novos casos
+usam chamadas e endereços fabricados, incluindo ordem errada, origem incorreta,
+cópias sobrepostas, reconstrução ausente/repetida, resultado divergente,
+chamadas aninhadas e interrupção por exceção de C++. Não executam o jogo,
+funções nativas, poses no headset ou produção de imagens.
+
+**Ainda não está jogável; nada foi instalado e 5.00c continua bloqueado.**
+A identificação não comprova memória válida, vida útil dos recursos, ordem
+entre tarefas ou segurança ao descarregar a DLL. O próximo passo é verificar
+como o desenho normal usa as duas câmeras internas e adaptar matrizes,
+visibilidade e efeitos para os dois olhos. Depois integrar cabeça, Touch e
+combate físico. A meta de FPS permanece cancelada; DLSS é complementar.
+Evidência somente local: `../artifacts/camera-copy-context-port-validation.json`.
+
 ## Centro da projeção e escrita da pose — 7 de outubro
 
 O caminho que reconstrói a câmera agora usa as posições de memória da versão
