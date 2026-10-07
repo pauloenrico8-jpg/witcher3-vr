@@ -7,6 +7,44 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Cabeça e autoridade da câmera — checkpoint de 7 de outubro
+
+`engine_camera_authority.h` separa nove callbacks e campos somente de leitura
+por contrato de versão. `dxgi_proxy.cpp` consulta esse perfil nos instaladores
+de cabeça, autoridade e direção, e no snapshot usado por câmera e mira. O perfil
+moderno exige bytes examinados antes de MH_CreateHook. A verificação executada
+usa o mesmo comparador dos testes, dentro de leitura protegida contra falha de
+acesso; isso não prova lifetime/thread ordering do objeto.
+
+Controle manual é +259 na4.04 e +269 na5.00c. Flags de cena player+2F3/+2F2 e
+game+11F não mudaram. CameraDirector entries+58/count+60/stride28 conserva o
+ponteiro Native no início da entrada; entry+8 é o handle de script, diferente.
+CCustomCamera primária5c é03805378, e não as tabelas secundárias038058A0 ou
+038058D0. O método GetCameraDirection escolhido é0237A1C0 no grupo do diretor;
+o método02470440 de outro grupo com o mesmo nome não foi instalado.
+
+Endereços escolhidos5c: cabeça02102690, matriz do osso02251A40, cena player
+02103880/021038A0, cena game0226CDB0, controle manual01E07620, câmera de topo
+0237A0A0, vídeo02271A80 e direção0237A1C0. Preservar script cursor+30,
+outputR8 e chamadas originais. Dados de cabeça/matriz observados não são
+poses de headset ou prova de integração com o script de primeira pessoa.
+
+DLL compilada; 107/107 CTest6,81s. Casos de teste fabricados incluem contrato
+nulo/copiado, tipo secundário, leitura truncada e cada byte divergente de um
+getter. Exe/SDK/ReShade instalados reconferidos iguais no recibo local.
+Gate global e reentrada5c fechados; nenhuma alteração instalada no jogo.
+Relatórios nativos novos e logs permanecem LOCAIS. Esta etapa não confirma
+instalação/rollback/teardown dos hooks, ABI de outros métodos, camera lifecycle,
+matrizes, culling, efeitos, imagens estéreo, mãos/armas ou gameplay físico.
+
+Próximo: inventariar os hooks realmente exigidos pela rota normal sem DLSS e
+portar rebuild/matrizes/constantes, frame builder/factory e reentrada com
+prova da rota normal, descritores e ownership. Não aproveitar câmera privada
+UberScreenshot como prova da normal. Não ativar5c apenas por desligar DLSS.
+O trabalho anterior de DLSS pode ser reutilizado quando necessário; não é um
+pré-requisito inventado para iniciar VR. FPSNovigrad continua cancelado.
+Recibo local reproduzível: `../artifacts/camera-authority-port-validation.json`.
+
 ## Clock compartilhado por command — checkpoint de 7 de outubro
 
 `modern_dlss_recording.h` mantém Clock por command/device canônicos. Registro
