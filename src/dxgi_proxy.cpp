@@ -29,6 +29,7 @@
 #include "engine_camera_temporal.h"
 #include "engine_camera_layout.h"
 #include "engine_camera_copy_context.h"
+#include "engine_render_core.h"
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
 #include "engine_dlss_contract.h"
@@ -2327,8 +2328,10 @@ using EngineViewConstantsFn = void(__fastcall*)(void*, void*, char);
 EngineViewConstantsFn g_engine_view_constants{};
 std::atomic<uint64_t> g_engine_view_call_count{};
 std::atomic<uint64_t> g_engine_view_last_logged_present{UINT64_MAX};
-using EngineFrameBuilderFn = void(__fastcall*)(void*, void*, void*);
+using EngineFrameBuilderFn = w3vr::render_core::NativeCore;
 EngineFrameBuilderFn g_engine_frame_builder{};
+w3vr::render_core::NativeEpilogue g_remastered_normal_epilogue{};
+std::atomic<bool> g_remastered_core_hooks_ready{};
 using EngineTemporalWriterFn = void(__fastcall*)(
     void*, float, float, uint32_t, uint32_t);
 EngineTemporalWriterFn g_engine_temporal_writer{};
@@ -2943,6 +2946,7 @@ struct EngineFrameTag {
         w3vr::mode3_transport::AfwPixelProjection::Invalid};
     HmdCameraPoseSnapshot hmd_pose{};
     bool task_provenance_valid{};
+    bool modern_camera_lineage_complete{}; // CPU factory receipt, NOT native lifetime or GPU completion.
 };
 
 // [FIX:AER-CINEMA-EXACT-EYE-CONTRACT V1214 2/12] A completed REDengine task
@@ -31088,6 +31092,103 @@ bool verify_native_asymmetric_frame_projection(
         std::fabs(secondary_core[10] - expected_projection.aspect) <= 0.000001f;
 }
 
+// Modern core gets a dedicated synchronous CPU label scope. The legacy
+// hook below contains unported frame offsets, fallbacks and completion paths.
+struct RemasteredCoreThreadState {
+    int eye{-1};
+    uint32_t generation{};
+    uint64_t pair{};
+    XrView view{XR_TYPE_VIEW};
+    bool view_valid{}, frame_lookup_exact{};
+    w3vr::mode3_transport::AfwPixelProjection projection{
+        w3vr::mode3_transport::AfwPixelProjection::Invalid};
+    HmdCameraPoseSnapshot hmd{};
+    void* audit_frame{};
+};
+RemasteredCoreThreadState read_remastered_core_thread_state() {
+    return {g_engine_render_eye, g_engine_render_generation, g_engine_render_pair_id,
+        g_engine_render_view, g_engine_render_view_valid, g_engine_render_tag_frame_lookup_exact,
+        g_engine_render_pixel_projection, g_engine_render_hmd_pose, g_asymmetric_render_frame};
+}
+void apply_remastered_core_thread_state(const RemasteredCoreThreadState& state) {
+    g_engine_render_eye = state.eye;
+    g_engine_render_generation = state.generation;
+    g_engine_render_pair_id = state.pair;
+    g_engine_render_view = state.view;
+    g_engine_render_view_valid = state.view_valid;
+    g_engine_render_tag_frame_lookup_exact = state.frame_lookup_exact;
+    g_engine_render_pixel_projection = state.projection;
+    g_engine_render_hmd_pose = state.hmd;
+    g_asymmetric_render_frame = state.audit_frame;
+}
+void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* scene) {
+    const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    EngineFrameTag tag{};
+    bool found_label{};
+    if (contract == &w3vr::engine_camera::remastered_500c &&
+        caller == w3vr::render_core::remastered_500c.normal_return && frame &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        g_remastered_core_hooks_ready.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{g_engine_dual_frame_mutex};
+        const auto found = g_engine_dual_frame_eyes.find(frame);
+        if (found != g_engine_dual_frame_eyes.end()) {
+            tag = found->second;
+            found_label = true;
+        }
+    }
+    const w3vr::render_core::FrameLabel label{
+        reinterpret_cast<uintptr_t>(frame), tag.generation, tag.pair_id,
+        static_cast<int>(tag.eye), tag.render_view_valid, tag.modern_camera_lineage_complete};
+    const RemasteredCoreThreadState labelled{
+        static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
+        tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr};
+    w3vr::render_core::invoke(contract, caller, g_engine_frame_builder,
+        renderer, frame, scene, found_label ? &label : nullptr,
+        g_streamline_capture_generation.load(std::memory_order_acquire),
+        labelled, RemasteredCoreThreadState{}, read_remastered_core_thread_state,
+        apply_remastered_core_thread_state);
+    // Returning from the CPU core is NOT a completed task, submitted command
+    // list, ready image or a GPU fence. Do not publish any of those here.
+}
+
+bool read_remastered_epilogue_task(void* task, w3vr::render_core::TaskRecord& result) {
+    if (!task) return false;
+    std::array<uint8_t, 0x30> prefix{};
+    __try { std::memcpy(prefix.data(), task, prefix.size()); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return w3vr::render_core::read_epilogue_record(prefix,
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), result);
+}
+void __fastcall hook_remastered_normal_epilogue(void* task) {
+    const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    w3vr::render_core::TaskRecord record{};
+    const bool record_valid = contract == &w3vr::engine_camera::remastered_500c &&
+        read_remastered_epilogue_task(task, record);
+    EngineFrameTag tag{};
+    bool found_label{};
+    if (record_valid && g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        g_remastered_core_hooks_ready.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{g_engine_dual_frame_mutex};
+        const auto found = g_engine_dual_frame_eyes.find(reinterpret_cast<void*>(record.frame));
+        if (found != g_engine_dual_frame_eyes.end()) { tag = found->second; found_label = true; }
+    }
+    const w3vr::render_core::FrameLabel label{record.frame, tag.generation,
+        tag.pair_id, static_cast<int>(tag.eye), tag.render_view_valid,
+        tag.modern_camera_lineage_complete};
+    const RemasteredCoreThreadState labelled{
+        static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
+        tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr};
+    w3vr::render_core::invoke_epilogue(contract, g_remastered_normal_epilogue,
+        task, record_valid ? &record : nullptr, found_label ? &label : nullptr,
+        g_streamline_capture_generation.load(std::memory_order_acquire),
+        labelled, RemasteredCoreThreadState{}, read_remastered_core_thread_state,
+        apply_remastered_core_thread_state);
+    // CPU task scope only: no completed image, fence, retained frame reference
+    // or entry into the old gameplay hook's completion/publication logic.
+}
+
 void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data, void* extra) {
     constexpr uintptr_t kGameplayFrameBuilderCallerRva = 0x01D002CF;
     const auto present = g_present_count.load();
@@ -31585,6 +31686,54 @@ void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data
     g_engine_render_hmd_pose = previous_hmd_pose;
 }
 
+bool remastered_render_entry_matches(const uint8_t* target,
+    std::span<const uint8_t> expected) {
+    if (!target || expected.size() != 16) return false;
+    std::array<uint8_t, 16> prefix{};
+    __try { std::memcpy(prefix.data(), target, prefix.size()); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return std::equal(prefix.begin(), prefix.end(), expected.begin());
+}
+bool remastered_normal_epilogue_table_matches(const uint8_t* module) {
+    if (!module) return false;
+    uintptr_t method{};
+    __try { std::memcpy(&method, module + w3vr::render_core::normal_epilogue_vtable_rva + 16, sizeof(method)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return method == reinterpret_cast<uintptr_t>(module) + w3vr::render_core::normal_epilogue_rva;
+}
+bool install_remastered_render_core_hooks(uint8_t* module) {
+    if (g_remastered_core_hooks_ready.load(std::memory_order_acquire)) return true;
+    // Keep original trampolines on any partial failure; never remove/null/retry
+    // them while entries may be in flight. This is NOT an unload barrier.
+    if (!module || g_engine_frame_builder || g_remastered_normal_epilogue) return false;
+    struct Hook { uintptr_t rva; void* detour; void** original; std::span<const uint8_t> signature; };
+    const std::array<Hook, 2> hooks{{
+        {w3vr::render_core::remastered_500c.entry, reinterpret_cast<void*>(&hook_remastered_render_core),
+            reinterpret_cast<void**>(&g_engine_frame_builder), w3vr::render_core::modern_entry_signature},
+        {w3vr::render_core::normal_epilogue_rva, reinterpret_cast<void*>(&hook_remastered_normal_epilogue),
+            reinterpret_cast<void**>(&g_remastered_normal_epilogue), w3vr::render_core::epilogue_entry_signature}}};
+    if (!remastered_normal_epilogue_table_matches(module)) return false;
+    for (const auto& hook : hooks)
+        if (!remastered_render_entry_matches(module + hook.rva, hook.signature)) return false;
+    for (const auto& hook : hooks) {
+        if (MH_CreateHook(module + hook.rva, hook.detour, hook.original) != MH_OK) {
+            log_line("Remastered core hook creation failed; admission closed, originals retained");
+            return false;
+        }
+    }
+    size_t enabled{};
+    for (; enabled < hooks.size(); ++enabled)
+        if (MH_EnableHook(module + hooks[enabled].rva) != MH_OK) break;
+    if (enabled != hooks.size()) {
+        for (size_t i = 0; i < enabled; ++i) MH_DisableHook(module + hooks[i].rva);
+        log_line("Remastered core hook activation incomplete; admission closed, originals retained");
+        return false;
+    }
+    g_remastered_core_hooks_ready.store(true, std::memory_order_release);
+    log_line("Remastered core and normal epilogue CPU label adapters installed; GPU completion not implied");
+    return true;
+}
+
 void install_engine_frame_builder_probe() {
     const bool cinema_frame_camera_needed =
         (std::isfinite(g_config.cinema_aspect_ratio) &&
@@ -31597,11 +31746,17 @@ void install_engine_frame_builder_probe() {
         return;
     }
 
-    constexpr uintptr_t kEngineFrameBuilderRva = 0x01D86400;
+    const auto* profile = w3vr::render_core::selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) || !profile) return;
+    const uintptr_t kEngineFrameBuilderRva = profile->entry;
+    const bool modern = profile == &w3vr::render_core::remastered_500c;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameBuilderRva : nullptr;
+    if (modern) { install_remastered_render_core_hooks(module); return; }
+    auto* detour = reinterpret_cast<void*>(&hook_engine_frame_builder);
     if (target != nullptr &&
-        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frame_builder),
+        MH_CreateHook(target, detour,
             reinterpret_cast<void**>(&g_engine_frame_builder)) == MH_OK &&
         MH_EnableHook(target) == MH_OK) {
         log_line("Engine frame builder probe hooked RVA=0x%llX target=%p",
@@ -41192,6 +41347,14 @@ void* invoke_engine_frame_factory_with_camera_context(void* render_context,
         reinterpret_cast<uintptr_t>(scene_descriptor), pair, eye, normal_producer,
         g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire));
     void* result = g_engine_frame_data_factory(render_context, render_settings, scene_descriptor);
+    if (contract == &w3vr::engine_camera::remastered_500c && result) {
+        // A new native factory return must never inherit an old label merely
+        // because the allocator reused that numeric address. Clear before any
+        // current producer can publish a replacement. Other native allocation
+        // routes/destruction still require the full lifetime port.
+        std::scoped_lock lock{g_engine_dual_frame_mutex};
+        g_engine_dual_frame_eyes.erase(result);
+    }
     sequence_complete = contract != &w3vr::engine_camera::remastered_500c ||
         scope.finish(reinterpret_cast<uintptr_t>(result));
     return result;
@@ -41592,6 +41755,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 tag.render_view_valid = true;
             }
             tag.hmd_pose = snapshot_current_hmd_camera_pose();
+            tag.modern_camera_lineage_complete = remastered_factory && primary_camera_sequence;
             g_engine_dual_frame_eyes[result] = tag;
             primary_asymmetric_tag = tag;
             primary_asymmetric_tag_valid = true;
@@ -41644,6 +41808,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                     tag.render_view_valid = true;
                 }
                 tag.hmd_pose = snapshot_current_hmd_camera_pose();
+                tag.modern_camera_lineage_complete = remastered_factory && duplicate_camera_sequence;
                 g_engine_dual_frame_eyes[right_frame_data] = tag;
                 duplicate_asymmetric_tag = tag;
                 duplicate_asymmetric_tag_valid = true;
