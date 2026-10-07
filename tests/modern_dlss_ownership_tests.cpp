@@ -15,7 +15,7 @@ struct Node : IUnknown {
     ULONG refs{1};
     unsigned queries{}, sdk_calls{};
     int sdk_status{};
-    bool sdk_null{}, query_fail{}, query_null{}, resource{}, modern_base{}, query_fault{};
+    bool sdk_null{}, query_fail{}, query_null{}, resource{}, modern_base{}, query_fault{}, queue{};
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
         ++queries; *output = nullptr;
         if (query_fault) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
@@ -24,8 +24,8 @@ struct Node : IUnknown {
         Node* target{};
         if (owner == Owner::ReShade && iid == w3vr::command_list_identity::kReShadeBase) target = inner;
         if (owner == Owner::Streamline && modern_base && iid == w3vr::command_list_identity::kStreamlineBase) target = inner;
-        if (owner == Owner::Native && iid == (resource
-            ? __uuidof(ID3D12Resource) : __uuidof(ID3D12GraphicsCommandList)))
+        if (owner == Owner::Native && iid == (queue ? __uuidof(ID3D12CommandQueue) : (resource
+            ? __uuidof(ID3D12Resource) : __uuidof(ID3D12GraphicsCommandList))))
             target = graphics_result ? graphics_result : this;
         if (!target) return E_NOINTERFACE;
         target->AddRef(); *output = target;
@@ -93,6 +93,7 @@ int main() {
     require(m::resolve_native(&sl, iid, classify, modern_qi).failure == m::Failure::SdkUnavailable);
     // A model's vtable is never accepted as the actual installed component.
     require(!m::installed_streamline_command_base(&sl));
+    require(!m::installed_streamline_queue_base(&sl));
     native.query_fault = true;
     require(m::resolve_native(&native, iid, classify).failure == m::Failure::Interface);
     native.query_fault = false;
@@ -138,6 +139,15 @@ int main() {
     }
     require(texture.refs == 1);
     require(m::resolve_native(&texture, iid, classify).failure == m::Failure::Interface);
+    Node queue; queue.queue = true;
+    {
+        auto resolved = m::resolve_native(&queue, __uuidof(ID3D12CommandQueue), classify);
+        require(bool(resolved) && queue.refs == 2);
+    }
+    require(queue.refs == 1);
+    require(m::resolve_native(&queue, iid, classify).failure == m::Failure::Interface);
+    require(m::acquire_queue(nullptr, classify).failure == m::Failure::Input);
+    require(!m::compatible_queue_device({}, {}));
     // Empty/forged receipts never enter COM. Opaque tokens are not read.
     w3vr::engine_dlss_resources::CpuResourceReceipt receipt;
     require(m::acquire(receipt, classify).failure == m::Failure::Receipt);

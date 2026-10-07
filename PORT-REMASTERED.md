@@ -891,3 +891,42 @@ não atestam uma gravação executável. DLL compilada e107/107CTest em11,81s.
 Evidência nova LOCAL `../artifacts/modern-dlss-recording-port-validation.json`.
 Nada instalado; gate5c fechado. Próximo: adaptador real de submissão e
 retenção por queue/fence, incluindo falhas e ciclo de vida do plugin.
+
+## Fila moderna: posse própria e dispositivo
+
+`OwnedQueue` possui referências da interface nativa ID3D12CommandQueue,
+IUnknown canônico da fila e device/identidade do device. `acquire_queue`
+reutiliza o resolver estrito, recusa endpoints Unknown/RenderDoc, exige
+DIRECT e dispositivo nativo. Em falha nenhuma posse parcial é devolvida.
+`compatible_queue_device` confere SOMENTE compatibilidade de dispositivo:
+mesmo device não significa mesma fila, envio observado ou GPU pronta.
+O helper não chama Execute/Signal e não substitui a fila pelo swapchain.
+
+`installed_streamline_queue_base` tem perfil separado do command-list:
+confere tabela/slots/export/GUIDs e digest de toda a QI em memória, sem cache
+positivo entre unload/reinit. Somente a classe de fila instalada exatamente
+reconhecida recebe a capacidade de QI moderna. Nenhum campo privado do
+wrapper é lido pelo mod. Alternativa SDK não thread safe permanece fechada
+sem prova de inicialização e serialização. Gate5c fechado; helper ainda não
+é adaptador de submissão/retirement do jogo.
+
+A análise do SDK instalado confirmou o ramo de QI da fila com AddRef/base
+e a conversão de arrays de command-list antes de Execute; fallbackQI,
+destino virtual de Execute e helpers transitivos ainda não constituem prova
+de execução nem conclusão GPU. Evidência nativa exclusivamente local em
+`../artifacts/remastered-modern-streamline-queue-candidate.json`, reproduzida
+por `../artifacts/inspect-modern-streamline-queue.py`. A
+[classe pública da fila](https://github.com/NVIDIA-RTX/Streamline/blob/main/source/core/sl.interposer/d3d12/d3d12CommandQueue.h)
+e [sua implementação](https://github.com/NVIDIA-RTX/Streamline/blob/main/source/core/sl.interposer/d3d12/d3d12CommandQueue.cpp)
+servem de referência, não substituem a análise do binário efetivamente instalado.
+
+Probe físico: duas filas DIRECT no mesmo device preservam identidades
+diferentes; fila COMPUTE recusada; fila WARP em outro device adquirida mas
+recusada como compatível com a avaliação da RTX. Referência original da fila
+de teste é solta e24cópias usam somente OwnedQueue, com Reset antecipado,
+fence e readback já descritos. Testes Streamline continuam estáticos/modelos;
+probe só usa endpoints Native, nunca jogo/DLSS/Quest/FPS. DLL compilada,
+107/107CTest em11,75s. Relatório LOCAL `modern-dlss-queue-port-validation.json`.
+Próximo: observações serializadas Reset/Close/Execute, retenção por queue/fence
+exata, Signal falho/reenvio/shutdown/device removal; depois IDs/históricos
+por olho. Não ligar o pacote fechado ao completion/cache legado.

@@ -32,6 +32,9 @@ struct StreamlineAccess {
 // vtable/slots/GUIDs and the entire QI function digest in loaded memory.
 // Hooked, changed, unloaded or other proxy classes do not get this capability.
 bool installed_streamline_command_base(const IUnknown*) noexcept;
+// A separate installed queue-class proof. The command-list profile must NOT
+// be used to authorize QI on a queue (or vice versa).
+bool installed_streamline_queue_base(const IUnknown*) noexcept;
 
 struct NativeInterface {
     ComPtr<IUnknown> object; // Owns the requested interface, not a borrowed key.
@@ -71,6 +74,22 @@ struct OwnedEvaluation {
 // or changes native options/tags/history.
 OwnedEvaluation acquire(const engine_dlss_resources::CpuResourceReceipt&,
     Classify, const StreamlineAccess& = {});
+
+struct OwnedQueue {
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<IUnknown> queue_identity;
+    ComPtr<ID3D12Device> device;
+    ComPtr<IUnknown> device_identity;
+    Failure failure{Failure::None};
+    explicit operator bool() const { return queue && failure == Failure::None; }
+    static constexpr bool gpu_completion_verified = false;
+};
+
+// Acquire while the real submission callback still owns its queue. Only a
+// DIRECT native endpoint is admitted. Never substitute the swapchain queue,
+// call Execute/Signal, or infer submission from matching devices alone.
+OwnedQueue acquire_queue(IUnknown*, Classify, const StreamlineAccess& = {});
+bool compatible_queue_device(const OwnedQueue&, const OwnedEvaluation&) noexcept;
 
 // UINT64_MAX is D3D12's device-removal sentinel, never a completed image.
 bool fence_reached(std::uint64_t completed, std::uint64_t target) noexcept;
