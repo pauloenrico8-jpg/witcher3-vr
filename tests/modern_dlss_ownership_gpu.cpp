@@ -682,8 +682,100 @@ int main() try {
         "legacy owners remove their own trampolines after quiescence");
     legacy_reset_forwarder = {}; legacy_execute_forwarder = {};
     std::puts("PASS cooperative native hooks: Close=1 Reset=2 Execute=1; owner preserved; proxy route observed once");
+    {
+        ComPtr<ID3D12CommandAllocator> clock_allocator, clock_alternate;
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&clock_allocator)), "clock allocator");
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&clock_alternate)), "clock alternate allocator");
+        ComPtr<ID3D12GraphicsCommandList> clock_command;
+        check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, clock_allocator.Get(),
+            nullptr, IID_PPV_ARGS(&clock_command)), "clock command");
+        auto clock_endpoint = m::acquire_command(clock_command.Get(), classify);
+        require(bool(clock_endpoint), "clock endpoint before manufactured evaluation");
+        auto clock_ledger = std::make_unique<recording::Ledger>(clock_endpoint);
+        events.ledger = clock_ledger.get(); events.command = clock_endpoint.command_identity.Get();
+        require(native_hooks::install(clock_endpoint, submission_queue, classify, observer), "clock native observers");
+        check(clock_command->Close(), "clock initial Close");
+        check(clock_command->Reset(clock_allocator.Get(), nullptr), "clock first Reset");
+        const auto old_stamp = clock_ledger->open_stamp();
+        require(bool(old_stamp) && old_stamp.epoch == 1, "clock first observed recording");
+        auto clock_receipt = receipt; clock_receipt.command = clock_command.Get(); clock_receipt.identity = {200, 1, 0};
+        std::array<ComPtr<ID3D12Resource>, 4> clock_textures;
+        for (std::size_t i = 0; i < clock_textures.size(); ++i) {
+            clock_textures[i] = texture(device.Get());
+            clock_receipt.bindings[i].resource.native = reinterpret_cast<std::uint64_t>(clock_textures[i].Get());
+        }
+        auto clock_evaluation = m::acquire(clock_receipt, classify);
+        require(bool(clock_evaluation), "clock fabricated receipt real resources");
+        void* clock_data{}; D3D12_RANGE clock_no_read{0, 0};
+        check(upload->Map(0, &clock_no_read, &clock_data), "clock upload map");
+        std::memset(clock_data, 0xB8, 4096); upload->Unmap(0, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION clock_source{}, clock_target{};
+        clock_source.pResource = upload.Get(); clock_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        clock_source.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 256};
+        clock_target.pResource = clock_evaluation.resources[3].Get();
+        clock_target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        transition(clock_command.Get(), clock_target.pResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        clock_command->CopyTextureRegion(&clock_target, 0, 0, 0, &clock_source, nullptr);
+        transition(clock_command.Get(), clock_target.pResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        clock_source.pResource = readback.Get();
+        clock_command->CopyTextureRegion(&clock_source, 0, 0, 0, &clock_target, nullptr);
+        require(clock_ledger->record(std::move(clock_evaluation), old_stamp), "clock first ownership transfer");
+        check(clock_command->Close(), "clock first observed Close");
+        auto old_recording = retirement::retain(clock_ledger->take_closed(old_stamp));
+        require(bool(old_recording), "clock old recording held");
+        IUnknown* clock_ids[]{clock_endpoint.command_identity.Get()};
+        ID3D12CommandList* clock_lists[]{clock_command.Get()};
+        const auto old_ticket = timeline.prepare(old_recording, old_stamp, submission_queue, clock_ids);
+        struct UnblockClock { ID3D12Fence* fence; ~UnblockClock() { fence->Signal(1001); } } unblock_clock{gate.Get()};
+        check(submission_queue.queue->Wait(gate.Get(), 1001), "clock GPU gate");
+        check(observed_execute(timeline, old_ticket, submission_queue, 1, clock_lists), "clock old Execute/private Signal");
+        for (auto& resource : clock_textures) resource.Reset();
+        clock_ledger.reset(); // Old packet/stamp, not a ledger, preserves the clock.
+        clock_ledger = std::make_unique<recording::Ledger>(clock_endpoint);
+        events.ledger = clock_ledger.get();
+        require(!clock_ledger->open_stamp() && !old_stamp.current(true) &&
+            !timeline.prepare(old_recording, old_stamp, submission_queue, clock_ids),
+            "recreated observer inherited an unobserved recording");
+        check(clock_command->Reset(clock_alternate.Get(), nullptr), "clock Reset while old GPU work pending");
+        const auto new_stamp = clock_ledger->open_stamp();
+        require(new_stamp.command == old_stamp.command && new_stamp.epoch == old_stamp.epoch + 1 &&
+            new_stamp != old_stamp, "Ledger recreation reused command/epoch stamp");
+        auto new_evaluation = m::acquire(clock_receipt, classify);
+        require(bool(new_evaluation) && !clock_ledger->record(std::move(new_evaluation), old_stamp) &&
+            bool(new_evaluation), "old producer stamp crossed Ledger recreation");
+        require(clock_ledger->record(std::move(new_evaluation), new_stamp), "clock new receipt transfer");
+        check(clock_command->Close(), "clock new empty native recording Close");
+        auto new_recording = retirement::retain(clock_ledger->take_closed(new_stamp));
+        require(bool(new_recording), "clock new closed recording");
+        retirement::observe_reset(old_stamp); // Delayed stale callback must be ignored.
+        const auto new_ticket = timeline.prepare(new_recording, new_stamp, submission_queue, clock_ids);
+        require(bool(new_ticket) && timeline.cancel(new_ticket), "stale Reset abandoned newer recording");
+        retirement::observe_reset(new_stamp);
+        require(!timeline.find(old_stamp) && timeline.status(old_ticket) == retirement::Status::Pending,
+            "new epoch released in-flight GPU ownership");
+        old_recording = {};
+        check(clock_command->Reset(clock_alternate.Get(), nullptr), "clock abandon unused new recording");
+        retirement::observe_reset(clock_ledger->open_stamp());
+        new_recording = {};
+        check(gate->Signal(1001), "clock release GPU gate");
+        check(timeline.completion_event(old_ticket, event), "clock old private completion event");
+        require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "clock GPU timeout");
+        D3D12_RANGE clock_range{0, 4096};
+        check(readback->Map(0, &clock_range, &clock_data), "clock physical readback");
+        for (unsigned row = 0; row < 16; ++row)
+            for (unsigned column = 0; column < 64; ++column)
+                require(static_cast<unsigned char*>(clock_data)[row * 256 + column] == 0xB8,
+                    "clock recreation released old GPU texture");
+        readback->Unmap(0, &clock_no_read);
+        require(timeline.release_completed(old_ticket), "clock old fence retirement");
+        require(native_hooks::uninstall(true), "clock single-thread quiescent cleanup");
+        events.ledger = &ledger; events.command = command_id;
+        std::puts("PASS persistent recording clock: Ledger destroyed/recreated, epoch 1->2; stale producer/Reset rejected; pending GPU copy retained");
+    }
     CloseHandle(event);
-    std::puts("PASS 27 real GPU copies: 24 recordings, one replay, one orphan, one legacy bridge; exact private fences/readback");
+    std::puts("PASS 28 real GPU copies: 24 recordings, replay, orphan, legacy bridge, recreated Ledger; exact private fences/readback");
     std::puts("GAME=false HEADSET=false NATIVE_DLSS=false STEREO_IMAGE=false");
     return 0;
 } catch (const std::exception& error) {
