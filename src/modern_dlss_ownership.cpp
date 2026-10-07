@@ -177,16 +177,14 @@ NativeInterface resolve_native(IUnknown* input, REFIID iid, Classify classify,
     }
 }
 
-OwnedEvaluation acquire(const engine_dlss_resources::CpuResourceReceipt& input,
-    Classify classify, const StreamlineAccess& sdk) {
+OwnedCommand acquire_command(IUnknown* input, Classify classify, const StreamlineAccess& sdk) {
     auto failed = [](Failure reason) {
-        OwnedEvaluation output{};
+        OwnedCommand output{};
         output.failure = reason;
         return output;
     };
-    if (classify == nullptr || !valid_receipt(input)) return failed(Failure::Receipt);
-    OwnedEvaluation candidate{};
-    auto command = resolve_native(static_cast<IUnknown*>(input.command),
+    OwnedCommand candidate{};
+    auto command = resolve_native(input,
         __uuidof(ID3D12GraphicsCommandList), classify, sdk);
     if (!command) return failed(command.failure);
     candidate.command = take<ID3D12GraphicsCommandList>(command);
@@ -202,6 +200,19 @@ OwnedEvaluation acquire(const engine_dlss_resources::CpuResourceReceipt& input,
         !identity(command_device.Get(), classify, candidate.device_identity))
         return failed(Failure::Device);
     candidate.device = std::move(command_device);
+    return candidate;
+}
+
+OwnedEvaluation acquire(const engine_dlss_resources::CpuResourceReceipt& input,
+    Classify classify, const StreamlineAccess& sdk) {
+    auto failed = [](Failure reason) {
+        OwnedEvaluation output{}; output.failure = reason; return output;
+    };
+    if (classify == nullptr || !valid_receipt(input)) return failed(Failure::Receipt);
+    OwnedEvaluation candidate{};
+    auto command = acquire_command(static_cast<IUnknown*>(input.command), classify, sdk);
+    if (!command) return failed(command.failure);
+    static_cast<OwnedCommand&>(candidate) = std::move(command);
     for (std::size_t i = 0; i < candidate.resources.size(); ++i) {
         auto resource = resolve_native(reinterpret_cast<IUnknown*>(
             input.bindings[i].resource.native), __uuidof(ID3D12Resource), classify, sdk);
