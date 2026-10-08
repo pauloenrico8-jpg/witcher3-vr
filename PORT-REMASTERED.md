@@ -1,4 +1,4 @@
-# Adaptação para Remastered 5.00c — evidências de renderização
+# Adaptação para Remastered — estado da renderização
 
 Estado em 06/10/2026: análise estática e início da adaptação do código de câmera,
 sem liberar o mod no jogo.
@@ -6,6 +6,51 @@ sem liberar o mod no jogo.
 O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
+
+## Identificação da fila por versão — 8 de outubro
+
+A atualização do jogo exigiu separar a identificação da fila de desenho por
+versão. A fila guarda comandos à espera de execução. O código agora carrega
+junto com cada identificação um perfil: o conjunto de tipos e endereços
+examinados para aquela versão.
+
+O fluxo, passo a passo:
+
+1. O chamador informa um perfil conhecido. O código confere os tipos do
+   desenhador, da fila e do comando, além do espaço disponível para leitura.
+   Um perfil desconhecido ou uma leitura incompleta é rejeitado sem trocar
+   o resultado anterior.
+2. A identificação capturada guarda esse perfil. Mesmo quando os endereços
+   dos objetos coincidem, uma identificação de outra versão não é equivalente.
+3. A função original de reserva também precisa estar vinculada ao mesmo
+   perfil. As chamadas existentes continuam vinculadas à versão anterior;
+   elas não adotam silenciosamente os dados da atualização.
+4. Quando as conferências passam, chama a função original com a fila real e
+   o mesmo tamanho de reserva, preservando seu retorno. O motor continua
+   controlando reservas, cabeçalhos e publicação dos comandos.
+5. As observações de reutilização e encerramento da fila conservam o perfil
+   junto com a identificação. Isso ainda não mantém os objetos do jogo vivos.
+
+Escolhi identificar tanto os dados quanto a função porque conferir só os
+endereços dos objetos permitiria misturar uma fila nova com uma função da
+versão anterior. O perfil é informação explícita desse subsistema; não é uma
+opção de configuração que libera o jogo.
+
+DLL de desenvolvimento compilada; **111/111 testes passaram em 14,95 segundos**.
+O teste da fila passou **190 verificações**, incluindo 23 novas sobre mistura
+entre versões, função de reserva incompatível, perfis desconhecidos, resultado
+preservado após rejeição e observações de reutilização. São testes com dados e
+funções fabricados; não executaram a fila nativa, seus hooks, a placa de vídeo
+ou o Quest.
+
+**O bloqueio global continua igual, admitindo somente a versão antiga já
+suportada. Nada foi instalado no jogo e o VR ainda não está jogável.**
+Os demais endereços e campos da atualização exigem conferência independente.
+As notas anteriores sobre a Remastered são registros da versão então examinada;
+não autorizam usar seus endereços na instalação atual. Continuam pendentes a
+integração dos dois olhos, recursos e históricos, vida útil e encerramento das
+chamadas, mãos/armas e dano/bloqueio físicos. DLSS é complementar e a meta de
+60 FPS em Novigrad continua cancelada. Novas análises nativas ficam locais.
 
 ## Escrita do registro anterior da câmera — 8 de outubro
 

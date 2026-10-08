@@ -27,6 +27,64 @@ struct Fixture {
  bool match(){return q::primary_command_matches(identity,pointer,primary,header,command);}
 };
 void* allocate_spy(void* actual,std::uint32_t bytes){++calls;receiver=actual;size=bytes;return answer;}
+void build_profiles_cannot_share_a_binding(){
+ Fixture f;const auto* newer=&q::remastered_1048522;
+ auto expected=f.identity;expected.profile=newer;
+ put(f.renderer,0,expected.module+newer->renderer_vtable);
+ put(f.renderer,newer->renderer_queue,expected.queue);
+ put(f.queue,0,expected.module+newer->queue_vtable);
+ put(f.command,0,expected.module+newer->scene_command_vtable);
+ q::Identity parsed{};
+ require(q::read_identity(newer,expected.module,expected.renderer,f.renderer,
+  expected.queue,f.queue,parsed)&&parsed==expected,"new build queue profile not parsed explicitly");
+ require(q::primary_command_matches(parsed,f.pointer,f.primary,f.header,f.command),"new command type not matched");
+ auto unchanged=f.identity;
+ require(!f.read(unchanged)&&unchanged==f.identity,"old default adopted new build bytes or changed output");
+ auto old_command=f.command;put(old_command,0,expected.module+q::scene_command_vtable_rva);
+ require(!q::primary_command_matches(parsed,f.pointer,f.primary,f.header,old_command),"old command type admitted in new queue");
+ put(f.command,0,expected.module+newer->scene_command_vtable);
+ require(!q::primary_command_matches(f.identity,f.pointer,f.primary,f.header,f.command),"new command type admitted in old queue");
+ const int before=calls;answer=reinterpret_cast<void*>(0x123400);
+ const q::Allocator allocator{newer,allocate_spy};
+ require(q::allocate_bound(allocator,parsed,parsed)==answer && calls==before+1 &&
+  receiver==reinterpret_cast<void*>(expected.queue+q::allocator_offset) && size==q::payload_bytes,
+  "new profile did not preserve actual allocator receiver/size/return");
+ require(!q::allocate_bound(allocate_spy,parsed,parsed)&&calls==before+1,
+  "old untagged host allocator silently adopted new build identity");
+ require(!q::allocate_bound(q::Allocator{&q::remastered_500c,allocate_spy},parsed,parsed)&&calls==before+1,
+  "old allocator profile invoked new queue");
+ require(!q::allocate_bound(q::Allocator{newer,nullptr},parsed,parsed)&&calls==before+1,
+  "null new allocator invoked Native");
+ auto other_profile=parsed;other_profile.profile=&q::remastered_500c;
+ require(q::valid(other_profile)&&other_profile!=parsed,"profile omitted from identity equality");
+ require(!q::allocate_bound(allocator,parsed,other_profile)&&calls==before+1,
+  "profile change called allocator despite identical addresses");
+ q::Profile copied=*newer;auto unknown=parsed;unknown.profile=&copied;
+ require(!q::valid(unknown),"copied unknown profile admitted");
+ auto sentinel=parsed;
+ require(!q::read_identity(&copied,expected.module,expected.renderer,f.renderer,expected.queue,f.queue,sentinel)&&sentinel==parsed,
+  "unknown profile parsed or changed output");
+ require(!q::read_identity(nullptr,expected.module,expected.renderer,f.renderer,expected.queue,f.queue,sentinel)&&sentinel==parsed,
+  "null profile parsed or changed output");
+ require(!q::allocate_bound(q::Allocator{&copied,allocate_spy},parsed,parsed)&&calls==before+1,"unknown allocator profile invoked Native");
+ require(!q::allocate_bound(allocator,unknown,unknown)&&calls==before+1,"unknown identity profile invoked allocator");
+ const auto truncated=std::span<const std::uint8_t>(f.renderer).first(newer->renderer_prefix-1);
+ require(!q::read_identity(newer,expected.module,expected.renderer,truncated,expected.queue,f.queue,sentinel)&&sentinel==parsed,
+  "truncated new renderer prefix changed output");
+ auto wrong_table=f.queue;put(wrong_table,0,expected.module+q::queue_vtable_rva);
+ require(!q::read_identity(newer,expected.module,expected.renderer,f.renderer,expected.queue,wrong_table,sentinel)&&sentinel==parsed,
+  "new renderer accepted old queue type");
+ put(f.renderer,0,expected.module+q::remastered_500c.renderer_vtable);
+ require(!q::read_identity(newer,expected.module,expected.renderer,f.renderer,expected.queue,f.queue,sentinel)&&sentinel==parsed,
+  "new profile accepted old renderer type");
+ // Revision observations retain the build identity too, without retaining Native objects.
+ namespace life=w3vr::modern_queue_lifecycle;life::Observations observations;
+ auto ticket=observations.begin(parsed.queue,true);require(observations.finish(ticket,parsed,true),"new profile observation refused");
+ life::Snapshot snap{};require(observations.snapshot(parsed,snap)&&observations.current(snap),"new profile observation lost");
+ life::Snapshot untouched{};untouched.revision=777;
+ require(!observations.snapshot(other_profile,untouched)&&untouched.revision==777,"cross-build snapshot admitted or changed output");
+ observations.retire(parsed.queue);require(!observations.current(snap),"new profile observation survived retirement");
+}
 void valid_binding_and_mutable_cursor(){Fixture f;q::Identity parsed{};
  require(f.read(parsed)&&parsed==f.identity,"native queue identity not parsed");
  require(f.match(),"original unpublished primary record not matched");
@@ -206,6 +264,6 @@ void partial_activation_cannot_adopt_an_earlier_construction(){
 }
 
 }
-int main(){valid_binding_and_mutable_cursor();reject_corrupt_identity();reject_foreign_or_published_primary();
+int main(){build_profiles_cannot_share_a_binding();valid_binding_and_mutable_cursor();reject_corrupt_identity();reject_foreign_or_published_primary();
  construction_reading_before_owner_store();observed_generation_is_not_an_address();constructor_and_stop_can_race();partial_activation_cannot_adopt_an_earlier_construction();
  std::printf("Modern captured native queue: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;}
