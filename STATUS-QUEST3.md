@@ -6,6 +6,53 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Lente própria para cada olho — 7 de outubro, noite
+
+O preparo das cópias privadas agora ajusta também a lente da câmera principal
+para cada olho, usando a mesma leitura OpenXR congelada que fornece a cabeça.
+OpenXR é a ligação que entrega as posições e a abertura de visão do headset.
+
+O fluxo, em linguagem simples:
+
+1. Confere a câmera original, a distância mínima/máxima de desenho e os quatro
+   ângulos que o Quest fornece para a lente de cada olho. Um preparo inválido
+   conserva as duas saídas anteriores e não chama nenhuma fábrica.
+2. Calcula a abertura vertical e a proporção horizontal da imagem para cada
+   lente. Substitui o zoom da câmera do monitor pela lente física do headset.
+3. Grava o centro óptico, que é o deslocamento da visão em relação ao centro da
+   imagem, em um campo estável separado da pequena oscilação dos efeitos
+   temporais. Usa um valor absoluto: não soma outra vez ao centro anterior.
+4. Altera esses cinco números só na câmera principal de cada cópia privada.
+   Conserva distâncias de desenho, oscilação em pixels, dimensões inteiras,
+   histórico, matrizes derivadas e referências de outros objetos. O jogo
+   reconstrói as matrizes ao copiar as entradas de cada olho.
+5. Na passagem moderna que atualiza a oscilação temporal, encaminha os cinco
+   argumentos originais uma vez e retorna antes das correções da versão
+   antiga. Uma atualização temporal não deve apagar nem duplicar a lente.
+
+Escolhi o campo estável porque ele é aplicado separadamente na reconstrução da
+câmera moderna. Misturar o centro óptico com a oscilação temporal exigiria
+repor esse centro em cada atualização do jogo e poderia acumulá-lo nas rotas
+de restauração. A câmera interna secundária conserva sua lente original nesta
+etapa; sua função de escolher os objetos visíveis ainda precisa de adaptação.
+
+A DLL compilou. **108/108 testes passaram em 10,54 segundos**, incluindo
+**424 verificações de câmera/lente**. Um modelo de matriz independente confere
+as quatro bordas de duas lentes diferentes, várias distâncias, profundidade,
+zoom antigo, centro anterior não nulo, oscilação temporal e dimensões inteiras.
+Os testes também conferem todos os bytes fora das escritas permitidas e as
+saídas preservadas em rejeições. Não executaram a função nativa de câmera,
+o jogo, a instalação das passagens nem o headset.
+
+**Continua sem versão jogável; nada instalado e 5.00c bloqueada.** Ainda faltam
+visibilidade para as lentes assimétricas, histórico separado por olho, demais
+efeitos, propriedade/vida útil/ordem dos recursos e tarefas e a parada segura.
+Depois provar duas imagens novas por quadro no jogo, testar cabeça/imagem no
+Quest e integrar mãos, armas e contato/dano/bloqueio físicos. Não há prazo
+confiável, porcentagem de conclusão ou meta de FPS. DLSS é complementar.
+Código novo: `src/modern_camera_projection.h`; integração no preparo de pose e
+na passagem temporal. Evidências nativas novas permanecem somente locais.
+
 ## Pose do headset nas entradas privadas de câmera — 7 de outubro, noite
 
 Implementei o preparo da posição e da rotação para os dois olhos, antes de

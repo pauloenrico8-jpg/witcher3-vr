@@ -7,6 +7,42 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Lente primária por olho — checkpoint de 7 de outubro, noite
+
+`modern_camera_projection.h` deriva os cinco valores de lente da câmera
+principal a partir do campo de visão OpenXR congelado: abertura vertical,
+proporção, escala unitária e centro normalizado em dois eixos. Confere a fonte
+perspectiva e conserva os planos de distância mínima/máxima do jogo. O centro
+é substituído por um valor absoluto, sem acumular o centro da câmera anterior.
+
+O centro usa a entrada estável de reconstrução moderna, separada do deslocamento
+temporal em pixels. Os pixels e suas dimensões inteiras ficam intactos. A
+passagem temporal moderna chama o original com todos os cinco argumentos uma
+vez e retorna antes da composição e das marcações da versão antiga. Isto não
+publica nenhuma conclusão de imagem ou de trabalho da placa de vídeo.
+
+O preparo de pose calcula as duas lentes antes de criar qualquer quadro. Grava
+cada lente somente na câmera principal de seu próprio buffer e mantém o
+movimento rígido das duas câmeras internas já implementado. Históricos,
+matrizes derivadas, referências e toda a projeção da câmera secundária ficam
+intactos. As cópias privadas ainda não são objetos nativos construídos nem
+possuem suas referências. Não reaplicar a cabeça/lente durante cada cópia.
+
+Release compilado; 108/108 CTest em 10,54s; 424 verificações de câmera/lente no
+processador. Modelo independente de multiplicação de matrizes por linhas
+confere cantos de lentes assimétricas diferentes, profundidade, pixel jitter,
+dimensões inteiras e centro absoluto. Confere também preservação de todos os
+bytes não autorizados e rejeições sem publicar saídas parciais. Não executou
+as funções do jogo, MinHook, câmera nativa, GPU ou Quest. Nova análise nativa
+permanece apenas local; não foi anexada à documentação publicada.
+
+**Global preflight inalterado; 5.00c/reentrada fechados; nada instalado.** A
+projeção atual da câmera primária é um passo parcial. Adaptar a visibilidade
+da câmera secundária e os planos para não excluir bordas assimétricas; portar
+históricos e demais efeitos, propriedade/vida útil/ordem dos recursos/tarefas e
+barreira de parada. Só depois verificar duas imagens novas por quadro no jogo,
+o primeiro teste Quest e mãos/armas/combate físico. DLSS continua complementar.
+
 ## Preparo privado da pose por olho — checkpoint de 7 de outubro, noite
 
 `modern_camera_pose.h` recebe uma leitura copiada de duas visões OpenXR, origem
