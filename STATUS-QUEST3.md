@@ -6,6 +6,42 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Escrita do registro anterior da câmera — 8 de outubro
+
+Adaptei a cópia do registro da câmera anterior para a Remastered. Esse registro
+contém dados usados para comparar a posição atual com a anterior. A adaptação
+conserva os espaços reservados que o jogo deixa intactos ao fazer essa cópia.
+
+O fluxo, passo a passo:
+
+1. Confere a regra da versão e todo o espaço de destino antes de escrever.
+2. Guarda uma cópia temporária da origem. Mesmo se origem e destino ocuparem
+   parte do mesmo espaço, escrever um campo não estraga os próximos campos.
+3. Copia os campos definidos do registro e conserva os espaços reservados
+   existentes no destino, além de todos os dados fora desse registro.
+4. Na Remastered, também aceita um registro completo que manda reiniciar o
+   histórico. Uma construção que falha continua devolvendo erro sem publicar
+   dados incompletos. O chamador precisa respeitar esse erro.
+5. A versão antiga conserva sua regra de cópia e de admissão do registro.
+
+Escolhi copiar os campos definidos porque copiar o bloco inteiro alterava os
+espaços que a rotina original da Remastered conserva. A cópia temporária evita
+corromper a origem quando as regiões se sobrepõem.
+
+DLL compilada; **111/111 testes passaram em 11,25 segundos**. Foram conferidas
+14 cópias com regiões sobrepostas nas duas versões, além de reinício do
+histórico, preservação dos espaços reservados, limites e rejeição de regra
+desconhecida.
+Os testes usam dados fabricados; não executam o jogo, suas funções nativas,
+a placa de vídeo ou o Quest. Esta alteração na escrita não conecta por si só
+os históricos dos dois olhos: ainda falta associar tempo, continuidade,
+reinícios, ordem e recursos a cada imagem real.
+
+**Ainda não está jogável; nada instalado e a 5.00c continua bloqueada.**
+DLSS permanece complementar, a meta de FPS continua cancelada e mãos, armas,
+dano e bloqueio físicos ainda exigem integração no jogo. Análises novas do
+executável permanecem somente nos arquivos locais.
+
 ## Construção durante a ativação dos observadores — 8 de outubro
 
 Fechei uma janela na ativação das três passagens que acompanham a fila do jogo.
