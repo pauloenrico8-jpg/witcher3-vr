@@ -7,6 +7,43 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Cópia privada da visibilidade mundial usa a câmera primária — 8 de outubro
+
+`modern_world_culling_view.h` identifica a tarefa pela cena e pelo quadro
+recebidos como argumentos reais do jogo. `engine_render_core.h` separa a
+validação da identidade do quadro da validação adicional do renderizador;
+a entrada normal conserva as mesmas condições anteriores. Uma tarefa não
+recebe um renderizador inventado nem herda a identificação de outra thread.
+Uma thread é uma linha de execução que pode trabalhar ao mesmo tempo que outra.
+
+Na cópia privada exata, a integração confere a câmera secundária de origem,
+campos finitos, limites e destino sem sobreposição com as duas câmeras.
+Encaminha o endereço nativo da primária daquele olho à cópia original. As
+leituras de conferência nunca são tratadas como câmeras nativas construídas.
+O destino, o retorno e a quantidade de chamadas são conservados. Reconstrução,
+ajuste interno da distância mínima e liberação continuam no código original;
+nenhuma transformação da cabeça é reaplicada nessa câmera temporária.
+
+Chamadas rejeitadas conservam todos os argumentos e mascaram o contexto
+anterior durante a função original. O grupo exige cinco passagens completas;
+falha parcial conserva os caminhos originais e fecha a admissão, sem remover
+passagens em uso nem repetir sua instalação. Isso não resolve o descarregamento.
+Leituras repetidas coincidentes não são uma reserva do quadro ou dos recursos.
+
+DLL compilada; **110/110 CTest em 10,92s**. O teste novo tem **80 verificações
+CPU**, com geometria independente das duas lentes, bordas perdidas pela câmera
+secundária, preservação de argumentos/retorno, endereços nativos distintos das
+cópias de conferência, limites inválidos, contexto interno e thread separada.
+Não executou funções nativas, leituras de memória do processo, MinHook, jogo,
+GPU ou Quest. Os dados novos da análise nativa permanecem somente locais.
+
+**Global preflight inalterado; 5.00c/reentrada fechados; nada instalado.**
+Próximo: fechar ordem, consumo e vida útil das tarefas compartilhadas, portar
+os demais consumidores de visibilidade, históricos, efeitos, recursos e a
+parada segura. Verificar imagens novas nos dois olhos e cabeça antes da
+integração real de mãos, armas, dano e bloqueio físico. DLSS complementar;
+a meta de FPS continua cancelada.
+
 ## Etapa antecipada da visibilidade de vegetação — 8 de outubro
 
 O encaminhamento de câmera agora cobre quatro atualizações normais de
