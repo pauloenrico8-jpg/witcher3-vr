@@ -2338,6 +2338,7 @@ EngineFrameBuilderFn g_engine_frame_builder{};
 w3vr::render_core::NativeEpilogue g_remastered_normal_epilogue{};
 std::atomic<bool> g_remastered_core_hooks_ready{};
 w3vr::modern_vegetation_view::NativeUpdate g_remastered_vegetation_update{};
+w3vr::modern_vegetation_view::NativePreselection g_remastered_vegetation_preselection{};
 thread_local w3vr::modern_vegetation_view::Context g_remastered_vegetation_context{};
 using EngineTemporalWriterFn = void(__fastcall*)(
     void*, float, float, uint32_t, uint32_t);
@@ -31760,6 +31761,46 @@ bool read_remastered_vegetation_snapshot(
     // atomic native read, allocation lease or proof of deferred task lifetime.
     return after==container && cameras.primary==repeated.primary && cameras.secondary==repeated.secondary;
 }
+w3vr::modern_vegetation_view::Context read_remastered_vegetation_context() {
+    return g_remastered_vegetation_context;
+}
+void apply_remastered_vegetation_context(const w3vr::modern_vegetation_view::Context& context) {
+    g_remastered_vegetation_context=context;
+}
+bool read_remastered_scene_vegetation_container(uintptr_t scene,uintptr_t& container) {
+    namespace veg=w3vr::modern_vegetation_view;
+    uintptr_t address{},end{},first{},second{};
+    if (!veg::add(scene,veg::scene_container_offset,address) || !veg::add(address,sizeof(uintptr_t),end))
+        return false;
+    __try {
+        std::memcpy(&first,reinterpret_cast<const void*>(address),sizeof(first));
+        std::memcpy(&second,reinterpret_cast<const void*>(address),sizeof(second));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!first || first!=second) return false;
+    container=first;return true; // Matching samples are not a native lifetime lease.
+}
+void __fastcall hook_remastered_vegetation_preselection(void* container,void* descriptor,void* scene) {
+    namespace veg=w3vr::modern_vegetation_view;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto return_address=reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t caller=module && return_address>=module ? return_address-module : 0;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+    const auto outer=g_remastered_vegetation_context;
+    uintptr_t observed{};veg::Context replacement{};
+    const bool admitted=g_remastered_core_hooks_ready.load(std::memory_order_acquire) &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        caller==veg::preselection_return && veg::accepts(contract,outer,generation) &&
+        read_remastered_scene_vegetation_container(outer.scene,observed) &&
+        veg::bind_preselection(contract,outer,generation,caller,reinterpret_cast<uintptr_t>(container),
+            reinterpret_cast<uintptr_t>(descriptor),reinterpret_cast<uintptr_t>(scene),observed,replacement) &&
+        generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
+        g_remastered_core_hooks_ready.load(std::memory_order_acquire);
+    // Unknown/nested paths get a neutral scope even while an outer normal core
+    // is active. The previous eye/phase is restored after this native call.
+    veg::invoke_preselection(g_remastered_vegetation_preselection,container,descriptor,scene,
+        admitted ? &replacement : nullptr,read_remastered_vegetation_context,apply_remastered_vegetation_context);
+}
 bool __fastcall hook_remastered_vegetation_update(void* receiver,const float* position,
     const float* projection,const float* view,float near_range,float far_range,bool final_mode) {
     namespace veg=w3vr::modern_vegetation_view;
@@ -31792,15 +31833,17 @@ bool install_remastered_render_core_hooks(uint8_t* module) {
     // Keep original trampolines on any partial failure; never remove/null/retry
     // them while entries may be in flight. This is NOT an unload barrier.
     if (!module || g_engine_frame_builder || g_remastered_normal_epilogue ||
-        g_remastered_vegetation_update) return false;
+        g_remastered_vegetation_update || g_remastered_vegetation_preselection) return false;
     struct Hook { uintptr_t rva; void* detour; void** original; std::span<const uint8_t> signature; };
-    const std::array<Hook, 3> hooks{{
+    const std::array<Hook, 4> hooks{{
         {w3vr::render_core::remastered_500c.entry, reinterpret_cast<void*>(&hook_remastered_render_core),
             reinterpret_cast<void**>(&g_engine_frame_builder), w3vr::render_core::modern_entry_signature},
         {w3vr::render_core::normal_epilogue_rva, reinterpret_cast<void*>(&hook_remastered_normal_epilogue),
             reinterpret_cast<void**>(&g_remastered_normal_epilogue), w3vr::render_core::epilogue_entry_signature},
         {w3vr::modern_vegetation_view::update_rva, reinterpret_cast<void*>(&hook_remastered_vegetation_update),
-            reinterpret_cast<void**>(&g_remastered_vegetation_update), w3vr::modern_vegetation_view::entry_signature}}};
+            reinterpret_cast<void**>(&g_remastered_vegetation_update), w3vr::modern_vegetation_view::entry_signature},
+        {w3vr::modern_vegetation_view::preselection_rva, reinterpret_cast<void*>(&hook_remastered_vegetation_preselection),
+            reinterpret_cast<void**>(&g_remastered_vegetation_preselection), w3vr::modern_vegetation_view::preselection_signature}}};
     if (!remastered_normal_epilogue_table_matches(module)) return false;
     for (const auto& hook : hooks)
         if (!remastered_render_entry_matches(module + hook.rva, hook.signature)) return false;
@@ -31819,7 +31862,7 @@ bool install_remastered_render_core_hooks(uint8_t* module) {
         return false;
     }
     g_remastered_core_hooks_ready.store(true, std::memory_order_release);
-    log_line("Remastered core, normal epilogue and primary-eye vegetation adapters installed; GPU completion not implied");
+    log_line("Remastered core, normal epilogue and early/late primary-eye vegetation adapters installed; GPU completion not implied");
     return true;
 }
 
