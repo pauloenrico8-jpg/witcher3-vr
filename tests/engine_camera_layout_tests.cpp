@@ -356,13 +356,15 @@ bool run_copy_camera(copy::Context& context, int index, std::uintptr_t destinati
     bool omit_rebuild = false, bool wrong_return = false) {
     // Fabricated synchronous callbacks. No native game function, resource,
     // headset pose or render output is executed by these tests.
-    copy::CameraScope camera(context, index == 0 ? 0x00324460 : 0x00324473,
+    const auto* profile = context.factory->profile;
+    copy::CameraScope camera(context, profile->camera_returns[index],
         destination + (index == 0 ? 0x10 : 0x5F0),
         source + (index == 0 ? 0x10 : 0x5F0));
     if (!omit_rebuild) {
-        const auto route = copy::observe_rebuild(context, 0x0228AA4F, camera.destination);
+        const auto route = copy::observe_rebuild(context, profile->rebuild_return, camera.destination);
         require(route.stage == stage && route.camera_index == index &&
-            route.eye == eye && route.pair == pair, "Rebuild mixed copy stage, internal record or factory eye");
+            route.eye == eye && route.pair == pair && route.profile == profile,
+            "Rebuild mixed version, copy stage, internal record or factory eye");
     }
     return camera.finish(wrong_return ? camera.destination + 16 : camera.destination);
 }
@@ -535,6 +537,117 @@ void test_copy_context_admission_and_signatures() {
                 "Truncated native prefix accepted");
         }
     }
+}
+
+void test_copy_profiles_never_mix_builds() {
+    using namespace w3vr;
+    const engine_camera::TemporalContract* contracts[] = {&engine_camera::remastered_500c,
+        &engine_camera::remastered_1048522};
+    const copy::Profile* profiles[] = {&copy::remastered_500c, &copy::remastered_1048522};
+    // Independent checked call returns. These are manufactured callbacks,
+    // not executions of the Native addresses, MinHook or GPU work.
+    constexpr std::uintptr_t expected[][6] = {
+        {0x00324430,0x01B8067B,0x01B80709,0x00324460,0x00324473,0x0228AA4F},
+        {0x00322F40,0x01B86F3B,0x01B86FC9,0x00322F70,0x00322F83,0x0229314F}};
+    for (int build : {0,1}) {
+        const auto* p = profiles[build];
+        const auto* other = profiles[1-build];
+        require(copy::selected(contracts[build]) == p &&
+            p->descriptor_copy == expected[build][0] &&
+            p->scratch_return == expected[build][1] &&
+            p->frame_return == expected[build][2] &&
+            p->camera_returns[0] == expected[build][3] &&
+            p->camera_returns[1] == expected[build][4] &&
+            p->rebuild_return == expected[build][5], "Copy profile selected another build");
+        for (int eye : {0,1}) {
+            copy::Context context{};
+            copy::FactoryScope factory(context, contracts[build], input_desc, 901, eye, true, true);
+            require(factory.admitted && factory.profile == p &&
+                run_copy_descriptor(context, p->scratch_return, scratch_desc, input_desc,
+                    copy::Stage::scratch, eye, 901) &&
+                run_copy_descriptor(context, p->frame_return, final_frame+0x10, scratch_desc,
+                    copy::Stage::frame, eye, 901) && factory.finish(final_frame),
+                "Complete own-build copy lineage rejected");
+        }
+        for (int failure = 0; failure < 5; ++failure) {
+            copy::Context context{};
+            copy::FactoryScope factory(context, contracts[build], input_desc, 901, 0, true, true);
+            if (failure == 0) {
+                copy::DescriptorScope wrong(context, other->scratch_return, scratch_desc, input_desc);
+                require(wrong.stage == copy::Stage::unknown && !wrong.finish(scratch_desc),
+                    "Scratch caller from another build accepted");
+            } else if (failure == 4) {
+                require(run_copy_descriptor(context, p->scratch_return, scratch_desc, input_desc,
+                    copy::Stage::scratch, 0, 901), "Own-build scratch fixture failed");
+                copy::DescriptorScope wrong(context, other->frame_return, final_frame+0x10, scratch_desc);
+                require(wrong.stage == copy::Stage::unknown && !wrong.finish(final_frame+0x10),
+                    "Final caller from another build accepted");
+            } else {
+                copy::DescriptorScope descriptor(context, p->scratch_return, scratch_desc, input_desc);
+                if (failure == 1 || failure == 2) {
+                    const int index = failure-1;
+                    if (index == 1) require(run_copy_camera(context, 0, scratch_desc, input_desc,
+                        copy::Stage::scratch, 0, 901), "First own-build camera fixture failed");
+                    copy::CameraScope wrong(context, other->camera_returns[index],
+                        scratch_desc+copy::camera_offsets[index], input_desc+copy::camera_offsets[index]);
+                    require(wrong.index == -1 && !wrong.finish(wrong.destination),
+                        "Internal camera caller from another build accepted");
+                } else {
+                    copy::CameraScope camera(context, p->camera_returns[0], scratch_desc+0x10, input_desc+0x10);
+                    const auto wrong = copy::observe_rebuild(context, other->rebuild_return, camera.destination);
+                    require(wrong.stage == copy::Stage::unknown && !wrong.profile &&
+                        !camera.finish(camera.destination), "Rebuild caller from another build accepted");
+                }
+            }
+            require(!factory.finish(final_frame), "Mixed-build copy produced complete lineage");
+        }
+        const auto copied = *contracts[build];
+        for (const auto* unknown : {static_cast<const engine_camera::TemporalContract*>(nullptr), &copied}) {
+            copy::Context context{};
+            copy::FactoryScope rejected(context, unknown, input_desc, 901, 0, true, true);
+            require(!copy::selected(unknown) && !rejected.admitted && !rejected.profile,
+                "Unknown/copy contract inherited a known copy profile");
+        }
+    }
+    for (int outer_build : {0,1}) {
+        const int inner_build = 1-outer_build;
+        const auto* outer_profile = profiles[outer_build];
+        const auto* inner_profile = profiles[inner_build];
+        copy::Context context{};
+        copy::FactoryScope outer(context, contracts[outer_build], input_desc, 901, 0, true, true);
+        {
+            copy::DescriptorScope descriptor(context, outer_profile->scratch_return, scratch_desc, input_desc);
+            copy::CameraScope camera(context, outer_profile->camera_returns[0], scratch_desc+0x10, input_desc+0x10);
+            {
+                copy::FactoryScope inner(context, contracts[inner_build], 0x700000, 902, 1, true, true);
+                require(copy::observe_rebuild(context, outer_profile->rebuild_return,
+                    camera.destination).stage == copy::Stage::unknown,
+                    "Nested different build inherited the outer camera");
+                require(run_copy_descriptor(context, inner_profile->scratch_return, 0x800000, 0x700000,
+                    copy::Stage::scratch, 1, 902) &&
+                    run_copy_descriptor(context, inner_profile->frame_return, 0x900010, 0x800000,
+                        copy::Stage::frame, 1, 902) && inner.finish(0x900000) &&
+                    !inner.finish(0x900000), "Nested copy mixed profile or finished twice");
+            }
+            require(context.factory == &outer && context.descriptor == &descriptor &&
+                context.camera == &camera && outer.profile == outer_profile,
+                "Nested different build failed to restore exact outer context");
+            const auto route = copy::observe_rebuild(context, outer_profile->rebuild_return, camera.destination);
+            require(route.profile == outer_profile && route.eye == 0 && route.pair == 901 &&
+                camera.finish(camera.destination), "Nested copy changed outer profile, eye or pair");
+            require(run_copy_camera(context, 1, scratch_desc, input_desc, copy::Stage::scratch, 0, 901) &&
+                descriptor.finish(scratch_desc), "Restored outer descriptor failed");
+        }
+        require(run_copy_descriptor(context, outer_profile->frame_return, final_frame+0x10, scratch_desc,
+            copy::Stage::frame, 0, 901) && outer.finish(final_frame), "Restored outer factory failed");
+    }
+    // Declaring the new temporal/copy contract does not silently port other
+    // versioned subsystems or admit the game's global executable preflight.
+    const auto* current = &engine_camera::remastered_1048522;
+    require(!layout::selected(current) && !layout::temporal_writer_rva(current) &&
+        !layout::normal_temporal_route(current, 0x01C1B7B1) &&
+        !engine_camera_authority::selected(current) && !render_core::selected(current),
+        "Camera copy profile silently admitted an unported subsystem");
 }
 
 // Opaque addresses and a manufactured CPU state. No native game calls or GPU
@@ -793,4 +906,7 @@ int main() {
     test_copy_context_rejects_missing_mismatched_and_repeated_steps();
     test_copy_context_admission_and_signatures();
     test_abandoned_copy_scope_restores_context();
+    test_copy_profiles_never_mix_builds();
+    std::cout << "Camera copy lineage checked for both builds, cross-build callers "
+        "rejected and unported subsystems closed (CPU fixtures only).\n";
 }

@@ -27,6 +27,11 @@ inline constexpr TemporalContract legacy_404{0x460, 0x015FE010,
     0x015FE550, 0x015FF640};
 inline constexpr TemporalContract remastered_500c{0x530, 0x02288F00,
     0x0228AB40, 0x0228A970, RecordCopy::remastered_fields};
+// Only this camera subsystem was compared for build 1048522. Other selected()
+// helpers still reject this contract until independently ported. No host or
+// global executable admission is added by declaring the contract.
+inline constexpr TemporalContract remastered_1048522{0x530, 0x02291600,
+    0x02293240, 0x02293070, RecordCopy::remastered_fields};
 inline constexpr std::size_t source_prefix_bytes = 0x38;
 inline constexpr std::size_t record_bytes = 0xB0;
 using TemporalRecord = std::array<std::uint8_t, record_bytes>;
