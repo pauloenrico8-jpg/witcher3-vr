@@ -25,6 +25,23 @@ inline constexpr std::array<std::uint8_t, 16> camera_signature{
     0x40,0x53,0x48,0x83,0xEC,0x30,0x8B,0x02,0x48,0x8B,0xD9,0x89,0x01,0x8B,0x42,0x04};
 inline constexpr std::array<std::uint8_t, 16> rebuild_signature{
     0x48,0x8B,0xC4,0x55,0x53,0x56,0x57,0x48,0x8D,0xA8,0x08,0xFB,0xFF,0xFF,0x48,0x81};
+// Explicit subsystem profiles. Field offsets above are unchanged in the
+// independently compared copy bodies; CALL returns differ by version. Legacy
+// host installers retain their old constants and do not select the new profile.
+struct Profile {
+    std::uintptr_t descriptor_copy, scratch_return, frame_return;
+    std::array<std::uintptr_t, 2> camera_returns;
+    std::uintptr_t rebuild_return;
+};
+inline constexpr Profile remastered_500c{descriptor_copy_rva,
+    scratch_return_rva, frame_return_rva, camera_returns, rebuild_return_rva};
+inline constexpr Profile remastered_1048522{0x00322F40, 0x01B86F3B, 0x01B86FC9,
+    {0x00322F70, 0x00322F83}, 0x0229314F};
+inline const Profile* selected(const engine_camera::TemporalContract* contract) {
+    if (contract == &engine_camera::remastered_500c) return &remastered_500c;
+    if (contract == &engine_camera::remastered_1048522) return &remastered_1048522;
+    return nullptr;
+}
 inline bool signature_matches(std::span<const std::uint8_t> expected,
     std::span<const std::uint8_t> bytes) {
     if (expected.empty() || bytes.size() < expected.size()) return false;
@@ -55,6 +72,7 @@ struct Route {
     int camera_index{-1}; // TWO records within ONE scene, NOT the two HMD eyes.
     int eye{-1};         // Independent factory invocation's externally provided eye.
     std::uint64_t pair{};
+    const Profile* profile{}; // Borrowed static profile, not native ownership.
 };
 
 // Call scopes always mask outer scopes, including when admission fails.
@@ -65,6 +83,7 @@ struct FactoryScope {
     const std::uintptr_t input;
     const std::uint64_t pair;
     const int eye;
+    const Profile* const profile;
     bool admitted;
     bool finished{};
     Phase phase{Phase::awaiting_scratch};
@@ -73,7 +92,7 @@ struct FactoryScope {
         std::uintptr_t descriptor, std::uint64_t pair_id, int eye_id,
         bool normal_producer, bool observers_ready)
         : context(c), previous(c), input(descriptor), pair(pair_id), eye(eye_id),
-          admitted(contract == &engine_camera::remastered_500c &&
+          profile(selected(contract)), admitted(profile != nullptr &&
             normal_producer && observers_ready && range(input) &&
             pair != 0 && pair != UINT64_MAX && eye >= 0 && eye <= 1) {
         context = {this, nullptr, nullptr};
@@ -103,18 +122,19 @@ struct DescriptorScope {
         : context(c), previous(c), factory(c.factory), destination(dst), source(src) {
         context.descriptor = this; context.camera = nullptr;
         if (!factory || !factory->admitted) return;
+        const auto& p = *factory->profile;
         if (!separate(dst, src)) {
-            if (caller == scratch_return_rva || caller == frame_return_rva)
+            if (caller == p.scratch_return || caller == p.frame_return)
                 factory->phase = Phase::broken;
             return;
         }
-        if (caller == scratch_return_rva && factory->phase == Phase::awaiting_scratch &&
+        if (caller == p.scratch_return && factory->phase == Phase::awaiting_scratch &&
             src == factory->input) {
             stage = Stage::scratch; factory->phase = Phase::copying_scratch;
-        } else if (caller == frame_return_rva && factory->phase == Phase::scratch_ready &&
+        } else if (caller == p.frame_return && factory->phase == Phase::scratch_ready &&
             src == factory->scratch && separate(dst, factory->input)) {
             stage = Stage::frame; factory->phase = Phase::copying_frame;
-        } else if (caller == scratch_return_rva || caller == frame_return_rva) {
+        } else if (caller == p.scratch_return || caller == p.frame_return) {
             factory->phase = Phase::broken;
         }
     }
@@ -155,12 +175,13 @@ struct CameraScope {
             context.factory != descriptor->factory || !descriptor->factory->admitted) return;
         const auto expected = descriptor->stage == Stage::scratch ? Phase::copying_scratch : Phase::copying_frame;
         if (descriptor->factory->phase != expected) return;
+        const auto& p = *descriptor->factory->profile;
         for (int i = 0; i < 2; ++i) {
-            if (caller == camera_returns[i] && dst == descriptor->destination + camera_offsets[i] &&
+            if (caller == p.camera_returns[i] && dst == descriptor->destination + camera_offsets[i] &&
                 src == descriptor->source + camera_offsets[i] &&
                 descriptor->camera_mask == (i == 0 ? 0u : 1u)) { index = i; return; }
         }
-        if (caller == camera_returns[0] || caller == camera_returns[1])
+        if (caller == p.camera_returns[0] || caller == p.camera_returns[1])
             descriptor->factory->phase = Phase::broken;
     }
     ~CameraScope() {
@@ -190,12 +211,12 @@ inline Route observe_rebuild(Context& context, std::uintptr_t caller, std::uintp
     if (!factory || !descriptor || !camera || !factory->admitted ||
         camera->descriptor != descriptor || descriptor->factory != factory ||
         camera->index < 0 || camera->finished || descriptor->finished ||
-        caller != rebuild_return_rva) return {};
+        caller != factory->profile->rebuild_return) return {};
     if (view != camera->destination) { factory->phase = Phase::broken; return {}; }
     const auto expected = descriptor->stage == Stage::scratch ? Phase::copying_scratch : Phase::copying_frame;
     if (factory->phase != expected) return {};
     if (camera->observed) { factory->phase = Phase::broken; return {}; }
     camera->observed = true;
-    return {descriptor->stage, camera->index, factory->eye, factory->pair};
+    return {descriptor->stage, camera->index, factory->eye, factory->pair, factory->profile};
 }
 } // namespace w3vr::camera_copy
