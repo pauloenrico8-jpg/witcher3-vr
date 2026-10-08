@@ -6,6 +6,55 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Vegetação recebe a câmera do olho correto — 8 de outubro
+
+Integrei o encaminhamento da câmera principal de cada olho nas duas chamadas
+normais que atualizam a seleção de vegetação. Isso evita usar a lente original
+da câmera secundaria para essas chamadas. O restante da seleção de objetos
+visiveis, as tarefas adiadas e o isolamento dos dados ainda estao pendentes.
+
+O fluxo, passo a passo:
+
+1. A entrada normal que desenha a cena identifica o quadro, o olho e a sessão
+   de VR. Essa identificação vale somente durante a chamada atual. Entradas
+   desconhecidas e chamadas internas de outras rotas não herdam essa permissao.
+2. Nas duas chamadas de vegetação verificadas, confere qual objeto recebera
+   os dados. Lê cópias limitadas das duas câmeras daquele mesmo quadro e
+   verifica se outra leitura entrega os mesmos bytes. Isso detecta mudancas
+   durante a leitura; não prova que o objeto esteja reservado para o mod.
+3. Compara os dados recebidos pela chamada com a câmera secundaria. Se não
+   forem exatamente os esperados, encaminha os dados originais sem correção.
+4. Usa a posição, a direção de visão, a variante correta da lente e a distancia
+   mínima da câmera principal daquele olho. Guarda esses números em cópias
+   próprias que sobrevivem ate a função original terminar. Nao altera os
+   bytes de nenhuma das duas câmeras.
+5. Chama a função original uma vez. Conserva o objeto receptor, o alcance da
+   grade de vegetação, o modo e o resultado original. O alcance da grade
+   continua sendo o do jogo; não é substituído pela distancia máxima da lente.
+6. As tres passagens deste grupo só permitem a adaptacao depois de instaladas
+   e conferidas. Em falha parcial, a permissao fica fechada e os caminhos
+   originais são conservados. Isso ainda não resolve a parada segura do mod.
+
+Escolhi encaminhar os dados da câmera principal porque ela ja recebe a lente
+assimétrica de cada olho. Copiar apenas o campo de visão para a secundaria não
+alinharia a visibilidade quando as câmeras tem posicoes e direcoes diferentes.
+A função do jogo continua calculando seus planos e sua seleção de vegetação.
+
+A DLL compilou e **109/109 testes passaram em 10,28 segundos**. O teste novo passou em **140 verificações no processador**:
+duas lentes e duas variantes de projeção, bordas que a câmera secundaria
+exclui, preservacao do alcance e retorno, cópias independentes das fontes,
+rotas rejeitadas e restauracao da identificação após chamadas internas.
+O modelo de recorte de imagem é independente do encaminhamento testado.
+Nao executou a função nativa de vegetação, o jogo, MinHook ou o Quest.
+
+**Ainda não está jogável; nada instalado e a 5.00c continua bloqueada.**
+Falta provar quando cada tarefa consome os dados de vegetação compartilhados,
+separa-los ou ordenar seu uso por olho, adaptar os demais consumidores de
+visibilidade, historicos e efeitos e resolver a vida útil e a parada dos
+recursos. Depois verificar duas imagens novas por quadro no jogo e realizar
+o primeiro teste de imagem/cabeça no Quest. Mãos, armas e combate físico ainda
+precisam de integracao real. A meta de FPS continua cancelada.
+
 ## Lente própria para cada olho — 7 de outubro, noite
 
 O preparo das cópias privadas agora ajusta também a lente da câmera principal
