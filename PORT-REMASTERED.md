@@ -7,6 +7,35 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Etapa antecipada da visibilidade de vegetação — 8 de outubro
+
+O encaminhamento de câmera agora cobre quatro atualizações normais de
+vegetação: duas na etapa antecipada e duas posteriores. A etapa antecipada
+só recebe autorização durante sua chamada exata dentro do desenho normal,
+com a mesma cena, o mesmo conjunto de vegetação e o descritor daquela imagem.
+Chamadas internas desconhecidas mascaram a identificação anterior e a
+restauram ao terminar. As fases não concedem autorização uma à outra.
+
+As cópias de entrada continuam pertencendo à atualização síncrona atual;
+isso não reserva objetos nativos nem isola dados lidos por tarefas posteriores.
+O agendamento, os argumentos e os resultados originais são conservados. O
+grupo de instalação agora contém quatro passagens e só permite a adaptação
+quando todas foram verificadas e ativadas; falhas parciais mantêm os caminhos
+originais e a admissão fechada. A barreira de descarregamento continua pendente.
+
+DLL compilada; **109/109 CTest em 10,36s**, com 292 verificações CPU de
+vegetação, incluindo geometria independente nas quatro chamadas, duas lentes,
+rejeições entre fases, argumentos intactos e restauração de chamadas internas.
+Não executaram algoritmos nativos, instalação de hooks, jogo, GPU ou Quest.
+
+**Global preflight inalterado; 5.00c/reentrada fechados; nada instalado.**
+Provar separação/consumo/ordem/vida útil dos dados e tarefas compartilhados,
+portar os demais consumidores de visibilidade, históricos, efeitos e recursos
+antes de liberar a execução. Cabeça e imagens novas nos dois olhos devem ser
+verificadas no jogo e Quest; mãos/armas/combate físico ainda precisam de
+integração real. DLSS complementar; sem meta de FPS. Dados novos de análise
+nativa permanecem locais e não foram anexados a esta documentação.
+
 ## Encaminhamento da visibilidade de vegetação por olho — 8 de outubro
 
 `modern_vegetation_view.h` adapta as duas atualizacoes normais de vegetação

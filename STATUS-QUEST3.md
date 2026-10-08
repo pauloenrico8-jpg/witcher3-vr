@@ -6,6 +6,51 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Vegetação na etapa antecipada da câmera — 8 de outubro
+
+A adaptação agora cobre também as duas atualizações antecipadas de vegetação
+na chamada normal que desenha a imagem. Antes, somente as duas posteriores
+recebiam a câmera principal de cada olho. As quatro usam a posição, a direção,
+a variante correta da lente e a distância mínima da câmera daquele olho.
+
+O fluxo, passo a passo:
+
+1. A chamada normal identifica o olho, a imagem e a sessão de VR atual.
+2. Ao entrar na etapa antecipada, confere a origem da chamada, a mesma cena,
+   o conjunto de dados de vegetação dessa cena e o descritor daquela imagem.
+   Um descritor é o conjunto de informações que o jogo recebe para desenhá-la.
+3. Cria uma identificação temporária dessa etapa. Somente as suas duas
+   atualizações podem usar essa identificação; as duas posteriores continuam
+   exigindo o contexto normal. Uma chamada desconhecida recebe um contexto
+   neutro, mesmo quando acontece dentro de outra chamada identificada.
+4. Cada atualização confere os dados originais e usa cópias próprias dos
+   números da câmera principal. Conserva os demais argumentos, o resultado e
+   a quantidade de chamadas da função original. A etapa antecipada conserva
+   seus três argumentos e o agendamento original do jogo.
+5. Ao sair, restaura a identificação anterior, incluindo o olho e a etapa.
+   As quatro passagens deste grupo precisam estar instaladas e conferidas
+   antes de permitir a adaptação. Falha parcial mantém a permissão fechada.
+
+Escolhi uma identificação separada para a etapa antecipada porque apenas
+estar dentro do desenho normal não identifica qual chamada interna pode
+receber a câmera de VR. Isso evita aplicar a correção a outra rota do jogo.
+
+DLL compilada; **109/109 testes passaram em 10,36 segundos**. Os testes de
+vegetação passaram em **292 verificações no processador**: quatro chamadas,
+dois olhos, bordas de lentes distintas, preservação de argumentos e resultados,
+rejeição de cenas/imagens/etapas diferentes e restauração após chamadas internas
+e uma exceção de teste. Uma exceção é uma interrupção controlada do código.
+Não executaram o jogo, suas funções nativas, MinHook nem o Quest.
+
+**Ainda não está jogável; nada instalado e a 5.00c continua bloqueada.**
+Este passo não separa os objetos compartilhados de vegetação nem comprova a
+ordem e a vida útil das tarefas do jogo. Continuam pendentes esses pontos,
+a visibilidade restante, efeitos, históricos, recursos e parada segura.
+Depois verificar duas imagens novas por quadro no jogo e imagem/cabeça no
+Quest, antes de integrar mãos, armas, dano e bloqueio por contato físico.
+DLSS continua complementar; a meta de FPS permanece cancelada. A nova análise
+nativa permanece somente nos arquivos locais, sem publicação desses dados.
+
 ## Vegetação recebe a câmera do olho correto — 8 de outubro
 
 Integrei o encaminhamento da câmera principal de cada olho nas duas chamadas
