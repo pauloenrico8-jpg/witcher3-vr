@@ -7,6 +7,40 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Reserva extra vinculada à fila nativa capturada — 8 de outubro
+
+`modern_command_queue.h` valida a identidade emprestada da fila, seus limites
+e o comando primário ainda não publicado. A integração inclui essa identidade
+no contexto de preparação do par. Exige o comando original dentro do espaço
+da fila, com sua classe, imagem, tamanho e argumento auxiliar esperados.
+Preserva o resultado da construção natural antes de conferir o comando.
+
+A reserva extra usa o alocador nativo com o receptor explicitamente capturado.
+Não consulta novamente uma fila global durante a reserva. Reconhece a função
+pela assinatura conferida, revalida o contexto e conserva argumentos/retorno
+nativos. O alocador original continua administrando reserva, cabeçalhos,
+capacidade e retorno ao começo da memória. Construção, publicação, referências
+e destruição dos comandos continuam no caminho existente.
+
+A identidade ignora contadores e posições que mudam enquanto a fila trabalha.
+Limites usam valores com sinal; capacidade negativa ou insuficiente é rejeitada.
+Conserva a comparação estrita da borda de reserva e a relação entre os limites.
+Essas conferências não são retenção do objeto, leitura atômica, reserva de
+capacidade para toda a preparação, barreira entre consumidores ou conclusão GPU.
+
+DLL compilada; **111/111 CTest em 10,84s**. O teste novo tem **47 verificações
+CPU**, incluindo argumentos/retorno do alocador, fila alterada, estado mutável,
+limites assinados, bordas, comandos estrangeiros e publicação prematura.
+São dados e funções de teste. Não executou o alocador nativo, o jogo, leituras
+SEH do processo, MinHook, GPU ou Quest. Novos dados nativos permanecem locais.
+
+**Global preflight inalterado; 5.00c/reentrada fechados; nada instalado.**
+Provar ciclo de vida da fila, consumidor e tarefas adiadas, capacidade durante
+as chamadas internas de preparação, consumo isolado dos dados e recursos por
+olho, históricos, efeitos e parada segura antes de liberar o teste gráfico.
+Duas imagens novas e cabeça precedem a integração real de mãos/armas/combate
+físico. DLSS complementar; meta de FPS cancelada.
+
 ## Cópia privada da visibilidade mundial usa a câmera primária — 8 de outubro
 
 `modern_world_culling_view.h` identifica a tarefa pela cena e pelo quadro

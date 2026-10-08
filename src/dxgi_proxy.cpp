@@ -32,6 +32,7 @@
 #include "modern_camera_pose.h"
 #include "modern_vegetation_view.h"
 #include "modern_world_culling_view.h"
+#include "modern_command_queue.h"
 #include "engine_render_core.h"
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
@@ -41334,6 +41335,7 @@ bool submit_engine_duplicate_frame(uintptr_t module, void* render_context,
 }
 
 struct RemasteredPreparationContext {
+    w3vr::modern_command_queue::Identity command_queue{};
     void* world_handle{};
     void* world_receiver{};
     void* engine{};
@@ -41341,6 +41343,50 @@ struct RemasteredPreparationContext {
     void* effects_world{};
     bool operator==(const RemasteredPreparationContext&) const = default;
 };
+
+bool read_remastered_command_queue(uintptr_t module,w3vr::modern_command_queue::Identity& result) {
+    namespace cq=w3vr::modern_command_queue;
+    uintptr_t renderer{},queue{},end{},global{};
+    if(!cq::add(module,w3vr::frame_submission::renderer_global_rva,global) ||
+        !cq::add(global,sizeof(renderer),end))return false;
+    std::array<uint8_t,cq::renderer_prefix_bytes> rp{},repeat_rp{};
+    std::array<uint8_t,cq::queue_prefix_bytes> qp{},repeat_qp{};
+    __try {
+        std::memcpy(&renderer,reinterpret_cast<const void*>(global),sizeof(renderer));
+        if(!cq::add(renderer,rp.size(),end))return false;
+        std::memcpy(rp.data(),reinterpret_cast<const void*>(renderer),rp.size());
+        std::memcpy(&queue,rp.data()+cq::renderer_queue_offset,sizeof(queue));
+        if(!cq::add(queue,qp.size(),end))return false;
+        std::memcpy(qp.data(),reinterpret_cast<const void*>(queue),qp.size());
+        std::memcpy(repeat_rp.data(),reinterpret_cast<const void*>(renderer),repeat_rp.size());
+        std::memcpy(repeat_qp.data(),reinterpret_cast<const void*>(queue),repeat_qp.size());
+        uintptr_t renderer_again{};
+        std::memcpy(&renderer_again,reinterpret_cast<const void*>(global),sizeof(renderer_again));
+        if(renderer_again!=renderer)return false;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    cq::Identity first{},second{};
+    if(!cq::read_identity(module,renderer,rp,queue,qp,first) ||
+        !cq::read_identity(module,renderer,repeat_rp,queue,repeat_qp,second) || first!=second)return false;
+    // Compare identity fields only: live budget/count/cursor naturally change.
+    result=first;return true;
+}
+bool remastered_primary_command_matches(const w3vr::modern_command_queue::Identity& queue,
+    void* command,void* frame) {
+    namespace cq=w3vr::modern_command_queue;
+    const auto address=reinterpret_cast<uintptr_t>(command);
+    uintptr_t end{};
+    if(address<16 || !cq::add(address,cq::payload_bytes,end))return false;
+    std::array<uint8_t,16> header{},repeat_header{};
+    std::array<uint8_t,cq::payload_bytes> payload{},repeat_payload{};
+    __try {
+        std::memcpy(header.data(),reinterpret_cast<const void*>(address-16),header.size());
+        std::memcpy(payload.data(),command,payload.size());
+        std::memcpy(repeat_header.data(),reinterpret_cast<const void*>(address-16),repeat_header.size());
+        std::memcpy(repeat_payload.data(),command,repeat_payload.size());
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    return header==repeat_header && payload==repeat_payload && cq::primary_command_matches(queue,
+        address,reinterpret_cast<uintptr_t>(frame),header,payload);
+}
 
 // The native producer supplies CGame as its first argument. In particular,
 // global 5A51930 is NOT established as CGame and must not supply this receiver.
@@ -41383,7 +41429,7 @@ bool read_remastered_preparation_context(uintptr_t module, void* game,
         void* shared_callback{};
         memcpy(&shared_callback, static_cast<const uint8_t*>(context.engine) + 0x40,
             sizeof(shared_callback));
-        return shared_callback == nullptr;
+        return shared_callback == nullptr && read_remastered_command_queue(module,context.command_queue);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         context = {};
         return false;
@@ -41423,12 +41469,27 @@ void invalidate_remastered_prepared_pair(void* owner, void* primary, void* dupli
         static_cast<unsigned long long>(scope->pair_id));
 }
 
+void* allocate_remastered_command_in_captured_queue() {
+    namespace cq=w3vr::modern_command_queue;
+    const auto* scope=g_remastered_producer_scope;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    RemasteredPreparationContext current{};
+    if(!scope || !g_remastered_preparation_hooks_ready.load(std::memory_order_acquire) ||
+        selected_scene_factory_version()!=w3vr::scene_factory::Version::remastered_500c ||
+        !read_remastered_preparation_context(module,scope->game,current) || current!=scope->context)return nullptr;
+    uintptr_t entry{},end{};
+    if(!cq::add(module,cq::payload_allocator_rva,entry) || !cq::add(entry,cq::allocator_signature.size(),end))return nullptr;
+    __try {
+        if(std::memcmp(reinterpret_cast<const void*>(entry),cq::allocator_signature.data(),cq::allocator_signature.size())!=0)return nullptr;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return nullptr;}
+    return cq::allocate_bound(reinterpret_cast<cq::AllocatePayload>(entry),scope->context.command_queue,current.command_queue);
+}
+
 w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(
     uintptr_t module) {
     w3vr::frame_submission::NativeCommandRoute route{};
     if (module == 0) return route;
-    route.allocate = reinterpret_cast<w3vr::frame_submission::AllocateCommand>(
-        module + w3vr::frame_submission::command_allocator_rva);
+    route.allocate = &allocate_remastered_command_in_captured_queue;
     // Use the trampoline, never our command hook recursively.
     route.construct = g_remastered_command_construct;
     route.dispatch = reinterpret_cast<w3vr::frame_submission::DispatchCommand>(
@@ -41493,7 +41554,8 @@ void* __fastcall hook_remastered_command_construct(void* command, void* frame,
         scope->pair.accepts(frame)) {
         RemasteredPreparationContext current{};
         const bool context_matches = read_remastered_preparation_context(
-            module, scope->game, current) && current == scope->context;
+            module, scope->game, current) && current == scope->context && result==command &&
+            remastered_primary_command_matches(current.command_queue,command,frame);
         const auto completion = scope->pair.at_native_command(frame,
             remastered_prepared_command_route(module), context_matches);
         if (completion == w3vr::frame_preparation::PendingPair::Completion::dispatched &&
