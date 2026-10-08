@@ -118,49 +118,49 @@ void observed_generation_is_not_an_address(){
  namespace life=w3vr::modern_queue_lifecycle;
  Fixture f;life::Observations observations;life::Snapshot absent{};absent.revision=0xBAD;
  require(!observations.snapshot(f.identity,absent)&&absent.revision==0xBAD,"late unobserved queue admitted/output overwritten");
- require(!observations.begin(0).revision,"null native memory began a lifetime");
- auto first=observations.begin(f.identity.queue);
+ require(!observations.begin(0,true).revision,"null native memory began a lifetime");
+ auto first=observations.begin(f.identity.queue,true);
  require(first.revision && !observations.snapshot(f.identity,absent),"unfinished constructor admitted");
- require(observations.finish(first,f.identity),"completed constructor not admitted");
+ require(observations.finish(first,f.identity,true),"completed constructor not admitted");
  life::Snapshot snapshot{};require(observations.snapshot(f.identity,snapshot)&&observations.current(snapshot),"current observation lost");
- require(!observations.finish(first,f.identity),"same constructor completed twice");
+ require(!observations.finish(first,f.identity,true),"same constructor completed twice");
  auto changed=f.identity;changed.buffer+=16;
  require(!observations.snapshot(changed,absent),"same pointer hid changed buffer identity");
  observations.retire(f.identity.queue+16);
  require(observations.current(snapshot),"unrelated stop invalidated observed queue");
  observations.retire(f.identity.queue);
  require(!observations.current(snapshot)&&!observations.snapshot(f.identity,absent),"stop left old snapshot current");
- auto second=observations.begin(f.identity.queue);
- require(second.revision!=first.revision&&observations.finish(second,f.identity),"identical reused addresses did not get a new revision");
+ auto second=observations.begin(f.identity.queue,true);
+ require(second.revision!=first.revision&&observations.finish(second,f.identity,true),"identical reused addresses did not get a new revision");
  life::Snapshot renewed{};require(observations.snapshot(f.identity,renewed)&&renewed.revision!=snapshot.revision&&
   !observations.current(snapshot),"byte-identical new allocation inherited old lifetime observation");
  observations.cancel(first);
  require(observations.current(renewed),"stale constructor rejection canceled a newer allocation");
- auto third=observations.begin(f.identity.queue);
+ auto third=observations.begin(f.identity.queue,true);
  observations.retire(f.identity.queue);
- require(!observations.finish(third,f.identity)&&!observations.current(renewed),"stop during construction reopened admission");
- auto fourth=observations.begin(f.identity.queue);auto wrong=f.identity;wrong.queue+=16;
- require(!observations.finish(fourth,wrong),"another queue completed this construction");
+ require(!observations.finish(third,f.identity,true)&&!observations.current(renewed),"stop during construction reopened admission");
+ auto fourth=observations.begin(f.identity.queue,true);auto wrong=f.identity;wrong.queue+=16;
+ require(!observations.finish(fourth,wrong,true),"another queue completed this construction");
  observations.cancel(fourth);
- require(!observations.finish(fourth,f.identity),"canceled constructor later became live");
+ require(!observations.finish(fourth,f.identity,true),"canceled constructor later became live");
  life::Snapshot invalid{};require(!observations.current(invalid),"default snapshot admitted");
- life::Observations saturated(UINT64_MAX-1);auto last=saturated.begin(f.identity.queue);
- require(last.revision==UINT64_MAX-1&&saturated.finish(last,f.identity),"last nonwrapping revision unusable");
+ life::Observations saturated(UINT64_MAX-1);auto last=saturated.begin(f.identity.queue,true);
+ require(last.revision==UINT64_MAX-1&&saturated.finish(last,f.identity,true),"last nonwrapping revision unusable");
  life::Snapshot old{};require(saturated.snapshot(f.identity,old),"last revision not captured");
- require(!saturated.begin(f.identity.queue).revision && !saturated.current(old),"revision wrap/reuse preserved old admission");
+ require(!saturated.begin(f.identity.queue,true).revision && !saturated.current(old),"revision wrap/reuse preserved old admission");
  life::Observations full;
  for(unsigned i=0;i<64;++i){auto identity=f.identity;identity.queue+=i*0x1000;
-  auto construction=full.begin(identity.queue);require(construction.revision&&full.finish(construction,identity),"fixed observation table filled early");}
+  auto construction=full.begin(identity.queue,true);require(construction.revision&&full.finish(construction,identity,true),"fixed observation table filled early");}
  auto extra=f.identity;extra.queue+=64*0x1000;
- require(!full.begin(extra.queue).revision,"observation table exceeded its bound");
+ require(!full.begin(extra.queue,true).revision,"observation table exceeded its bound");
  full.retire(f.identity.queue);
- auto reused=full.begin(extra.queue);require(reused.revision&&full.finish(reused,extra),"retired storage could not be reused");
+ auto reused=full.begin(extra.queue,true);require(reused.revision&&full.finish(reused,extra,true),"retired storage could not be reused");
 }
 void constructor_and_stop_can_race(){
  namespace life=w3vr::modern_queue_lifecycle;
- Fixture f;life::Observations observations;auto pending=observations.begin(f.identity.queue);
+ Fixture f;life::Observations observations;auto pending=observations.begin(f.identity.queue,true);
  std::latch go(1);bool finished{};
- std::thread constructor([&]{go.wait();finished=observations.finish(pending,f.identity);});
+ std::thread constructor([&]{go.wait();finished=observations.finish(pending,f.identity,true);});
  std::thread stop([&]{go.wait();observations.retire(f.identity.queue);});
  go.count_down();constructor.join();stop.join();
  life::Snapshot after{};
@@ -170,7 +170,42 @@ void constructor_and_stop_can_race(){
  (void)finished;
 }
 
+void partial_activation_cannot_adopt_an_earlier_construction(){
+ namespace life=w3vr::modern_queue_lifecycle;
+ Fixture f;life::Observations observations;life::Snapshot untouched{};untouched.revision=0xBAD;
+ auto early=observations.begin(f.identity.queue,false);
+ require(!early.queue && !early.revision,"partial activation issued a construction ticket");
+ require(!observations.finish(early,f.identity,false),"partial installation completed a construction");
+ require(!observations.finish(early,f.identity,true),"activation during native construction admitted its earlier entry");
+ require(!observations.snapshot(f.identity,untouched)&&untouched.revision==0xBAD,"rejected early entry changed snapshot output");
+ auto admitted=observations.begin(f.identity.queue,true);
+ require(admitted.revision==1 && observations.finish(admitted,f.identity,true),"early rejection consumed first revision or blocked ready entry");
+ life::Snapshot prior{};require(observations.snapshot(f.identity,prior),"ready construction snapshot absent");
+ // Closed entry must invalidate a previous allocation at the same address.
+ auto closed_reuse=observations.begin(f.identity.queue,false);
+ require(!closed_reuse.revision && !observations.current(prior),"closed reused address kept old admission");
+ require(!observations.finish(closed_reuse,f.identity,true),"closed address reuse gained a late ticket");
+ auto pending=observations.begin(f.identity.queue,true);
+ require(!observations.finish(pending,f.identity,false),"closed exit admitted ready entry");
+ require(!observations.finish(pending,f.identity,true),"rejected closed exit was revived on later activation");
+ require(!observations.snapshot(f.identity,untouched),"closed exit left a complete record");
+ auto replaced=observations.begin(f.identity.queue,true);
+ auto replacement=observations.begin(f.identity.queue,true);
+ require(replacement.revision!=replaced.revision && observations.finish(replacement,f.identity,true),"new construction lost its own revision");
+ life::Snapshot renewed{};require(observations.snapshot(f.identity,renewed),"replacement observation absent");
+ require(!observations.finish(replaced,f.identity,false)&&observations.current(renewed),"old closed exit canceled a newer construction");
+ // Observe admission independently for two queues; rejecting one cannot adopt
+ // or cancel another owner's construction when activation completes.
+ auto other=f.identity;other.queue+=0x1000;
+ auto other_early=observations.begin(other.queue,false);
+ require(!observations.finish(other_early,other,true)&&observations.current(renewed),"another early queue changed admitted queue");
+ auto other_ready=observations.begin(other.queue,true);
+ require(observations.finish(other_ready,other,true),"new ready queue rejected after earlier closed entry");
+ observations.retire(other.queue);
+ require(!observations.finish(other_ready,other,true)&&observations.current(renewed),"stop reopened construction or affected another owner");
+}
+
 }
 int main(){valid_binding_and_mutable_cursor();reject_corrupt_identity();reject_foreign_or_published_primary();
- construction_reading_before_owner_store();observed_generation_is_not_an_address();constructor_and_stop_can_race();
+ construction_reading_before_owner_store();observed_generation_is_not_an_address();constructor_and_stop_can_race();partial_activation_cannot_adopt_an_earlier_construction();
  std::printf("Modern captured native queue: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;}
