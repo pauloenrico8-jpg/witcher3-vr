@@ -6,6 +6,56 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Construção, parada e reutilização da fila — 8 de outubro
+
+O mod agora exige uma construção observada da fila e uma identificação nova
+para cada construção. Um endereço de memória pode ser reutilizado pelo jogo;
+mesmo endereço e mesmos números não significam a mesma fila de antes.
+
+O fluxo, passo a passo:
+
+1. Ao entrar no construtor original, invalida a observação anterior daquele
+   endereço e reserva uma identificação nova. Ainda não permite a imagem extra.
+2. Chama o construtor original uma vez, conservando seus argumentos e resultado.
+   Nas duas rotas admitidas, confere a fila e seu responsável depois da construção.
+   Nesse momento, o chamador ainda não guardou a fila em seu campo normal;
+   a conferência usa o responsável que o próprio construtor registrou.
+3. Só conclui aquela identificação se a construção ainda for a mesma e estiver
+   válida. Uma parada durante a construção impede que ela seja reaberta depois.
+   Rejeitar uma construção antiga não cancela uma nova que reutilizou o endereço.
+4. Antes da rotina original de parada ou destruição observada, fecha a observação.
+   O jogo conserva seus comandos, esperas, argumentos de destruição e resultado.
+   O mod não mantém seu bloqueio interno enquanto essas rotinas originais executam.
+5. A preparação das duas imagens exige a mesma identificação da fila. Uma fila
+   não observada, substituída ou parada impede a preparação extra. As três
+   passagens precisam estar instaladas e conferidas para permitir essa adaptação.
+
+Escolhi uma identificação por construção porque comparar só endereços e números
+poderia aceitar uma nova alocação como se ainda fosse a antiga. O registro usa
+armazenamento limitado e fecha a permissão em vez de repetir identificações.
+Também corrigi a falha parcial das passagens de preparação: conserva os caminhos
+originais, cancela sua ativação e impede nova tentativa no conjunto parcial.
+
+Isso é uma observação, não uma reserva da vida útil da fila: ela pode parar depois
+da conferência. Ainda faltam todas as rotas de liberação, a proteção das chamadas
+em andamento, a ordem e o consumo dos dados de cada olho e o término do uso pela
+placa de vídeo. Conservar caminhos originais não prova parada segura da DLL.
+Filas já existentes quando esses observadores entram não são aceitas por amostragem.
+
+DLL compilada; **111/111 testes passaram em 10,68 segundos**. O teste da fila
+passou em **150 verificações no processador**, incluindo construção ainda sem o
+campo publicado, endereço reutilizado com dados idênticos, cancelamento antigo,
+limites do registro, identificação sem repetição e parada concorrente à conclusão.
+Não executaram o jogo, suas funções nativas, as leituras do processo, a instalação
+ou falha real de MinHook, a placa de vídeo nem o Quest.
+
+**Ainda não está jogável; nada instalado e a 5.00c continua bloqueada.**
+A próxima etapa continua sendo fechar a vida útil e a ordem dos recursos para
+verificar duas imagens novas por quadro no jogo e depois imagem/cabeça no Quest.
+Mãos, armas, dano e bloqueio por contato continuam exigindo integração real.
+DLSS é complementar; a meta de FPS permanece cancelada. Novas análises nativas
+permanecem somente nos arquivos locais.
+
 ## Segunda imagem vinculada à fila da primeira — 8 de outubro
 
 A reserva do comando extra agora usa explicitamente a fila identificada na
