@@ -157,7 +157,7 @@ void test_version_specific_history_boundaries() {
     for (std::size_t index = 0; index < record.size(); ++index) {
         record[index] = static_cast<std::uint8_t>((index % 254) + 1);
     }
-    for (const auto& contract : {camera::legacy_404, camera::remastered_500c}) {
+    for (const auto& contract : {camera::legacy_404, camera::remastered_500c, camera::remastered_1048522}) {
         const auto end = contract.previous_record_offset + camera::record_bytes;
         std::vector<std::uint8_t> view(end + 32, 0xA7);
         require(camera::write_previous_record(view, contract, record),
@@ -211,31 +211,33 @@ void test_version_specific_history_boundaries() {
 }
 
 void test_remastered_reset_preserves_native_padding() {
-    camera::TemporalRecord reset;
-    for (std::size_t i = 0; i < reset.size(); ++i) reset[i] = std::uint8_t(i + 1);
-    reset[0] = 0; // Explicit, complete reset input, not a failed builder output.
-    std::vector<std::uint8_t> view(0x600, 0xD7);
-    require(camera::write_previous_record(view, camera::remastered_500c, reset),
-        "Explicit Remastered camera reset rejected");
-    require(view[0x530] == 0, "Previous-camera validity was not reset");
-    for (std::size_t i = 0; i < view.size(); ++i) {
-        const bool in_record = i >= 0x530 && i < 0x5E0;
-        const auto r = in_record ? i - 0x530 : 0;
-        const bool field = r == 0 || (r >= 4 && r < 12) ||
-            (r >= 16 && r < 44) || (r >= 48 && r < 176);
-        require(view[i] == (in_record && field ? reset[r] : 0xD7),
-            "Reset omitted a native field or changed padding/another camera field");
+    for (const auto& contract : {camera::remastered_500c, camera::remastered_1048522}) {
+        camera::TemporalRecord reset;
+        for (std::size_t i = 0; i < reset.size(); ++i) reset[i] = std::uint8_t(i + 1);
+        reset[0] = 0; // Explicit, complete reset input, not a failed builder output.
+        std::vector<std::uint8_t> view(0x600, 0xD7);
+        require(camera::write_previous_record(view, contract, reset),
+            "Explicit Remastered camera reset rejected");
+        require(view[0x530] == 0, "Previous-camera validity was not reset");
+        for (std::size_t i = 0; i < view.size(); ++i) {
+            const bool in_record = i >= 0x530 && i < 0x5E0;
+            const auto r = in_record ? i - 0x530 : 0;
+            const bool field = r == 0 || (r >= 4 && r < 12) ||
+                (r >= 16 && r < 44) || (r >= 48 && r < 176);
+            require(view[i] == (in_record && field ? reset[r] : 0xD7),
+                "Reset omitted a native field or changed padding/another camera field");
+        }
+        const auto original = view;
+        require(!camera::write_previous_record(std::span<std::uint8_t>(view).first(0x5DF),
+            contract, reset), "Truncated reset destination accepted");
+        require(view == original, "Rejected reset was partly written");
     }
-    const auto original = view;
-    require(!camera::write_previous_record(std::span<std::uint8_t>(view).first(0x5DF),
-        camera::remastered_500c, reset), "Truncated reset destination accepted");
-    require(view == original, "Rejected reset was partly written");
 }
 
 void test_overlapping_record_source_is_staged() {
     camera::TemporalRecord input;
     for (std::size_t i = 0; i < input.size(); ++i) input[i] = std::uint8_t(i + 1);
-    for (const auto& contract : {camera::legacy_404, camera::remastered_500c}) {
+    for (const auto& contract : {camera::legacy_404, camera::remastered_500c, camera::remastered_1048522}) {
         for (const int displacement : {-64, -16, -1, 0, 1, 16, 64}) {
             const auto destination = contract.previous_record_offset;
             const auto source = std::size_t(std::ptrdiff_t(destination) + displacement);
@@ -268,7 +270,7 @@ int main() {
     test_version_specific_history_boundaries();
     test_remastered_reset_preserves_native_padding();
     test_overlapping_record_source_is_staged();
-    std::cout << "Camera ABI argument order, staged failures and both version-specific "
-        "history boundaries, Remastered field/reset copies and 14 overlapping copies "
+    std::cout << "Camera ABI argument order, staged failures and three version-specific "
+        "history boundaries, Remastered field/reset copies and 21 overlapping copies "
         "passed (simulated native function only).\n";
 }
