@@ -40,13 +40,17 @@ struct FrameLabel {
     int eye{-1};
     bool view_valid{}, normal_factory_lineage{};
 };
-inline bool accepts_frame_label(std::uintptr_t renderer, std::uintptr_t frame,
+inline bool accepts_frame_identity(std::uintptr_t frame,
     const FrameLabel* label, std::uint32_t current_generation) {
-    return renderer != 0 && frame != 0 && label && label->frame == frame &&
+    return frame != 0 && label && label->frame == frame &&
         label->generation != 0 && label->generation == current_generation &&
         label->pair != 0 && label->pair != UINT64_MAX &&
         label->eye >= 0 && label->eye <= 1 && label->view_valid &&
         label->normal_factory_lineage;
+}
+inline bool accepts_frame_label(std::uintptr_t renderer, std::uintptr_t frame,
+    const FrameLabel* label, std::uint32_t current_generation) {
+    return renderer != 0 && accepts_frame_identity(frame,label,current_generation);
 }
 inline bool accepts_label(const engine_camera::TemporalContract* contract,
     std::uintptr_t caller, std::uintptr_t renderer, std::uintptr_t frame,

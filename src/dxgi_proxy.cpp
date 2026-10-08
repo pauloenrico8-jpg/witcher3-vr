@@ -31,6 +31,7 @@
 #include "engine_camera_copy_context.h"
 #include "modern_camera_pose.h"
 #include "modern_vegetation_view.h"
+#include "modern_world_culling_view.h"
 #include "engine_render_core.h"
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
@@ -2340,6 +2341,8 @@ std::atomic<bool> g_remastered_core_hooks_ready{};
 w3vr::modern_vegetation_view::NativeUpdate g_remastered_vegetation_update{};
 w3vr::modern_vegetation_view::NativePreselection g_remastered_vegetation_preselection{};
 thread_local w3vr::modern_vegetation_view::Context g_remastered_vegetation_context{};
+w3vr::world_culling_view::NativeConsumer g_remastered_world_culling{};
+thread_local w3vr::world_culling_view::Context g_remastered_world_culling_context{};
 using EngineTemporalWriterFn = void(__fastcall*)(
     void*, float, float, uint32_t, uint32_t);
 EngineTemporalWriterFn g_engine_temporal_writer{};
@@ -31828,14 +31831,59 @@ bool __fastcall hook_remastered_vegetation_update(void* receiver,const float* po
     // shared receiver caches and downstream worker ordering remain unported.
 }
 
+w3vr::world_culling_view::Context read_remastered_world_culling_context() {
+    return g_remastered_world_culling_context;
+}
+void apply_remastered_world_culling_context(const w3vr::world_culling_view::Context& context) {
+    g_remastered_world_culling_context=context;
+}
+bool read_remastered_world_culling_manager(uintptr_t scene,uintptr_t& manager) {
+    namespace world=w3vr::world_culling_view;
+    uintptr_t address{},end{},first{},second{};
+    if(!world::add(scene,world::scene_manager_offset,address) || !world::add(address,sizeof(uintptr_t),end))return false;
+    __try {
+        std::memcpy(&first,reinterpret_cast<const void*>(address),sizeof(first));
+        std::memcpy(&second,reinterpret_cast<const void*>(address),sizeof(second));
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    if(!first || first!=second)return false;
+    manager=first;return true;
+}
+void __fastcall hook_remastered_world_culling(void* manager,void* scene,void* frame) {
+    namespace world=w3vr::world_culling_view;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto return_address=reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t caller=module && return_address>=module?return_address-module:0;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+    EngineFrameTag tag{};bool found{};
+    if(caller==world::consumer_return && frame) {
+        std::lock_guard<std::mutex> lock(g_engine_dual_frame_mutex);
+        const auto it=g_engine_dual_frame_eyes.find(frame);
+        if(it!=g_engine_dual_frame_eyes.end()) {tag=it->second;found=true;}
+    }
+    const w3vr::render_core::FrameLabel label{reinterpret_cast<uintptr_t>(frame),tag.generation,
+        tag.pair_id,static_cast<int>(tag.eye),tag.render_view_valid,tag.modern_camera_lineage_complete};
+    uintptr_t observed{};world::Context replacement{};
+    const bool admitted=found && g_remastered_core_hooks_ready.load(std::memory_order_acquire) &&
+        g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire) &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        read_remastered_world_culling_manager(reinterpret_cast<uintptr_t>(scene),observed) &&
+        world::bind(contract,caller,reinterpret_cast<uintptr_t>(manager),reinterpret_cast<uintptr_t>(scene),
+            reinterpret_cast<uintptr_t>(frame),label,generation,observed,replacement) &&
+        generation==g_streamline_capture_generation.load(std::memory_order_acquire);
+    // This worker receives its actual native frame/scene. Do not borrow a core
+    // thread's TLS label. Unknown/nested consumers mask and restore this scope.
+    world::invoke(g_remastered_world_culling,manager,scene,frame,admitted?&replacement:nullptr,
+        read_remastered_world_culling_context,apply_remastered_world_culling_context);
+}
 bool install_remastered_render_core_hooks(uint8_t* module) {
     if (g_remastered_core_hooks_ready.load(std::memory_order_acquire)) return true;
     // Keep original trampolines on any partial failure; never remove/null/retry
     // them while entries may be in flight. This is NOT an unload barrier.
     if (!module || g_engine_frame_builder || g_remastered_normal_epilogue ||
-        g_remastered_vegetation_update || g_remastered_vegetation_preselection) return false;
+        g_remastered_vegetation_update || g_remastered_vegetation_preselection || g_remastered_world_culling) return false;
     struct Hook { uintptr_t rva; void* detour; void** original; std::span<const uint8_t> signature; };
-    const std::array<Hook, 4> hooks{{
+    const std::array<Hook, 5> hooks{{
         {w3vr::render_core::remastered_500c.entry, reinterpret_cast<void*>(&hook_remastered_render_core),
             reinterpret_cast<void**>(&g_engine_frame_builder), w3vr::render_core::modern_entry_signature},
         {w3vr::render_core::normal_epilogue_rva, reinterpret_cast<void*>(&hook_remastered_normal_epilogue),
@@ -31843,7 +31891,9 @@ bool install_remastered_render_core_hooks(uint8_t* module) {
         {w3vr::modern_vegetation_view::update_rva, reinterpret_cast<void*>(&hook_remastered_vegetation_update),
             reinterpret_cast<void**>(&g_remastered_vegetation_update), w3vr::modern_vegetation_view::entry_signature},
         {w3vr::modern_vegetation_view::preselection_rva, reinterpret_cast<void*>(&hook_remastered_vegetation_preselection),
-            reinterpret_cast<void**>(&g_remastered_vegetation_preselection), w3vr::modern_vegetation_view::preselection_signature}}};
+            reinterpret_cast<void**>(&g_remastered_vegetation_preselection), w3vr::modern_vegetation_view::preselection_signature},
+        {w3vr::world_culling_view::consumer_rva,reinterpret_cast<void*>(&hook_remastered_world_culling),
+            reinterpret_cast<void**>(&g_remastered_world_culling),w3vr::world_culling_view::entry_signature}}};
     if (!remastered_normal_epilogue_table_matches(module)) return false;
     for (const auto& hook : hooks)
         if (!remastered_render_entry_matches(module + hook.rva, hook.signature)) return false;
@@ -31862,7 +31912,7 @@ bool install_remastered_render_core_hooks(uint8_t* module) {
         return false;
     }
     g_remastered_core_hooks_ready.store(true, std::memory_order_release);
-    log_line("Remastered core, normal epilogue and early/late primary-eye vegetation adapters installed; GPU completion not implied");
+    log_line("Remastered core, epilogue and primary-eye vegetation/world visibility adapters installed; GPU completion not implied");
     return true;
 }
 
@@ -40658,11 +40708,43 @@ void install_engine_view_factory_probe() {
 // gameplay FOV. The temporal record at source+0x468 must remain the corrected
 // per-eye VR history used for DLSS motion. Visible projection, matrices and
 // view+0x2B0 stay untouched.
+bool select_remastered_world_culling_camera(uintptr_t caller,uintptr_t destination,uintptr_t source,
+    uintptr_t& result) {
+    namespace world=w3vr::world_culling_view;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+    const auto context=g_remastered_world_culling_context;
+    if(caller!=world::camera_copy_return || !world::accepts(contract,context,generation) ||
+        !g_remastered_core_hooks_ready.load(std::memory_order_acquire) ||
+        !g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire) ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire))return false;
+    uintptr_t p{},s{},end{},observed{};
+    if(!world::add(context.frame,world::primary_offset,p) || !world::add(context.frame,world::secondary_offset,s) ||
+        !world::add(s,world::camera_bytes,end) || source!=s ||
+        !read_remastered_world_culling_manager(context.scene,observed) || observed!=context.manager)return false;
+    std::array<uint8_t,world::camera_bytes> primary{},secondary{},repeat_primary{},repeat_secondary{};
+    __try {
+        std::memcpy(primary.data(),reinterpret_cast<const void*>(p),primary.size());
+        std::memcpy(secondary.data(),reinterpret_cast<const void*>(s),secondary.size());
+        std::memcpy(repeat_primary.data(),reinterpret_cast<const void*>(p),repeat_primary.size());
+        std::memcpy(repeat_secondary.data(),reinterpret_cast<const void*>(s),repeat_secondary.size());
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    uintptr_t candidate{};
+    if(primary!=repeat_primary || secondary!=repeat_secondary ||
+        !world::select_primary(contract,context,generation,caller,destination,source,primary,secondary,candidate) ||
+        generation!=g_streamline_capture_generation.load(std::memory_order_acquire) ||
+        !g_remastered_core_hooks_ready.load(std::memory_order_acquire) ||
+        !g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire))return false;
+    result=candidate;return true; // Still no native allocation lease or queued resource proof.
+}
 float* invoke_remastered_camera_copy(float* destination, const float* source,
     uintptr_t caller_rva) {
     w3vr::camera_copy::CameraScope scope(g_remastered_camera_copy_context, caller_rva,
         reinterpret_cast<uintptr_t>(destination), reinterpret_cast<uintptr_t>(source));
-    float* result = g_engine_view_copy_rebuild(destination, source);
+    uintptr_t selected_source{};
+    select_remastered_world_culling_camera(caller_rva,
+        reinterpret_cast<uintptr_t>(destination),reinterpret_cast<uintptr_t>(source),selected_source);
+    float* result=w3vr::world_culling_view::invoke_copy(g_engine_view_copy_rebuild,destination,source,selected_source);
     scope.finish(reinterpret_cast<uintptr_t>(result));
     return result;
 }
