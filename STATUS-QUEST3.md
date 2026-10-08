@@ -6,6 +6,51 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Segunda imagem vinculada à fila da primeira — 8 de outubro
+
+A reserva do comando extra agora usa explicitamente a fila identificada na
+construção da primeira imagem. Antes, procurava novamente a fila global, o que
+poderia selecionar outra fila se o jogo a trocasse entre as duas chamadas.
+Uma fila é o conjunto de tarefas que aguardam processamento pelo jogo.
+
+O fluxo, passo a passo:
+
+1. Ao preparar o par de imagens, confere o responsável pelo desenho, a classe
+   da fila, seu espaço de memória e os limites que o jogo registrou. Guarda
+   somente essa identificação; não cria uma fila nem copia objetos do jogo.
+2. Quando o jogo constrói o comando da primeira imagem, confere que ele está
+   no espaço daquela fila, contém a imagem esperada e ainda não foi liberado
+   para processamento. Comandos de outras imagens ou já liberados não servem.
+3. Antes da reserva extra, lê novamente a identificação e os dados da cena.
+   Os contadores de tarefas e a posição de leitura podem mudar normalmente;
+   eles não são confundidos com uma troca de fila.
+4. Usa a função original de reserva com o endereço daquela fila. O jogo
+   continua administrando seus espaços, retornos ao começo da memória,
+   construção dos comandos, referências e liberação. Limites negativos ou
+   insuficientes e uma fila diferente impedem essa reserva extra.
+5. Se rejeitada, a rotina existente cancela a segunda imagem e libera somente
+   a referência que pertence ao mod. A imagem original permanece com o jogo.
+
+Escolhi vincular a reserva ao receptor já conferido para não depender de uma
+segunda busca global durante o envio. Isso não reserva a vida útil da fila,
+comprova consumidor único nem encerra o uso dos recursos pela placa de vídeo.
+A capacidade mínima conferida não garante espaço para todas as tarefas internas
+que a preparação da imagem possa criar. Esses pontos continuam pendentes.
+
+DLL compilada; **111/111 testes passaram em 10,84 segundos**. O teste novo
+passou em **47 verificações no processador**: identidade, mudança de fila,
+contadores que podem variar, limites negativos/insuficientes, borda de retorno
+da memória, comando de outra imagem ou já liberado e preservação dos argumentos
+e do retorno da função de reserva. Usa dados e funções de teste; não executou
+o jogo, suas funções nativas, leituras do processo ou o Quest.
+
+**Ainda não está jogável; nada instalado e a 5.00c continua bloqueada.**
+Faltam vida útil, consumo e ordem das tarefas/recursos, demais efeitos,
+históricos e parada segura, antes de verificar duas imagens novas por quadro
+no jogo e imagem/cabeça no Quest. Mãos, armas, dano e bloqueio físico continuam
+exigindo integração real. DLSS complementar; meta de FPS cancelada. Dados
+novos da análise nativa permanecem somente nos arquivos locais.
+
 ## Câmera do olho na seleção de objetos do mundo — 8 de outubro
 
 A seleção de objetos do mundo agora encaminha a câmera principal de cada olho
