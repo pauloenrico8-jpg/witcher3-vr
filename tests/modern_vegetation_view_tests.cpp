@@ -67,14 +67,21 @@ std::array<double,4> world_point(int eye,double tangent_x,double tangent_y,doubl
     return {x*c+depth*s+(eye==0?-.032:.032),y+2,-x*s+depth*c+12,1};
 }
 void test_routing_and_boundary_geometry() {
-    for(int eye:{0,1})for(int variant:{0,1}) {
+    for(int eye:{0,1})for(int variant:{0,1})for(int early:{0,1}) {
         auto primary=camera(true,eye),secondary=camera(false,eye);const auto before_primary=primary,before_secondary=secondary;
         const auto route=variant?veg::Route::renderer_projection:veg::Route::ordinary_projection;
-        const auto caller=variant?0x1C14D79:0x1C14D43;const std::uintptr_t container=0x400000;
+        const std::uintptr_t caller=early?(variant?0x1CE6379:0x1CE6345):(variant?0x1C14D79:0x1C14D43);
+        const std::uintptr_t container=0x400000;auto ctx=context(eye);
+        if(early) {
+            veg::Context bound{};
+            require(veg::bind_preselection(&cam::remastered_500c,ctx,7,veg::preselection_return,
+                container,ctx.frame+veg::frame_descriptor_offset,ctx.scene,container,bound),"early parent scope rejected");
+            ctx=bound;
+        }
         const auto receiver=container+(variant?0x794:0x4BC);veg::Inputs incoming{},output{},expected{};
         require(veg::read_inputs(secondary,route,incoming),"secondary fixture");
         require(veg::read_inputs(primary,route,expected),"primary fixture");
-        require(veg::prepare(&cam::remastered_500c,context(eye),7,caller,container,receiver,incoming,false,
+        require(veg::prepare(&cam::remastered_500c,ctx,7,caller,container,receiver,incoming,false,
             primary,secondary,output),"known core route rejected");
         require(veg::same(output,expected),"primary position/view/projection/near not routed");
         record={};calls=0;record.result=eye==0;const float grid_far=4096.f;
@@ -165,6 +172,85 @@ void test_nested_core_masks_and_restores() {
         &outer.label,7,context(0),veg::Context{},read_context,apply_context);
     require(current_context.label.eye==1,"accepted nested core did not restore outer eye");
 }
+bool equal_context(const veg::Context& a,const veg::Context& b) {
+    return a.renderer==b.renderer && a.frame==b.frame && a.scene==b.scene &&
+        a.label.frame==b.label.frame && a.label.generation==b.label.generation &&
+        a.label.pair==b.label.pair && a.label.eye==b.label.eye &&
+        a.label.view_valid==b.label.view_valid && a.label.normal_factory_lineage==b.label.normal_factory_lineage &&
+        a.normal_core==b.normal_core && a.phase==b.phase && a.early_container==b.early_container;
+}
+int parent_calls{};void* seen_container{};void* seen_descriptor{};void* seen_scene{};
+veg::Context expected_parent{};bool nested_parent{},throw_parent{};
+void preselection_probe(void* container,void* descriptor,void* scene) {
+    ++parent_calls;seen_container=container;seen_descriptor=descriptor;seen_scene=scene;
+    require(equal_context(current_context,expected_parent),"preselection inherited wrong phase/frame/eye");
+    if(nested_parent) {
+        nested_parent=false;const auto outer=current_context;expected_parent={};
+        veg::invoke_preselection(preselection_probe,nullptr,nullptr,nullptr,nullptr,read_context,apply_context);
+        require(equal_context(current_context,outer),"unknown nested preselection failed to restore early eye");
+    }
+    if(throw_parent) {throw_parent=false;throw 23;}
+}
+void test_preselection_scope_and_cross_phase_rejections() {
+    const auto outer=context(1);veg::Context bound{};
+    require(veg::bind_preselection(&cam::remastered_500c,outer,7,veg::preselection_return,
+        0x400000,0x200010,0x300000,0x400000,bound),"valid early scope failed");
+    require(bound.phase==veg::Phase::preselection && bound.early_container==0x400000 &&
+        bound.label.eye==1 && bound.label.pair==outer.label.pair,"early scope lost actual identity");
+    for(int failure=0;failure<17;++failure) {
+        auto ctx=outer;auto contract=&cam::remastered_500c;std::uint32_t generation=7;
+        std::uintptr_t caller=veg::preselection_return,container=0x400000,descriptor=0x200010,
+            scene=0x300000,observed=0x400000;
+        switch(failure) {
+        case 0:contract=nullptr;break;case 1:contract=&cam::legacy_404;break;
+        case 2:ctx.normal_core=false;break;case 3:ctx.scene=0;break;
+        case 4:ctx.frame+=16;break;case 5:generation=8;break;
+        case 6:caller+=1;break;case 7:container=0;break;case 8:observed+=16;break;
+        case 9:descriptor-=16;break;case 10:scene+=16;break;case 11:ctx.phase=veg::Phase::preselection;break;
+        case 12:ctx.label.normal_factory_lineage=false;break;case 13:ctx.label.view_valid=false;break;
+        case 14:ctx.label.eye=2;break;case 15:ctx.label.pair=0;break;
+        case 16:ctx.frame=ctx.label.frame=UINTPTR_MAX-8;descriptor=7;break;
+        }
+        auto out=bound,saved=out;
+        require(!veg::bind_preselection(contract,ctx,generation,caller,container,descriptor,scene,observed,out),
+            "invalid early parent admitted");
+        require(equal_context(out,saved),"rejected early parent changed published scope");
+    }
+    const auto primary=camera(true,1),secondary=camera(false,1);
+    for(int variant:{0,1}) {
+        const auto route=variant?veg::Route::renderer_projection:veg::Route::ordinary_projection;
+        veg::Inputs incoming{};veg::read_inputs(secondary,route,incoming);
+        for(int failure=0;failure<4;++failure) {
+            auto ctx=failure==0?outer:bound;
+            std::uintptr_t caller=variant?0x1CE6379:0x1CE6345;
+            if(failure==1)caller=variant?0x1C14D79:0x1C14D43;
+            if(failure==2)ctx.early_container+=16;
+            if(failure==3)ctx.phase=static_cast<veg::Phase>(99);
+            auto out=incoming,saved=out;
+            require(!veg::prepare(&cam::remastered_500c,ctx,7,caller,0x400000,
+                variant?0x400794:0x4004BC,incoming,false,primary,secondary,out),"cross-phase update admitted");
+            require(veg::same(out,saved),"cross-phase rejection changed output");
+        }
+    }
+    current_context=outer;expected_parent=bound;parent_calls=0;nested_parent=false;
+    auto c=reinterpret_cast<void*>(0x400000),d=reinterpret_cast<void*>(0x200010),v=reinterpret_cast<void*>(0x300000);
+    veg::invoke_preselection(preselection_probe,c,d,v,&bound,read_context,apply_context);
+    require(parent_calls==1 && seen_container==c && seen_descriptor==d && seen_scene==v,"parent native arguments/count changed");
+    require(equal_context(current_context,outer),"accepted early parent lost outer normal eye");
+    expected_parent={};parent_calls=0;
+    veg::invoke_preselection(preselection_probe,nullptr,d,nullptr,nullptr,read_context,apply_context);
+    require(parent_calls==1 && seen_container==nullptr && seen_descriptor==d && seen_scene==nullptr,
+        "unknown parent arguments/count changed");
+    require(equal_context(current_context,outer),"unknown parent lost outer eye");
+    expected_parent=bound;parent_calls=0;nested_parent=true;
+    veg::invoke_preselection(preselection_probe,c,d,v,&bound,read_context,apply_context);
+    require(parent_calls==2 && equal_context(current_context,outer),"nested early parent changed count/restore");
+    expected_parent=bound;throw_parent=true;bool caught{};
+    try {veg::invoke_preselection(preselection_probe,c,d,v,&bound,read_context,apply_context);}
+    catch(int error){caught=error==23;}
+    require(caught && equal_context(current_context,outer),"CPU exception did not preserve propagation/restore");
+}
 }
 int main(){test_routing_and_boundary_geometry();test_rejections_preserve_output();test_nested_core_masks_and_restores();
+    test_preselection_scope_and_cross_phase_rejections();
     std::printf("Modern vegetation eye routing: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;}
