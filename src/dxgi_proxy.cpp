@@ -41371,12 +41371,17 @@ void* __fastcall hook_remastered_queue_construct(void* memory,void* owner,uint8_
     const auto caller=module && address>=module?address-module:0;
     // Constructor return precedes the caller's renderer+110 store. Read the
     // actual constructor owner at queue+68; never synthesize that store.
-    const auto construction=g_remastered_queue_observations.begin(reinterpret_cast<uintptr_t>(memory));
+    const auto construction=g_remastered_queue_observations.begin(reinterpret_cast<uintptr_t>(memory),
+        g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire));
     auto* result=g_remastered_queue_construct(memory,owner,mode);
     w3vr::modern_command_queue::Identity identity{};
-    if(result!=memory || !life::known_construction(caller,mode) ||
+    // A rejected entry cannot become admitted when installation finishes inside
+    // the native constructor. Check readiness again before probing native memory.
+    if(!construction.revision || result!=memory || !life::known_construction(caller,mode) ||
+        !g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire) ||
         !read_remastered_constructed_queue(module,memory,owner,identity) ||
-        !g_remastered_queue_observations.finish(construction,identity))
+        !g_remastered_queue_observations.finish(construction,identity,
+            g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire)))
         g_remastered_queue_observations.cancel(construction);
     return result;
 }

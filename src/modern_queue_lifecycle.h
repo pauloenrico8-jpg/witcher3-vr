@@ -49,7 +49,7 @@ class Observations {
  std::uint64_t next_;
 public:
  explicit Observations(std::uint64_t first_revision=1):next_(first_revision){}
- Construction begin(std::uintptr_t queue){
+ Construction begin(std::uintptr_t queue,bool observers_ready){
   if(!queue)return {};
   std::lock_guard guard(mutex_);
   Entry* available{};
@@ -57,6 +57,9 @@ public:
    if(entry.construction.queue==queue){entry={};available=&entry;}
    else if(!entry.construction.queue && !available)available=&entry;
   }
+  // Always invalidate reuse, even during partial observer activation. Never
+  // let a constructor that entered too early acquire a ticket on its return.
+  if(!observers_ready)return {};
   if(!next_ || next_==std::numeric_limits<std::uint64_t>::max()){
    entries_.fill({});return {};
   }
@@ -64,7 +67,8 @@ public:
   const Construction construction{queue,next_++};
   *available={construction,{},false};return construction;
  }
- bool finish(Construction construction,const modern_command_queue::Identity& identity){
+ bool finish(Construction construction,const modern_command_queue::Identity& identity,bool observers_ready){
+  if(!observers_ready){cancel(construction);return false;}
   if(!construction.queue || !construction.revision || construction.queue!=identity.queue ||
    !modern_command_queue::valid(identity))return false;
   std::lock_guard guard(mutex_);

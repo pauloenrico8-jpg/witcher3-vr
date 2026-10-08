@@ -7,6 +7,43 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Construção durante a ativação dos observadores — 8 de outubro
+
+Fechei uma janela na ativação das três passagens que acompanham a fila do jogo.
+A fila guarda tarefas à espera de processamento. Antes, uma construção iniciada
+quando só parte das passagens estava ativa poderia ser aceita ao terminar.
+
+O fluxo, passo a passo:
+
+1. Ao entrar, verifica se as três passagens já estão ativas. Uma entrada cedo
+   demais apaga a observação antiga daquele endereço, mas não recebe permissão.
+2. Executa o construtor original uma vez, com os mesmos argumentos e resultado.
+   O jogo continua construindo sua fila normalmente.
+3. Ao sair, exige a permissão obtida na entrada e confere novamente a ativação
+   antes de ler a fila. Terminar a instalação no meio da chamada não recupera
+   uma entrada rejeitada.
+4. Se a ativação fechar durante uma entrada aceita, cancela somente aquela
+   construção. Um cancelamento antigo não pode apagar uma construção nova.
+5. Só depois dessas conferências pode registrar a identificação que a preparação
+   da segunda imagem exige. Isso ainda não mantém os objetos do jogo vivos.
+
+Escolhi exigir autorização na entrada e na saída porque uma conferência somente
+na saída esconderia a parte da construção que ocorreu sem todos os observadores.
+As rotinas do jogo conservam sua execução; a restrição vale para a imagem extra.
+
+DLL compilada; **111/111 testes passaram em 11,04 segundos**. O teste da fila
+passou em **167 verificações no processador**, incluindo 17 novas sobre ativação
+parcial, entrada rejeitada seguida de ativação, fechamento na saída, reutilização
+do endereço e cancelamento antigo sem atingir uma nova construção.
+Esses testes não executaram o jogo, suas funções nativas, a instalação real das
+passagens, a leitura da memória do processo, a placa de vídeo ou o Quest.
+
+**Ainda não está jogável; nada instalado e a 5.00c continua bloqueada.**
+Continuam pendentes a vida útil, a ordem e os recursos de cada olho, antes da
+primeira prova de duas imagens novas no jogo. Depois vem imagem/cabeça no Quest
+e a integração de mãos, armas, dano e bloqueio físicos. DLSS é complementar;
+a meta de FPS permanece cancelada. Novas análises nativas permanecem locais.
+
 ## Construção, parada e reutilização da fila — 8 de outubro
 
 O mod agora exige uma construção observada da fila e uma identificação nova
