@@ -7,6 +7,41 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Encaminhamento da visibilidade de vegetação por olho — 8 de outubro
+
+`modern_vegetation_view.h` adapta as duas atualizacoes normais de vegetação
+para receber a câmera principal do olho identificado pelo quadro atual.
+A identificação vive no contexto da chamada normal; chamadas desconhecidas
+e o epílogo usam um contexto neutro. A restauracao após chamadas internas
+impede que uma rota sem identificação herde o olho de outra chamada.
+
+A passagem confere a rota, o receptor, a sessão, a origem normal do quadro e
+os dados originais da câmera secundaria. As leituras limitadas repetidas
+precisam coincidir. Copias próprias guardam posição, lente na variante correta,
+direção de visão e distancia mínima da primaria durante a função original.
+Nao escreve nas câmeras nem nos recursos diretamente. Conserva receptor,
+alcance da grade, modo, número de chamadas e resultado booleano nativos.
+
+A instalacao agrupa as tres passagens deste trecho: entrada normal, epílogo
+e atualizacao de vegetação. A permissao abre somente depois de conferir e
+ativar todas. Falhas parciais conservam os caminhos originais e fecham a
+admissao; não fornecem uma barreira para descarregar a DLL com seguranca.
+
+DLL compilada; **109/109 testes em 10,28s**, incluindo 140 verificações CPU, incluindo um modelo de
+recorté independente, lentes distintas, bordas perdidas com a secundaria,
+variantes de projeção, alcance/retorno, fontes alteradas depois da copia,
+rejeicoes e contextos internos. Dados fábricados e callbacks de teste não
+executam o algoritmo nativo nem comprovam o jogo ou o headset.
+
+**Global preflight inalterado; 5.00c/reentrada fechados; nada instalado.**
+Este port não isola os dados nativos reutilizados de vegetação entre tarefas nem comprova
+a visibilidade completa do mundo. Provar consumo/copia/ordem desses caches,
+os demais consumidores, historicos/efeitos e a vida útil/barreira dos recursos
+antes de executar a duplicacao. Dois olhos novos por quadro e cabeça devem
+ser verificados no jogo/Quest antes de integrar mãos/armas/combate físico.
+DLSS continua complementar e não existe requisito de FPS. Novos dados de
+analise nativa permanecem locais e não foram anexados a estes documentos.
+
 ## Lente primária por olho — checkpoint de 7 de outubro, noite
 
 `modern_camera_projection.h` deriva os cinco valores de lente da câmera
