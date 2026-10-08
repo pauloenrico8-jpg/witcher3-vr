@@ -13,17 +13,20 @@ namespace w3vr::engine_camera {
 // check. The 5.00c entries were examined statically for executable SHA-256
 // 9406ECCC12B68E08920931442EF6A57340E910D3E01F2082E88232487433FE51.
 // They must not enable the remaining legacy engine/rendering hooks.
+enum class RecordCopy { whole_record, remastered_fields };
+
 struct TemporalContract {
     std::size_t previous_record_offset;
     std::uint32_t builder_rva;
     std::uint32_t rebuild_rva;
     std::uint32_t copy_rebuild_rva;
+    RecordCopy record_copy{RecordCopy::whole_record};
 };
 
 inline constexpr TemporalContract legacy_404{0x460, 0x015FE010,
     0x015FE550, 0x015FF640};
 inline constexpr TemporalContract remastered_500c{0x530, 0x02288F00,
-    0x0228AB40, 0x0228A970};
+    0x0228AB40, 0x0228A970, RecordCopy::remastered_fields};
 inline constexpr std::size_t source_prefix_bytes = 0x38;
 inline constexpr std::size_t record_bytes = 0xB0;
 using TemporalRecord = std::array<std::uint8_t, record_bytes>;
@@ -97,15 +100,35 @@ inline bool build_record(std::span<const std::uint8_t> view, float time,
 // The caller supplies a valid camera range owned by its native hook. A span
 // checks offsets/lengths, not Windows page access or the identity of an object.
 // Refuse an incomplete range before writing anything, and preserve every byte
-// outside the version's previous-camera record.
+// outside the version's defined previous-camera fields. Remastered also
+// preserves native padding and accepts an explicit invalid/reset record.
 inline bool write_previous_record(std::span<std::uint8_t> view,
     const TemporalContract& contract, const TemporalRecord& record) {
     const std::size_t offset = contract.previous_record_offset;
-    if (record[0] == 0 || offset < source_prefix_bytes ||
+    const bool remastered_fields = contract.record_copy == RecordCopy::remastered_fields;
+    if ((contract.record_copy != RecordCopy::whole_record && !remastered_fields) ||
+        (!remastered_fields && record[0] == 0) || offset < source_prefix_bytes ||
         offset > view.size() || record_bytes > view.size() - offset) {
         return false;
     }
-    std::memmove(view.data() + offset, record.data(), record_bytes);
+    if (remastered_fields) {
+        // Native Remastered copies the defined fields, including a complete
+        // invalid/reset record. Its padding belongs to the destination and
+        // stays intact. The caller must reject a failed build_record result;
+        // that function returns false and leaves its output intact.
+        // Stage FIRST so overlapping ranges cannot overwrite a later source
+        // field. This is a byte-copy contract, not history/ownership readiness.
+        const TemporalRecord staged = record;
+        struct FieldRange { std::size_t offset, bytes; };
+        constexpr std::array<FieldRange, 4> fields{{
+            {0x00, 0x01}, {0x04, 0x08}, {0x10, 0x1C}, {0x30, 0x80}}};
+        for (const auto& field : fields) {
+            std::memcpy(view.data() + offset + field.offset,
+                staged.data() + field.offset, field.bytes);
+        }
+    } else {
+        std::memmove(view.data() + offset, record.data(), record_bytes);
+    }
     return true;
 }
 
