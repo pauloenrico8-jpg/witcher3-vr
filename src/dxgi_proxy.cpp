@@ -30,6 +30,7 @@
 #include "engine_camera_layout.h"
 #include "engine_camera_copy_context.h"
 #include "modern_camera_pose.h"
+#include "modern_vegetation_view.h"
 #include "engine_render_core.h"
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
@@ -2336,6 +2337,8 @@ using EngineFrameBuilderFn = w3vr::render_core::NativeCore;
 EngineFrameBuilderFn g_engine_frame_builder{};
 w3vr::render_core::NativeEpilogue g_remastered_normal_epilogue{};
 std::atomic<bool> g_remastered_core_hooks_ready{};
+w3vr::modern_vegetation_view::NativeUpdate g_remastered_vegetation_update{};
+thread_local w3vr::modern_vegetation_view::Context g_remastered_vegetation_context{};
 using EngineTemporalWriterFn = void(__fastcall*)(
     void*, float, float, uint32_t, uint32_t);
 EngineTemporalWriterFn g_engine_temporal_writer{};
@@ -31120,11 +31123,13 @@ struct RemasteredCoreThreadState {
         w3vr::mode3_transport::AfwPixelProjection::Invalid};
     HmdCameraPoseSnapshot hmd{};
     void* audit_frame{};
+    w3vr::modern_vegetation_view::Context vegetation{};
 };
 RemasteredCoreThreadState read_remastered_core_thread_state() {
     return {g_engine_render_eye, g_engine_render_generation, g_engine_render_pair_id,
         g_engine_render_view, g_engine_render_view_valid, g_engine_render_tag_frame_lookup_exact,
-        g_engine_render_pixel_projection, g_engine_render_hmd_pose, g_asymmetric_render_frame};
+        g_engine_render_pixel_projection, g_engine_render_hmd_pose, g_asymmetric_render_frame,
+        g_remastered_vegetation_context};
 }
 void apply_remastered_core_thread_state(const RemasteredCoreThreadState& state) {
     g_engine_render_eye = state.eye;
@@ -31136,6 +31141,7 @@ void apply_remastered_core_thread_state(const RemasteredCoreThreadState& state) 
     g_engine_render_pixel_projection = state.projection;
     g_engine_render_hmd_pose = state.hmd;
     g_asymmetric_render_frame = state.audit_frame;
+    g_remastered_vegetation_context = state.vegetation;
 }
 void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* scene) {
     const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
@@ -31159,7 +31165,9 @@ void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* s
         static_cast<int>(tag.eye), tag.render_view_valid, tag.modern_camera_lineage_complete};
     const RemasteredCoreThreadState labelled{
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
-        tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr};
+        tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,
+        {reinterpret_cast<uintptr_t>(renderer), reinterpret_cast<uintptr_t>(frame),
+            reinterpret_cast<uintptr_t>(scene), label, true}};
     w3vr::render_core::invoke(contract, caller, g_engine_frame_builder,
         renderer, frame, scene, found_label ? &label : nullptr,
         g_streamline_capture_generation.load(std::memory_order_acquire),
@@ -31717,17 +31725,82 @@ bool remastered_normal_epilogue_table_matches(const uint8_t* module) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return method == reinterpret_cast<uintptr_t>(module) + w3vr::render_core::normal_epilogue_rva;
 }
+struct RemasteredVegetationCameraSnapshot {
+    std::array<uint8_t,w3vr::modern_vegetation_view::camera_bytes> primary{},secondary{};
+};
+bool read_remastered_vegetation_snapshot(
+    const w3vr::modern_vegetation_view::Context& context,
+    w3vr::modern_vegetation_view::Route route,void* receiver,
+    const float* position,const float* projection,const float* view,float near_range,
+    uintptr_t& container,RemasteredVegetationCameraSnapshot& cameras,
+    w3vr::modern_vegetation_view::Inputs& incoming) {
+    namespace veg=w3vr::modern_vegetation_view;
+    uintptr_t scene_field{},primary_address{},secondary_address{},end{};
+    if (!position || !projection || !view ||
+        !veg::add(context.scene,veg::scene_container_offset,scene_field) ||
+        !veg::add(context.frame,veg::frame_primary_offset,primary_address) ||
+        !veg::add(context.frame,veg::frame_secondary_offset,secondary_address) ||
+        !veg::add(secondary_address,veg::camera_bytes,end)) return false;
+    RemasteredVegetationCameraSnapshot repeated{};
+    uintptr_t after{};
+    __try {
+        std::memcpy(&container,reinterpret_cast<const void*>(scene_field),sizeof(container));
+        if (!veg::receiver_matches(route,container,reinterpret_cast<uintptr_t>(receiver))) return false;
+        std::memcpy(cameras.primary.data(),reinterpret_cast<const void*>(primary_address),cameras.primary.size());
+        std::memcpy(cameras.secondary.data(),reinterpret_cast<const void*>(secondary_address),cameras.secondary.size());
+        std::memcpy(incoming.position.data(),position,sizeof(incoming.position));
+        std::memcpy(incoming.projection.data(),projection,sizeof(incoming.projection));
+        std::memcpy(incoming.view.data(),view,sizeof(incoming.view));
+        incoming.near_range=near_range;
+        std::memcpy(repeated.primary.data(),reinterpret_cast<const void*>(primary_address),repeated.primary.size());
+        std::memcpy(repeated.secondary.data(),reinterpret_cast<const void*>(secondary_address),repeated.secondary.size());
+        std::memcpy(&after,reinterpret_cast<const void*>(scene_field),sizeof(after));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    // A matching second sample detects changes while reading; it is NOT an
+    // atomic native read, allocation lease or proof of deferred task lifetime.
+    return after==container && cameras.primary==repeated.primary && cameras.secondary==repeated.secondary;
+}
+bool __fastcall hook_remastered_vegetation_update(void* receiver,const float* position,
+    const float* projection,const float* view,float near_range,float far_range,bool final_mode) {
+    namespace veg=w3vr::modern_vegetation_view;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto return_address=reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t caller=module && return_address>=module ? return_address-module : 0;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto context=g_remastered_vegetation_context;
+    const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+    const auto route=veg::route(caller);
+    veg::Inputs incoming{},replacement{};
+    RemasteredVegetationCameraSnapshot cameras{};uintptr_t container{};
+    const bool admitted=g_remastered_core_hooks_ready.load(std::memory_order_acquire) &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        route!=veg::Route::unknown && veg::accepts(contract,context,generation) && !final_mode &&
+        read_remastered_vegetation_snapshot(context,route,receiver,position,projection,view,near_range,
+            container,cameras,incoming) &&
+        veg::prepare(contract,context,generation,caller,container,reinterpret_cast<uintptr_t>(receiver),
+            incoming,final_mode,cameras.primary,cameras.secondary,replacement) &&
+        generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
+        g_remastered_core_hooks_ready.load(std::memory_order_acquire);
+    return veg::invoke(g_remastered_vegetation_update,receiver,position,projection,view,
+        near_range,far_range,final_mode,admitted ? &replacement : nullptr);
+    // The native function still owns cache generation/return semantics. Its
+    // shared receiver caches and downstream worker ordering remain unported.
+}
+
 bool install_remastered_render_core_hooks(uint8_t* module) {
     if (g_remastered_core_hooks_ready.load(std::memory_order_acquire)) return true;
     // Keep original trampolines on any partial failure; never remove/null/retry
     // them while entries may be in flight. This is NOT an unload barrier.
-    if (!module || g_engine_frame_builder || g_remastered_normal_epilogue) return false;
+    if (!module || g_engine_frame_builder || g_remastered_normal_epilogue ||
+        g_remastered_vegetation_update) return false;
     struct Hook { uintptr_t rva; void* detour; void** original; std::span<const uint8_t> signature; };
-    const std::array<Hook, 2> hooks{{
+    const std::array<Hook, 3> hooks{{
         {w3vr::render_core::remastered_500c.entry, reinterpret_cast<void*>(&hook_remastered_render_core),
             reinterpret_cast<void**>(&g_engine_frame_builder), w3vr::render_core::modern_entry_signature},
         {w3vr::render_core::normal_epilogue_rva, reinterpret_cast<void*>(&hook_remastered_normal_epilogue),
-            reinterpret_cast<void**>(&g_remastered_normal_epilogue), w3vr::render_core::epilogue_entry_signature}}};
+            reinterpret_cast<void**>(&g_remastered_normal_epilogue), w3vr::render_core::epilogue_entry_signature},
+        {w3vr::modern_vegetation_view::update_rva, reinterpret_cast<void*>(&hook_remastered_vegetation_update),
+            reinterpret_cast<void**>(&g_remastered_vegetation_update), w3vr::modern_vegetation_view::entry_signature}}};
     if (!remastered_normal_epilogue_table_matches(module)) return false;
     for (const auto& hook : hooks)
         if (!remastered_render_entry_matches(module + hook.rva, hook.signature)) return false;
@@ -31746,7 +31819,7 @@ bool install_remastered_render_core_hooks(uint8_t* module) {
         return false;
     }
     g_remastered_core_hooks_ready.store(true, std::memory_order_release);
-    log_line("Remastered core and normal epilogue CPU label adapters installed; GPU completion not implied");
+    log_line("Remastered core, normal epilogue and primary-eye vegetation adapters installed; GPU completion not implied");
     return true;
 }
 
