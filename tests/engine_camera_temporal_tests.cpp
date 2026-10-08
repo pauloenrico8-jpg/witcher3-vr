@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -162,8 +163,13 @@ void test_version_specific_history_boundaries() {
         require(camera::write_previous_record(view, contract, record),
             "Complete camera range rejected");
         for (std::size_t index = 0; index < view.size(); ++index) {
-            const auto expected = index >= contract.previous_record_offset && index < end
-                ? record[index - contract.previous_record_offset] : 0xA7;
+            const bool in_record = index >= contract.previous_record_offset && index < end;
+            const auto relative = in_record ? index - contract.previous_record_offset : 0;
+            const bool native_field = relative == 0 || (relative >= 4 && relative < 12) ||
+                (relative >= 16 && relative < 44) || (relative >= 48 && relative < 176);
+            const bool copied = in_record &&
+                (contract.record_copy == camera::RecordCopy::whole_record || native_field);
+            const auto expected = copied ? record[relative] : 0xA7;
             require(view[index] == expected,
                 "History write changed a byte outside its version's record");
         }
@@ -191,10 +197,67 @@ void test_version_specific_history_boundaries() {
     invalid_contract.previous_record_offset = 0;
     require(!camera::write_previous_record(remastered, invalid_contract, record),
         "Record overlaps camera inputs");
-    record[0] = 0;
-    require(!camera::write_previous_record(remastered, camera::remastered_500c, record),
-        "Invalid native record accepted");
+    invalid_contract = camera::remastered_500c;
+    invalid_contract.record_copy = static_cast<camera::RecordCopy>(255);
+    require(!camera::write_previous_record(remastered, invalid_contract, record),
+        "Unknown copy policy accepted");
     require(remastered == original, "Rejected history write modified the camera");
+    record[0] = 0;
+    std::vector<std::uint8_t> legacy(0x510, 0xA7);
+    const auto legacy_original = legacy;
+    require(!camera::write_previous_record(legacy, camera::legacy_404, record),
+        "Legacy invalid-history admission changed");
+    require(legacy == legacy_original, "Rejected legacy history modified the camera");
+}
+
+void test_remastered_reset_preserves_native_padding() {
+    camera::TemporalRecord reset;
+    for (std::size_t i = 0; i < reset.size(); ++i) reset[i] = std::uint8_t(i + 1);
+    reset[0] = 0; // Explicit, complete reset input, not a failed builder output.
+    std::vector<std::uint8_t> view(0x600, 0xD7);
+    require(camera::write_previous_record(view, camera::remastered_500c, reset),
+        "Explicit Remastered camera reset rejected");
+    require(view[0x530] == 0, "Previous-camera validity was not reset");
+    for (std::size_t i = 0; i < view.size(); ++i) {
+        const bool in_record = i >= 0x530 && i < 0x5E0;
+        const auto r = in_record ? i - 0x530 : 0;
+        const bool field = r == 0 || (r >= 4 && r < 12) ||
+            (r >= 16 && r < 44) || (r >= 48 && r < 176);
+        require(view[i] == (in_record && field ? reset[r] : 0xD7),
+            "Reset omitted a native field or changed padding/another camera field");
+    }
+    const auto original = view;
+    require(!camera::write_previous_record(std::span<std::uint8_t>(view).first(0x5DF),
+        camera::remastered_500c, reset), "Truncated reset destination accepted");
+    require(view == original, "Rejected reset was partly written");
+}
+
+void test_overlapping_record_source_is_staged() {
+    camera::TemporalRecord input;
+    for (std::size_t i = 0; i < input.size(); ++i) input[i] = std::uint8_t(i + 1);
+    for (const auto& contract : {camera::legacy_404, camera::remastered_500c}) {
+        for (const int displacement : {-64, -16, -1, 0, 1, 16, 64}) {
+            const auto destination = contract.previous_record_offset;
+            const auto source = std::size_t(std::ptrdiff_t(destination) + displacement);
+            std::vector<std::uint8_t> bytes(destination + camera::record_bytes + 96, 0xE9);
+            auto* alias = std::construct_at(
+                reinterpret_cast<camera::TemporalRecord*>(bytes.data() + source), input);
+            const auto before = bytes;
+            require(camera::write_previous_record(bytes, contract, *alias),
+                "Overlapping record source rejected");
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                const bool in_record = i >= destination && i < destination + camera::record_bytes;
+                const auto r = in_record ? i - destination : 0;
+                const bool field = r == 0 || (r >= 4 && r < 12) ||
+                    (r >= 16 && r < 44) || (r >= 48 && r < 176);
+                const bool copied = in_record &&
+                    (contract.record_copy == camera::RecordCopy::whole_record || field);
+                require(bytes[i] == (copied ? input[r] : before[i]),
+                    "Overlap corrupted a later field, padding or unrelated byte");
+            }
+            std::destroy_at(alias);
+        }
+    }
 }
 
 int main() {
@@ -203,6 +266,9 @@ int main() {
     test_failed_native_result_does_not_publish();
     test_uninterpreted_source_words_are_preserved();
     test_version_specific_history_boundaries();
+    test_remastered_reset_preserves_native_padding();
+    test_overlapping_record_source_is_staged();
     std::cout << "Camera ABI argument order, staged failures and both version-specific "
-        "history boundaries passed (simulated native function only).\n";
+        "history boundaries, Remastered field/reset copies and 14 overlapping copies "
+        "passed (simulated native function only).\n";
 }
