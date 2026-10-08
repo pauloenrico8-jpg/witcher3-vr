@@ -29990,6 +29990,14 @@ void __fastcall hook_engine_temporal_writer(
         reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const auto* camera_contract = g_engine_camera_temporal_contract.load(
         std::memory_order_acquire);
+    if (camera_contract == &w3vr::engine_camera::remastered_500c) {
+        // The frozen runtime lens uses the modern stable normalized center,
+        // separate from this writer's pixel jitter. Forward all five native
+        // arguments once; private/restore/unknown calls also stay intact.
+        // Do not enter legacy center composition or completion bookkeeping.
+        g_engine_temporal_writer(temporal_data, value0, value1, value2, value3);
+        return;
+    }
     const bool native_asymmetric_known_route =
         w3vr::engine_camera_layout::normal_temporal_route(camera_contract, caller_rva);
     std::array<size_t, 2> jitter_offsets{};
@@ -41658,8 +41666,9 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     void* primary_scene_descriptor = scene_descriptor;
     if (duplicate_render && remastered_factory) {
         // Freeze both runtime views and recenter before either factory. Make
-        // two private descriptors from ONE unmodified byte snapshot, then let
-        // native scratch/frame copies perform their normal matrix rebuilds.
+        // two private descriptors from ONE unmodified byte snapshot with
+        // primary-eye lens inputs and both internal poses, then let native
+        // scratch/frame copies perform their normal matrix rebuilds.
         remastered_pair_pose = snapshot_current_hmd_camera_pose();
         remastered_pair_generation = g_streamline_capture_generation.load(std::memory_order_acquire);
         remastered_pair_pose_prepared = g_config.hmd_freelook && !g_config.hmd_compositor_only &&
@@ -41679,7 +41688,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             // No native factory has run and no source byte was changed.
             g_engine_pair_retry_present.store(present + 2, std::memory_order_relaxed);
             if (g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1) < 8)
-                log_line("Remastered stereo camera pose preparation rejected; unmodified native input used");
+                log_line("Remastered stereo camera pose/lens preparation rejected; unmodified native input used");
         }
     }
     if (duplicate_render || tag_aer_frame) {

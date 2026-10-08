@@ -3,6 +3,7 @@
 #include "engine_camera_layout.h"
 #include "engine_scene_descriptor.h"
 #include "openxr_eye_geometry.h"
+#include "modern_camera_projection.h"
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -86,11 +87,12 @@ inline bool encode_orientation(XrQuaternionf q,
 }
 
 // Prepare BOTH eyes before calling either native factory. Source stays intact;
-// all failures leave the caller's output untouched. Only six current-pose
-// floats per internal camera change. Projection, history, pointers and all
-// derived matrices remain native inputs; the game rebuilds them from the new
-// pose while copying these private descriptors. This does not port projection,
-// history ownership, task lifetime, culling consumers or the full renderer.
+// all failures leave the caller's output untouched. Each internal camera gets
+// six current-pose floats; only the PRIMARY camera gets the runtime lens.
+// Pixel jitter/dimensions, history, pointers and all derived matrices stay
+// untouched; the game rebuilds them while copying the private descriptors.
+// Secondary visibility, temporal history, lifetime and the full renderer are
+// still pending. These inputs do not prove that an eye image was rendered.
 inline bool prepare_pair(std::span<const std::uint8_t> source,
     const TrackingSample& tracking, Options options, PreparedPair& result) {
     using namespace openxr_eye_geometry;
@@ -105,6 +107,10 @@ inline bool prepare_pair(std::span<const std::uint8_t> source,
     if (!normalize(tracking.origin_heading,heading) ||
         std::fabs(heading.x)>1e-5f || std::fabs(heading.z)>1e-5f) return false;
     EyeGeometry geometry{};
+    std::array<modern_camera_projection::LensFields,2> lenses{};
+    const auto primary_camera=source.subspan(layout.descriptor_cameras[0],layout.camera_bytes);
+    for (std::size_t eye=0;eye<2;++eye)
+        if (!modern_camera_projection::derive(primary_camera,tracking.views[eye].fov,lenses[eye])) return false;
     for (const auto& view:tracking.views) {
         AsymmetricProjectionDescriptor projection{};
         if (view.type!=XR_TYPE_VIEW || view.next!=nullptr ||
@@ -158,6 +164,9 @@ inline bool prepare_pair(std::span<const std::uint8_t> source,
                 if (!engine_camera_layout::write_pose(
                     std::span<std::uint8_t>(candidate.descriptors[eye]).subspan(
                         layout.descriptor_cameras[i],layout.camera_bytes),&layout,poses[eye][i])) return false;
+            if (!modern_camera_projection::write(
+                std::span<std::uint8_t>(candidate.descriptors[eye]).subspan(
+                    layout.descriptor_cameras[0],layout.camera_bytes),lenses[eye])) return false;
         }
     } catch (const std::bad_alloc&) { return false; }
     result=std::move(candidate);
