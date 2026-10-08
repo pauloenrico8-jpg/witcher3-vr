@@ -6,6 +6,50 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Cópia da câmera identificada por versão — 8 de outubro
+
+Adaptei a identificação das cópias da câmera para a atualização 1048522. O
+perfil reúne as chamadas examinadas de cada versão; a sequência permanece
+ligada ao perfil escolhido ao entrar na fábrica, que cria os dados de um quadro.
+
+O fluxo, passo a passo:
+
+1. Recebe uma regra de câmera conhecida e escolhe seu perfil de cópia.
+   Regra desconhecida ou uma cópia da regra não ganha autorização.
+2. Acompanha a cópia temporária, a cópia final e as duas câmeras internas,
+   conferindo a origem, o destino, a ordem e as chamadas daquela versão.
+   Essas duas câmeras pertencem a um quadro do jogo; os olhos do Quest
+   precisam de dois quadros desenhados separadamente.
+3. A reconstrução da câmera só é reconhecida quando vem da chamada e do
+   destino esperados pelo mesmo perfil. Chamadas da outra versão não
+   completam a sequência.
+4. Se outra cópia acontece durante uma chamada, guarda o contexto anterior
+   e o restaura exatamente ao terminar, incluindo versão, olho e par.
+5. O registro da câmera anterior conserva a cópia dos campos definidos,
+   os espaços reservados do destino e a regra de reinício do histórico.
+   Os demais subsistemas ainda sem adaptação rejeitam a regra nova.
+
+Escolhi guardar o perfil durante toda a sequência para impedir que endereços
+examinados em versões diferentes sejam tratados como uma única operação.
+Isso identifica chamadas; não mantém objetos ou texturas vivos nem comprova
+que a placa de vídeo terminou de desenhar.
+
+DLL de desenvolvimento compilada; **111/111 testes passaram em 12,35 segundos**.
+Foram verificadas sequências completas dos dois perfis, chamadas misturadas
+em cinco pontos, cópias aninhadas entre versões, restauração do contexto,
+perfis desconhecidos e rejeição dos subsistemas ainda sem adaptação. As
+cópias de registros também passaram por 21 casos com origem e destino
+sobrepostos nas três regras de versão, além de reinício, limites e preservação
+dos espaços reservados. Os testes usam dados e chamadas fabricados no PC.
+Não executaram as funções nativas do jogo, os hooks, a placa de vídeo ou o Quest.
+
+**O bloqueio global e os instaladores de hooks continuam iguais. Nada foi
+instalado no jogo e o VR ainda não está jogável.** Continuam pendentes os
+recursos e históricos por olho, a vida útil e o encerramento das chamadas,
+a integração das duas imagens reais, cabeça, mãos/armas e dano/bloqueio
+físicos. DLSS é complementar e a meta de 60 FPS continua cancelada.
+As análises novas do executável permanecem somente nos arquivos locais.
+
 ## Identificação da fila por versão — 8 de outubro
 
 A atualização do jogo exigiu separar a identificação da fila de desenho por
