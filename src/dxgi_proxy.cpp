@@ -29,6 +29,7 @@
 #include "engine_camera_temporal.h"
 #include "engine_camera_layout.h"
 #include "engine_camera_copy_context.h"
+#include "modern_camera_pose.h"
 #include "engine_render_core.h"
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
@@ -1409,6 +1410,9 @@ float g_hmd_position_y{};
 float g_hmd_position_z{};
 XrVector3f g_mono_neck_pose_correction{};
 std::mutex g_hmd_pose_snapshot_mutex{};
+// Published only under the pose mutex; readers never sample the live XR vector.
+w3vr::modern_camera_pose::TrackingSample g_modern_camera_tracking{};
+uint32_t g_modern_camera_tracking_generation{};
 
 XrQuaternionf multiply_quaternions(const XrQuaternionf& a, const XrQuaternionf& b);
 XrVector3f rotate_vector(const XrQuaternionf& rotation, const XrVector3f& vector);
@@ -2933,6 +2937,8 @@ struct HmdCameraPoseSnapshot {
     float eye_cant_degrees{};
     bool native_canted_valid{};
     bool valid{};
+    w3vr::modern_camera_pose::TrackingSample tracking{};
+    uint32_t tracking_generation{};
 };
 thread_local HmdCameraPoseSnapshot g_engine_render_hmd_pose{};
 std::atomic<uint64_t> g_engine_pair_sequence{};
@@ -3426,6 +3432,8 @@ HmdCameraPoseSnapshot snapshot_current_hmd_camera_pose() {
     pose.eye_cant_degrees = g_native_canted_cant_degrees;
     pose.native_canted_valid = g_native_canted_eye_geometry_valid;
     pose.valid = g_hmd_pose_valid.load(std::memory_order_acquire);
+    pose.tracking = g_modern_camera_tracking;
+    pose.tracking_generation = g_modern_camera_tracking_generation;
     return pose;
 }
 
@@ -37386,9 +37394,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         const size_t index = route.stage == w3vr::camera_copy::Stage::unknown ? 4u :
             (route.stage == w3vr::camera_copy::Stage::scratch ? 0u : 2u) + route.camera_index;
         g_remastered_camera_copy_route_counts[index].fetch_add(1, std::memory_order_relaxed);
-        // Classification is not pose-write authority. Until matrices, culling,
-        // camera roles and the rest of the normal renderer are ported, forward
-        // ALL modern rebuilds once without entering legacy correction paths.
+        // Pose is prepared once in private input descriptors before the
+        // factory, never reapplied during scratch/frame copies. The original
+        // rebuild derives matrices from those inputs; no legacy corrections
+        // or native completion claims belong to this modern forwarding path.
         g_engine_view_rebuild(view);
         return;
     }
@@ -41401,6 +41410,10 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // Keep their byte snapshot local to this synchronous factory hook. Its
     // C++ byte-buffer destructor must never destroy native game resources.
     std::vector<uint8_t> remastered_borrowed_descriptor;
+    w3vr::modern_camera_pose::PreparedPair remastered_pose_pair;
+    HmdCameraPoseSnapshot remastered_pair_pose{};
+    uint32_t remastered_pair_generation{};
+    bool remastered_pair_pose_prepared{};
     std::vector<uint8_t>* right_scene_descriptor{};
     const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
         std::memory_order_relaxed);
@@ -41642,6 +41655,33 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         ? static_cast<int>(aer_identity.eye)
         : (g_config.engine_taau_reverse_eye_order ? 1 : 0);
     const int duplicate_eye = 1 - primary_eye;
+    void* primary_scene_descriptor = scene_descriptor;
+    if (duplicate_render && remastered_factory) {
+        // Freeze both runtime views and recenter before either factory. Make
+        // two private descriptors from ONE unmodified byte snapshot, then let
+        // native scratch/frame copies perform their normal matrix rebuilds.
+        remastered_pair_pose = snapshot_current_hmd_camera_pose();
+        remastered_pair_generation = g_streamline_capture_generation.load(std::memory_order_acquire);
+        remastered_pair_pose_prepared = g_config.hmd_freelook && !g_config.hmd_compositor_only &&
+            remastered_pair_generation != 0 &&
+            remastered_pair_pose.tracking_generation == remastered_pair_generation &&
+            pair_pose_display_time > 0 &&
+            remastered_pair_pose.tracking.display_time == pair_pose_display_time &&
+            right_scene_descriptor != nullptr &&
+            w3vr::modern_camera_pose::prepare_pair(*right_scene_descriptor,
+                remastered_pair_pose.tracking,
+                {g_config.hmd_position_scale, g_config.hmd_lock_game_pitch}, remastered_pose_pair);
+        if (remastered_pair_pose_prepared) {
+            primary_scene_descriptor = remastered_pose_pair.descriptors[primary_eye].data();
+            right_scene_descriptor = &remastered_pose_pair.descriptors[duplicate_eye];
+        } else {
+            duplicate_render = false;
+            // No native factory has run and no source byte was changed.
+            g_engine_pair_retry_present.store(present + 2, std::memory_order_relaxed);
+            if (g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1) < 8)
+                log_line("Remastered stereo camera pose preparation rejected; unmodified native input used");
+        }
+    }
     if (duplicate_render || tag_aer_frame) {
         g_engine_factory_eye = primary_eye;
     }
@@ -41652,13 +41692,13 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const int previous_asymmetric_factory_eye =
         g_asymmetric_factory_eye;
     if (duplicate_render && asymmetric_factory_audit) {
-        g_asymmetric_factory_scene_descriptor = scene_descriptor;
+        g_asymmetric_factory_scene_descriptor = primary_scene_descriptor;
         g_asymmetric_factory_pair_id = pair_id;
         g_asymmetric_factory_eye = primary_eye;
     }
     bool primary_camera_sequence{};
     void* result = invoke_engine_frame_factory_with_camera_context(
-        render_context, render_settings, scene_descriptor, pair_id, primary_eye,
+        render_context, render_settings, primary_scene_descriptor, pair_id, primary_eye,
         remastered_factory && duplicate_render, primary_camera_sequence);
     if (duplicate_render && asymmetric_factory_audit) {
         g_asymmetric_factory_scene_descriptor =
@@ -41667,11 +41707,12 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         g_asymmetric_factory_eye = previous_asymmetric_factory_eye;
     }
     g_engine_factory_eye = previous_eye;
-    if (remastered_factory && duplicate_render && !primary_camera_sequence) {
+    if (remastered_factory && duplicate_render && (!primary_camera_sequence ||
+        g_streamline_capture_generation.load(std::memory_order_acquire) != remastered_pair_generation)) {
         duplicate_render = false;
         g_engine_pair_retry_present.store(present + 2, std::memory_order_relaxed);
         if (g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1) < 8)
-            log_line("Remastered primary camera copy lineage incomplete; native frame preserved, duplicate skipped");
+            log_line("Remastered primary camera sequence or generation changed; pose pair not admitted");
     }
 
     // [FIX:MODE3-AER-SINGLE-PRODUCER V12034 2/2] Feed the natural Mode-3
@@ -41740,7 +41781,12 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             tag.eye = static_cast<uint32_t>(primary_eye);
             tag.generation = g_streamline_capture_generation.load();
             tag.pair_id = pair_id;
-            if (g_hmd_pose_valid.load() &&
+            if (remastered_factory && remastered_pair_pose_prepared) {
+                tag.render_view = remastered_pair_pose.tracking.views[primary_eye];
+                tag.render_view_valid = true;
+                tag.generation = remastered_pair_generation;
+                tag.hmd_pose = remastered_pair_pose;
+            } else if (g_hmd_pose_valid.load() &&
                 g_xr_views.size() > static_cast<size_t>(primary_eye)) {
                 tag.render_view = g_config.hmd_compositor_only
                     ? g_hmd_center_views[primary_eye]
@@ -41754,8 +41800,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 }
                 tag.render_view_valid = true;
             }
-            tag.hmd_pose = snapshot_current_hmd_camera_pose();
-            tag.modern_camera_lineage_complete = remastered_factory && primary_camera_sequence;
+            if (!remastered_factory) tag.hmd_pose = snapshot_current_hmd_camera_pose();
+            tag.modern_camera_lineage_complete = remastered_factory && remastered_pair_pose_prepared && primary_camera_sequence;
             g_engine_dual_frame_eyes[result] = tag;
             primary_asymmetric_tag = tag;
             primary_asymmetric_tag_valid = true;
@@ -41793,7 +41839,12 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 tag.eye = static_cast<uint32_t>(duplicate_eye);
                 tag.generation = g_streamline_capture_generation.load();
                 tag.pair_id = pair_id;
-                if (g_hmd_pose_valid.load() &&
+                if (remastered_factory && remastered_pair_pose_prepared) {
+                    tag.render_view = remastered_pair_pose.tracking.views[duplicate_eye];
+                    tag.render_view_valid = true;
+                    tag.generation = remastered_pair_generation;
+                    tag.hmd_pose = remastered_pair_pose;
+                } else if (g_hmd_pose_valid.load() &&
                     g_xr_views.size() > static_cast<size_t>(duplicate_eye)) {
                     tag.render_view = g_config.hmd_compositor_only
                         ? g_hmd_center_views[duplicate_eye]
@@ -41807,8 +41858,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                     }
                     tag.render_view_valid = true;
                 }
-                tag.hmd_pose = snapshot_current_hmd_camera_pose();
-                tag.modern_camera_lineage_complete = remastered_factory && duplicate_camera_sequence;
+                if (!remastered_factory) tag.hmd_pose = snapshot_current_hmd_camera_pose();
+                tag.modern_camera_lineage_complete = remastered_factory && remastered_pair_pose_prepared && duplicate_camera_sequence;
                 g_engine_dual_frame_eyes[right_frame_data] = tag;
                 duplicate_asymmetric_tag = tag;
                 duplicate_asymmetric_tag_valid = true;
@@ -41818,7 +41869,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             if (primary_factory_capture != nullptr &&
                 primary_asymmetric_tag_valid) {
                 capture_asymmetric_frame_factory(
-                    result, scene_descriptor, primary_asymmetric_tag,
+                    result, primary_scene_descriptor, primary_asymmetric_tag,
                     *primary_factory_capture);
             }
             if (duplicate_factory_capture != nullptr &&
@@ -41834,7 +41885,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 auto* scope = g_remastered_producer_scope;
                 const auto* vtable = *reinterpret_cast<void***>(right_frame_data);
                 const auto release = reinterpret_cast<w3vr::frame_submission::ReleaseFrame>(vtable[2]);
-                if (scope != nullptr && duplicate_camera_sequence) {
+                if (scope != nullptr && duplicate_camera_sequence && remastered_pair_pose_prepared &&
+                    g_streamline_capture_generation.load(std::memory_order_acquire) == remastered_pair_generation) {
                     scope->pair_id = pair_id;
                     scope->present = present;
                     duplicate_deferred = scope->pair.arm(result, right_frame_data, release,
@@ -47692,22 +47744,23 @@ void update_runtime_eye_geometry() {
     }
 }
 
-void update_hmd_freelook_pose() {
-    if (!g_config.hmd_freelook || g_xr_views.size() < 2) {
+void update_hmd_freelook_pose(XrTime display_time,
+    const std::array<XrView, 2>& views, XrViewStateFlags view_state_flags) {
+    if (!g_config.hmd_freelook) {
         g_hmd_f9_latched.store(false, std::memory_order_relaxed);
+        std::scoped_lock pose_lock{g_hmd_pose_snapshot_mutex};
+        g_modern_camera_tracking = {};
+        g_modern_camera_tracking_generation = 0;
         return;
     }
     std::scoped_lock pose_lock{g_hmd_pose_snapshot_mutex};
 
-    const std::array<XrView, 2> views{{g_xr_views[0], g_xr_views[1]}};
     w3vr::openxr_eye_geometry::EyeGeometry eye_geometry{};
     const bool eye_geometry_valid =
         w3vr::openxr_eye_geometry::compute(views, eye_geometry);
     constexpr XrViewStateFlags kRequiredPoseFlags =
         XR_VIEW_STATE_ORIENTATION_VALID_BIT |
         XR_VIEW_STATE_POSITION_VALID_BIT;
-    const XrViewStateFlags view_state_flags =
-        g_xr_render_view_state_flags.load(std::memory_order_acquire);
     const bool runtime_pose_valid =
         (view_state_flags & kRequiredPoseFlags) == kRequiredPoseFlags;
     const bool native_canted_valid = runtime_pose_valid &&
@@ -47723,11 +47776,11 @@ void update_hmd_freelook_pose() {
     // quaternion midpoint so fixed eye cant is not mistaken for head motion.
     const auto current = native_canted_valid
         ? eye_geometry.cyclopean_orientation
-        : g_xr_views[0].pose.orientation;
+        : views[0].pose.orientation;
     const XrVector3f current_position{
-        (g_xr_views[0].pose.position.x + g_xr_views[1].pose.position.x) * 0.5f,
-        (g_xr_views[0].pose.position.y + g_xr_views[1].pose.position.y) * 0.5f,
-        (g_xr_views[0].pose.position.z + g_xr_views[1].pose.position.z) * 0.5f};
+        (views[0].pose.position.x + views[1].pose.position.x) * 0.5f,
+        (views[0].pose.position.y + views[1].pose.position.y) * 0.5f,
+        (views[0].pose.position.z + views[1].pose.position.z) * 0.5f};
     const bool f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     const bool manual_recenter = f9_down &&
         !g_hmd_f9_latched.exchange(true, std::memory_order_relaxed);
@@ -47747,8 +47800,8 @@ void update_hmd_freelook_pose() {
                   current.w / yaw_twist_length}
             : XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
         g_hmd_center_position = current_position;
-        g_hmd_center_views[0] = g_xr_views[0];
-        g_hmd_center_views[1] = g_xr_views[1];
+        g_hmd_center_views[0] = views[0];
+        g_hmd_center_views[1] = views[1];
         g_hmd_center_valid.store(true);
         log_line("HMD freelook recentered present=%llu",
             static_cast<unsigned long long>(g_present_count.load()));
@@ -47829,6 +47882,10 @@ void update_hmd_freelook_pose() {
         g_native_canted_cant_degrees = 0.0f;
     }
     g_native_canted_eye_geometry_valid = native_canted_valid;
+    g_modern_camera_tracking = {views, g_hmd_center_yaw_orientation,
+        g_hmd_center_position, display_time,
+        runtime_pose_valid && eye_geometry_valid && display_time > 0};
+    g_modern_camera_tracking_generation = g_streamline_capture_generation.load(std::memory_order_acquire);
     g_hmd_pose_valid.store(true, std::memory_order_release);
 }
 
@@ -47900,6 +47957,7 @@ void prepare_openxr_render_frame(uint32_t origin) {
     }
 
     update_motion_controllers(frame_state.predictedDisplayTime);
+    std::array<XrView, 2> located_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
     XrViewState view_state{XR_TYPE_VIEW_STATE};
     XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
     locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -47907,7 +47965,7 @@ void prepare_openxr_render_frame(uint32_t origin) {
     locate_info.space = g_xr_space;
     uint32_t view_count{};
     result = pfn_xrLocateViews(g_xr_session, &locate_info, &view_state,
-        static_cast<uint32_t>(g_xr_views.size()), &view_count, g_xr_views.data());
+        static_cast<uint32_t>(located_views.size()), &view_count, located_views.data());
 
     g_xr_render_frame_state = frame_state;
     g_xr_render_views_valid = XR_SUCCEEDED(result) && view_count >= 2;
@@ -47915,8 +47973,14 @@ void prepare_openxr_render_frame(uint32_t origin) {
         g_xr_render_views_valid ? view_state.viewStateFlags : 0,
         std::memory_order_release);
     if (g_xr_render_views_valid) {
+        g_xr_views[0] = located_views[0];
+        g_xr_views[1] = located_views[1];
         update_runtime_eye_geometry();
-        update_hmd_freelook_pose();
+        update_hmd_freelook_pose(frame_state.predictedDisplayTime, located_views, view_state.viewStateFlags);
+    } else {
+        std::scoped_lock pose_lock{g_hmd_pose_snapshot_mutex};
+        g_modern_camera_tracking = {};
+        g_modern_camera_tracking_generation = 0;
     }
     g_xr_render_frame_prepared.store(true);
 }
@@ -47975,7 +48039,7 @@ XrTime locate_openxr_mode3_pair_pose() {
     g_xr_render_view_state_flags.store(
         view_state.viewStateFlags, std::memory_order_release);
     update_runtime_eye_geometry();
-    update_hmd_freelook_pose();
+    update_hmd_freelook_pose(target_time, located_views, view_state.viewStateFlags);
     return target_time;
 }
 
