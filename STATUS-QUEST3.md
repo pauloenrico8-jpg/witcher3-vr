@@ -6,6 +6,50 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Câmera do olho na seleção de objetos do mundo — 8 de outubro
+
+A seleção de objetos do mundo agora encaminha a câmera principal de cada olho
+para uma cópia privada que o jogo já constrói. Essa cópia conserva a lente do
+olho, em vez de começar com a lente secundária usada no monitor. Uma cópia
+privada é uma câmera temporária usada somente nessa tarefa do jogo.
+
+O fluxo, passo a passo:
+
+1. A tarefa recebe do próprio jogo a cena e os dados da imagem que está
+   processando. Confere a identificação dessa imagem, o olho e a sessão atual;
+   não pega a identificação de outra tarefa executada em paralelo.
+2. Confere que a cena pertence ao mesmo responsável pela seleção dos objetos.
+   Uma chamada desconhecida usa uma identificação neutra durante sua execução
+   e restaura a anterior ao terminar.
+3. Somente na cópia específica dessa tarefa, verifica a origem secundária e
+   o destino separado das duas câmeras. Leituras repetidas precisam coincidir,
+   e os dados básicos da lente precisam ser válidos.
+4. Entrega à função original o endereço da câmera principal daquele olho.
+   As cópias de números usadas na conferência não viram objetos do jogo.
+   O jogo conserva o destino, o resultado, a reconstrução e a liberação da
+   câmera temporária. O movimento da cabeça não é aplicado uma segunda vez.
+5. Se alguma conferência falhar, chama o caminho original com sua câmera
+   original. As cinco passagens do grupo precisam estar instaladas e
+   conferidas antes de permitir a adaptação.
+
+Escolhi trocar a origem dessa cópia porque isso deixa o próprio jogo calcular
+os dados derivados e cuidar da câmera temporária. Copiar seus bytes para um
+objeto inventado pelo mod não conservaria as referências que o jogo administra.
+
+DLL compilada; **110/110 testes passaram em 10,92 segundos**. O teste novo
+passou em **80 verificações no processador**: duas lentes, bordas de objetos
+visíveis, origem real da câmera, argumentos e resultado originais, rejeição de
+dados inválidos, restauração após chamadas internas e separação entre tarefas.
+Não executaram o jogo, suas funções nativas, a instalação das passagens ou o
+Quest. Leituras repetidas iguais não comprovam posse nem reserva dos objetos.
+
+**Ainda não está jogável; nada instalado e a 5.00c continua bloqueada.**
+Faltam a ordem e a vida útil dos dados compartilhados, outros consumidores de
+visibilidade, históricos, efeitos, recursos e parada segura. Depois verificar
+as duas imagens novas por quadro no jogo e imagem/cabeça no Quest. Mãos, armas,
+dano e bloqueio físico continuam exigindo integração real. DLSS complementar;
+a meta de FPS permanece cancelada. Novos dados nativos continuam somente locais.
+
 ## Vegetação na etapa antecipada da câmera — 8 de outubro
 
 A adaptação agora cobre também as duas atualizações antecipadas de vegetação
