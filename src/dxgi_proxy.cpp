@@ -33,6 +33,7 @@
 #include "modern_vegetation_view.h"
 #include "modern_world_culling_view.h"
 #include "modern_command_queue.h"
+#include "modern_queue_lifecycle.h"
 #include "engine_render_core.h"
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
@@ -2362,6 +2363,7 @@ w3vr::frame_preparation::PrepareFrame g_remastered_engine_prepare{};
 w3vr::frame_preparation::PrepareFrame g_remastered_effects_apply{};
 w3vr::frame_submission::ConstructCommand g_remastered_command_construct{};
 std::atomic<bool> g_remastered_preparation_hooks_ready{};
+std::atomic<bool> g_remastered_preparation_install_attempted{};
 using EngineViewRebuildFn = void(__fastcall*)(float*);
 EngineViewRebuildFn g_engine_view_rebuild{};
 using EngineViewCopyRebuildFn = float*(__fastcall*)(float*, const float*);
@@ -41334,8 +41336,92 @@ bool submit_engine_duplicate_frame(uintptr_t module, void* render_context,
     return false;
 }
 
+using RemasteredQueueConstruct=void*(__fastcall*)(void*,void*,uint8_t);
+using RemasteredQueueStop=void(__fastcall*)(void*);
+using RemasteredQueueDestroy=void*(__fastcall*)(void*,uint32_t);
+RemasteredQueueConstruct g_remastered_queue_construct{};
+RemasteredQueueStop g_remastered_queue_stop{};
+RemasteredQueueDestroy g_remastered_queue_destroy{};
+w3vr::modern_queue_lifecycle::Observations g_remastered_queue_observations;
+std::atomic<bool> g_remastered_queue_lifecycle_hooks_ready{};
+std::atomic<bool> g_remastered_queue_lifecycle_install_attempted{};
+
+bool read_remastered_constructed_queue(uintptr_t module,void* memory,void* owner,
+    w3vr::modern_command_queue::Identity& result) {
+    namespace q=w3vr::modern_command_queue;
+    namespace life=w3vr::modern_queue_lifecycle;
+    const auto renderer=reinterpret_cast<uintptr_t>(owner),queue=reinterpret_cast<uintptr_t>(memory);
+    uintptr_t end{};
+    if(!q::add(renderer,q::renderer_prefix_bytes,end) || !q::add(queue,life::constructed_prefix_bytes,end))return false;
+    std::array<uint8_t,q::renderer_prefix_bytes> rp{},repeat_rp{};
+    std::array<uint8_t,life::constructed_prefix_bytes> qp{},repeat_qp{};
+    __try {
+        std::memcpy(rp.data(),owner,rp.size());std::memcpy(qp.data(),memory,qp.size());
+        std::memcpy(repeat_rp.data(),owner,repeat_rp.size());std::memcpy(repeat_qp.data(),memory,repeat_qp.size());
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    q::Identity first{},second{};
+    if(!life::read_constructed_identity(module,renderer,rp,queue,qp,first) ||
+        !life::read_constructed_identity(module,renderer,repeat_rp,queue,repeat_qp,second) || first!=second)return false;
+    result=first;return true;
+}
+void* __fastcall hook_remastered_queue_construct(void* memory,void* owner,uint8_t mode) {
+    namespace life=w3vr::modern_queue_lifecycle;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto address=reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const auto caller=module && address>=module?address-module:0;
+    // Constructor return precedes the caller's renderer+110 store. Read the
+    // actual constructor owner at queue+68; never synthesize that store.
+    const auto construction=g_remastered_queue_observations.begin(reinterpret_cast<uintptr_t>(memory));
+    auto* result=g_remastered_queue_construct(memory,owner,mode);
+    w3vr::modern_command_queue::Identity identity{};
+    if(result!=memory || !life::known_construction(caller,mode) ||
+        !read_remastered_constructed_queue(module,memory,owner,identity) ||
+        !g_remastered_queue_observations.finish(construction,identity))
+        g_remastered_queue_observations.cancel(construction);
+    return result;
+}
+void __fastcall hook_remastered_queue_stop(void* queue) {
+    // Close admission before the original posts its null-vtable stop command.
+    // No lock is held across the native allocation/publication or its waits.
+    g_remastered_queue_observations.retire(reinterpret_cast<uintptr_t>(queue));
+    g_remastered_queue_stop(queue);
+}
+void* __fastcall hook_remastered_queue_destroy(void* queue,uint32_t flags) {
+    g_remastered_queue_observations.retire(reinterpret_cast<uintptr_t>(queue));
+    return g_remastered_queue_destroy(queue,flags);
+}
+bool install_remastered_queue_lifecycle_hooks() {
+    namespace life=w3vr::modern_queue_lifecycle;
+    if(g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire))return true;
+    if(selected_scene_factory_version()!=w3vr::scene_factory::Version::remastered_500c)return false;
+    if(g_remastered_queue_lifecycle_install_attempted.exchange(true,std::memory_order_acq_rel))return false;
+    auto* module=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if(!module)return false;
+    struct Hook {uintptr_t rva;void* detour;void** original;std::span<const uint8_t> signature;};
+    const std::array<Hook,3> hooks{{
+        {life::construct_rva,reinterpret_cast<void*>(&hook_remastered_queue_construct),
+            reinterpret_cast<void**>(&g_remastered_queue_construct),life::construct_signature},
+        {life::stop_rva,reinterpret_cast<void*>(&hook_remastered_queue_stop),
+            reinterpret_cast<void**>(&g_remastered_queue_stop),life::stop_signature},
+        {life::destroy_rva,reinterpret_cast<void*>(&hook_remastered_queue_destroy),
+            reinterpret_cast<void**>(&g_remastered_queue_destroy),life::destroy_signature}}};
+    for(const auto& hook:hooks)if(!remastered_render_entry_matches(module+hook.rva,hook.signature))return false;
+    for(const auto& hook:hooks)if(MH_CreateHook(module+hook.rva,hook.detour,hook.original)!=MH_OK)return false;
+    size_t enabled{};
+    for(;enabled<hooks.size();++enabled)if(MH_EnableHook(module+hooks[enabled].rva)!=MH_OK)break;
+    if(enabled!=hooks.size()){
+        for(size_t i=0;i<enabled;++i)MH_DisableHook(module+hooks[i].rva);
+        log_line("Remastered queue lifecycle activation incomplete; admission closed, originals retained");
+        return false;
+    }
+    g_remastered_queue_lifecycle_hooks_ready.store(true,std::memory_order_release);
+    log_line("Remastered queue constructor/stop/destroy observers installed; observations are not lifetime leases");
+    return true;
+}
+
 struct RemasteredPreparationContext {
     w3vr::modern_command_queue::Identity command_queue{};
+    w3vr::modern_queue_lifecycle::Snapshot queue_observation{};
     void* world_handle{};
     void* world_receiver{};
     void* engine{};
@@ -41429,7 +41515,10 @@ bool read_remastered_preparation_context(uintptr_t module, void* game,
         void* shared_callback{};
         memcpy(&shared_callback, static_cast<const uint8_t*>(context.engine) + 0x40,
             sizeof(shared_callback));
-        return shared_callback == nullptr && read_remastered_command_queue(module,context.command_queue);
+        return shared_callback == nullptr &&
+            g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire) &&
+            read_remastered_command_queue(module,context.command_queue) &&
+            g_remastered_queue_observations.snapshot(context.command_queue,context.queue_observation);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         context = {};
         return false;
@@ -41570,8 +41659,10 @@ bool install_remastered_preparation_hooks() {
     if (g_remastered_preparation_hooks_ready.load(std::memory_order_acquire)) return true;
     // Keep any trampolines from a failed enable alive; do not retry against a
     // partially installed set or remove code a suspended hook could still use.
-    if (g_remastered_producer != nullptr) return false;
+    // Retaining originals closes this failure race, not the DLL unload barrier.
     if (selected_scene_factory_version() != w3vr::scene_factory::Version::remastered_500c)
+        return false;
+    if (g_remastered_preparation_install_attempted.exchange(true, std::memory_order_acq_rel))
         return false;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     if (module == nullptr) return false;
@@ -41599,15 +41690,19 @@ bool install_remastered_preparation_hooks() {
     }
     if (!queued) {
         for (size_t n = 0; n < created; ++n) {
-            MH_RemoveHook(module + hooks[n].rva);
-            *hooks[n].original = nullptr;
+            // Cancel only our queued changes. A hook body may already be in
+            // flight after another batch activation; keep its original alive.
+            MH_QueueDisableHook(module + hooks[n].rva);
+            MH_DisableHook(module + hooks[n].rva);
         }
         log_line("Remastered preparation hook installation failed; factory not enabled");
         return false;
     }
     if (MH_ApplyQueued() != MH_OK) {
-        for (const auto& hook : hooks) MH_QueueDisableHook(module + hook.rva);
-        MH_ApplyQueued();
+        for (const auto& hook : hooks) {
+            MH_QueueDisableHook(module + hook.rva);
+            MH_DisableHook(module + hook.rva);
+        }
         log_line("Remastered preparation hook enable failed; duplicate production disabled");
         return false;
     }
@@ -42255,7 +42350,8 @@ void install_engine_frame_factory_probe() {
         w3vr::scene_factory::factory_rva(selected_scene_factory_version());
     if (kEngineFrameDataFactoryRva == 0) return;
     if (selected_scene_factory_version() == w3vr::scene_factory::Version::remastered_500c &&
-        (!install_remastered_camera_copy_hooks() || !install_remastered_preparation_hooks())) return;
+        (!install_remastered_queue_lifecycle_hooks() || !install_remastered_camera_copy_hooks() ||
+            !install_remastered_preparation_hooks())) return;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameDataFactoryRva : nullptr;
     if (target != nullptr &&
