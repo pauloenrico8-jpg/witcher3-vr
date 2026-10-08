@@ -7,6 +7,44 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Preparo privado da pose por olho — checkpoint de 7 de outubro, noite
+
+`modern_camera_pose.h` recebe uma leitura copiada de duas visões OpenXR, origem
+de recentralização, horário previsto e opções. Prepara os dois descritores
+antes de publicar a saída. Rejeita leituras inválidas, dados incompletos,
+câmeras sem perspectiva, ângulos inválidos e geometria de olhos imprópria.
+Falhas conservam a saída anterior; erro de alocação também retorna rejeição.
+
+A cabeça usa o rumo recentralizado e uma mudança de eixos apropriada. A escala
+atua apenas no deslocamento do centro da cabeça; a separação e a inclinação dos
+olhos vêm do runtime. Usa um movimento rígido comum, ancorado na câmera
+principal, para preservar a relação da câmera interna secundária. A conversão
+para os três ângulos do jogo trata a singularidade de inclinação vertical e
+confere a equivalência da orientação codificada.
+
+Somente os seis floats da pose atual de cada câmera mudam em dois buffers
+privados. FOV, projeção, histórico, matrizes e referências embutidas ficam
+intactos. Os buffers não são objetos nativos construídos e não possuem as
+referências copiadas; nunca recebem um destrutor do jogo. Vida útil/propriedade
+completa dos objetos indiretos continua pendente. As duas fábricas recebem
+entradas de olhos distintos preparadas do mesmo snapshot. A substituição do
+ponteiro de entrada é deliberada; não é encaminhamento de argumentos idênticos.
+
+A integração congela leitura/horário/geração antes das fábricas e repete a mesma
+leitura nas duas tags. As funções de cópia/rebuild modernas só encaminham uma
+vez; não aplicam o HMD novamente. Rejeição anterior às fábricas conserva a
+entrada original. Uma falha posterior não permite chamar o quadro transformado
+de fallback original intacto. Nenhuma conclusão GPU/imagem é publicada.
+
+Build Release e 108/108 CTest em12,36s; teste novo351 verificações CPU, incluindo
+matrizes trigonométricas independentes e todos os bytes fora das seis escritas.
+Não executou Native, Witcher, Quest, MinHook install/failure ou dados reais de
+câmera. **Global preflight inalterado; 5.00c fechado; nada instalado.** Próximo:
+projeção/centro óptico por olho, históricos, visibilidade/efeitos, ownership e
+ordem de recursos/tarefas e barreira de parada, depois prova de dois olhos novos
+por quadro e teste de headset. DLSS não é condição para esse primeiro teste.
+Os novos relatórios nativos permanecem locais, fora da publicação de código.
+
 ## Entrada e epílogo normais — checkpoint de 7 de outubro
 
 `engine_render_core.h` e `dxgi_proxy.cpp` acrescentam uma passagem própria para

@@ -6,6 +6,57 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Pose do headset nas entradas privadas de câmera — 7 de outubro, noite
+
+Implementei o preparo da posição e da rotação para os dois olhos, antes de
+criar qualquer um dos quadros. É código integrado ao caminho moderno da
+fábrica de quadros, ainda atrás do bloqueio de compatibilidade da 5.00c.
+
+O fluxo, em linguagem simples:
+
+1. O OpenXR, que fornece o rastreamento do Quest, entrega as duas visões juntas.
+   O código guarda essa leitura, seu horário previsto e a origem usada para
+   recentralizar. A fábrica exige a mesma geração e o horário do par pedido.
+2. Cria duas cópias privadas dos dados de entrada. Os dados originais do jogo
+   ficam intactos. Calcula os dois olhos antes de chamar a primeira fábrica.
+3. Converte direita/cima/trás do headset para os eixos do jogo. Soma o movimento
+   da cabeça à câmera e conserva a distância física entre os olhos. Ajustar a
+   escala do deslocamento da cabeça não aumenta nem diminui essa distância.
+4. Aplica a mesma transformação ao conjunto das duas câmeras internas de uma
+   cena, preservando sua posição e sua orientação relativas. Essas câmeras
+   internas não são os dois olhos: cada olho recebe seu próprio quadro.
+5. Muda somente seis números de pose por câmera. O campo de visão, as matrizes,
+   o histórico e as referências de outros objetos continuam intactos nas
+   cópias. O jogo reconstrói as matrizes quando copia essas novas entradas.
+   As passagens de cópia e reconstrução não somam a pose novamente.
+6. Guarda a mesma leitura congelada nas identificações dos dois quadros. Se o
+   preparo falhar antes das fábricas, usa a entrada original. Se a sequência ou
+   geração falhar depois, não admite o par; o quadro já criado pode conter a
+   pose de um olho e não é apresentado como uma imagem original sem alteração.
+
+Escolhi preparar cópias antes da fábrica porque ela reconstrói as câmeras mais
+uma vez ao criar o quadro final. Corrigir a cabeça durante ambas as cópias
+repetiria a rotação e o deslocamento. As cópias privadas também permitem
+rejeitar um preparo incompleto antes de alterar qualquer entrada do jogo.
+
+A DLL compilou. **108/108 testes passaram em 12,36 segundos**; o teste novo tem
+**351 verificações no processador**: eixos, recentralização, distância entre
+olhos, câmeras com bases diferentes, inclinação dos olhos, ângulos verticais,
+dados inválidos e preservação de todos os bytes fora da pose. As matrizes de
+referência usam fórmulas trigonométricas independentes. Não executaram o jogo,
+funções nativas, o headset nem a instalação das passagens.
+
+**Ainda não está jogável e nada foi instalado.** O preparo mantém a projeção
+original; falta portar o campo de visão/centro óptico para cada olho, os
+históricos, a visibilidade e demais efeitos, a vida útil/ordem dos recursos e
+as tarefas e sua parada segura. O bloqueio global da 5.00c permanece igual.
+Depois verificar imagens novas nos dois olhos a cada quadro no jogo, fazer o
+primeiro teste no Quest e integrar mãos, armas e contato/dano/bloqueio físicos.
+O primeiro teste de imagem poderá preceder o combate pronto; ainda não há data
+confiável. Não existe meta de FPS. DLSS permanece complementar.
+Código: `src/modern_camera_pose.h`; integração: `src/dxgi_proxy.cpp`.
+Evidências e recibo desta rodada ficam na pasta local `../artifacts`.
+
 ## Entrada normal e tarefa de desenho da 5.00c — 7 de outubro
 
 Adaptei a entrada principal do renderizador e a tarefa de epílogo normal. O
