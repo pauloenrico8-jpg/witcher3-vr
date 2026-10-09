@@ -35,6 +35,13 @@
 #include "modern_command_queue.h"
 #include "modern_queue_lifecycle.h"
 #include "engine_render_core.h"
+#include "modern_eye_capture.h"
+static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
+    D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
+    D3D12_RESOURCE_STATE_PRESENT == 0 &&
+    D3D12_RESOURCE_BARRIER_FLAG_NONE == 0 &&
+    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES == UINT32_MAX);
+
 #include "engine_camera_authority.h"
 #include "engine_view_constants_contract.h"
 #include "engine_dlss_contract.h"
@@ -2965,6 +2972,9 @@ struct EngineFrameTag {
     bool task_provenance_valid{};
     bool modern_camera_lineage_complete{}; // CPU factory receipt, NOT native lifetime or GPU completion.
 };
+
+thread_local w3vr::modern_eye_capture::Identity g_modern_capture_identity{};
+thread_local EngineFrameTag g_modern_capture_tag{};
 
 // [FIX:AER-CINEMA-EXACT-EYE-CONTRACT V1214 2/12] A completed REDengine task
 // is the only scene-eye authority accepted by AER Cinema. producer_present is
@@ -12261,6 +12271,25 @@ bool mode3_aer_cinema_exact_eye_contract_active() {
         g_engine_menu_state.load(std::memory_order_relaxed) == 0;
 }
 
+// A synchronous modern native call labels this concrete recording operation.
+// Never infer a modern eye from the old completed-task FIFO or Present parity.
+bool snapshot_modern_noaa_capture_tag(EngineFrameTag& tag) {
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if (g_config.openxr_mode!=3 || g_config.temporal_backend!=TemporalBackend::None ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire) ||
+        !w3vr::modern_eye_capture::admits(g_modern_capture_identity,contract,
+            g_remastered_core_installed_profile.load(std::memory_order_acquire),
+            g_remastered_core_hooks_ready.load(std::memory_order_acquire),
+            g_streamline_capture_generation.load(std::memory_order_acquire))) return false;
+    const auto& candidate=g_modern_capture_tag;
+    const auto& label=g_modern_capture_identity.frame;
+    if (candidate.eye!=static_cast<uint32_t>(label.eye) || candidate.pair_id!=label.pair ||
+        candidate.generation!=label.generation || !candidate.render_view_valid ||
+        !candidate.modern_camera_lineage_complete) return false;
+    tag=candidate;tag.task_provenance_valid=true;
+    return true;
+}
+
 bool current_exact_engine_render_tag(EngineFrameTag& tag) {
     const uint32_t generation =
         g_streamline_capture_generation.load(std::memory_order_acquire);
@@ -13574,6 +13603,21 @@ void log_first_person_aim_diagnostic(const char* fmt, ...) {
 
 bool game_swapchain_owns_resource(ID3D12Resource* resource) {
     return w3vr::swapchain_identity::owns_resource(g_game_swapchain, resource);
+}
+
+ID3D12Resource* acquire_current_game_backbuffer() {
+    if (!g_game_swapchain) return nullptr;
+    IDXGISwapChain3* chain{};
+    if (FAILED(g_game_swapchain->QueryInterface(IID_PPV_ARGS(&chain))) || !chain) {
+        if (chain) chain->Release();
+        return nullptr;
+    }
+    ID3D12Resource* resource{};
+    const auto index=chain->GetCurrentBackBufferIndex();
+    const auto result=chain->GetBuffer(index,IID_PPV_ARGS(&resource));
+    chain->Release();
+    if (FAILED(result)) { if(resource) resource->Release(); return nullptr; }
+    return resource; // Caller owns this reference; not an engine descriptor clone.
 }
 
 void diagnose_final_present_resource_identity(
@@ -29030,7 +29074,9 @@ void STDMETHODCALLTYPE hook_resource_barrier(
     // this symmetric AER No-AA route presents only the final-backbuffer eye
     // cache. Do not keep recording a second, unused scene-only copy into the
     // packed capture ring on every PRESENT transition.
-    if (g_config.openxr_mode == 3 &&
+    const bool modern_capture_contract = w3vr::render_core::modern_selected(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire)) != nullptr;
+    if (!modern_capture_contract && g_config.openxr_mode == 3 &&
         !mode3_aer_final_present_source_active() &&
         !mode3_taau_afw_final_source_active() &&
         g_engine_dual_render_active.load() &&
@@ -29193,6 +29239,43 @@ void STDMETHODCALLTYPE hook_resource_barrier(
     }
 
     g_resource_barrier(command_list, num_barriers, barriers);
+    // Modern No-AA uses the eye of this exact native recording operation. The
+    // source is the CURRENT game swapchain texture, held until recording ends.
+    // Copies use the concrete endpoint seen by ExecuteCommandLists, which
+    // later publishes existing per-copy tickets/fences for the owned eye ring.
+    EngineFrameTag modern_copy_tag{};
+    if (modern_capture_contract && !g_packed_capture_internal && barriers &&
+        command_list_is_recording_endpoint(command_list) &&
+        command_list->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT &&
+        snapshot_modern_noaa_capture_tag(modern_copy_tag)) {
+        ID3D12Resource* source=acquire_current_game_backbuffer();
+        if (source) {
+            const D3D12_RESOURCE_BARRIER* last{};
+            for (UINT i=0;i<num_barriers;++i)
+                if (barriers[i].Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                    barriers[i].Transition.pResource==source) last=&barriers[i];
+            const auto description=source->GetDesc();
+            w3vr::modern_eye_capture::Request request{};
+            if (last && w3vr::modern_eye_capture::prepare(g_modern_capture_identity,
+                    g_engine_camera_temporal_contract.load(std::memory_order_acquire),
+                    g_remastered_core_installed_profile.load(std::memory_order_acquire),
+                    g_remastered_core_hooks_ready.load(std::memory_order_acquire),
+                    g_streamline_capture_generation.load(std::memory_order_acquire),
+                    reinterpret_cast<uintptr_t>(command_list),true,
+                    reinterpret_cast<uintptr_t>(source),true,
+                    description.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        description.MipLevels==1 && description.DepthOrArraySize==1 &&
+                        description.Width==g_game_render_width && description.Height==g_game_render_height,
+                    {static_cast<uint32_t>(last->Flags),static_cast<uint32_t>(last->Transition.StateBefore),
+                     static_cast<uint32_t>(last->Transition.StateAfter),last->Transition.Subresource},request)) {
+                capture_tagged_backbuffer_output(command_list,source,D3D12_RESOURCE_STATE_PRESENT,
+                    static_cast<uint32_t>(request.eye),request.generation,request.pair,
+                    modern_copy_tag.render_view,modern_copy_tag.render_view_valid,
+                    static_cast<uint32_t>(request.eye),true);
+            }
+            source->Release();
+        }
+    }
     if (early_hud_capture_source != nullptr) {
         capture_mode3_early_hud(
             command_list, early_hud_capture_source,
@@ -31132,12 +31215,14 @@ struct RemasteredCoreThreadState {
     HmdCameraPoseSnapshot hmd{};
     void* audit_frame{};
     w3vr::modern_vegetation_view::Context vegetation{};
+    w3vr::modern_eye_capture::Identity capture_identity{};
+    EngineFrameTag capture_tag{};
 };
 RemasteredCoreThreadState read_remastered_core_thread_state() {
     return {g_engine_render_eye, g_engine_render_generation, g_engine_render_pair_id,
         g_engine_render_view, g_engine_render_view_valid, g_engine_render_tag_frame_lookup_exact,
         g_engine_render_pixel_projection, g_engine_render_hmd_pose, g_asymmetric_render_frame,
-        g_remastered_vegetation_context};
+        g_remastered_vegetation_context,g_modern_capture_identity,g_modern_capture_tag};
 }
 void apply_remastered_core_thread_state(const RemasteredCoreThreadState& state) {
     g_engine_render_eye = state.eye;
@@ -31150,6 +31235,8 @@ void apply_remastered_core_thread_state(const RemasteredCoreThreadState& state) 
     g_engine_render_hmd_pose = state.hmd;
     g_asymmetric_render_frame = state.audit_frame;
     g_remastered_vegetation_context = state.vegetation;
+    g_modern_capture_identity=state.capture_identity;
+    g_modern_capture_tag=state.capture_tag;
 }
 void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* scene) {
     const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
@@ -31177,7 +31264,8 @@ void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* s
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
         tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,
         {reinterpret_cast<uintptr_t>(renderer), reinterpret_cast<uintptr_t>(frame),
-            reinterpret_cast<uintptr_t>(scene), label, true}};
+            reinterpret_cast<uintptr_t>(scene), label, true},
+        {profile, reinterpret_cast<uintptr_t>(renderer), label}, tag};
     w3vr::render_core::invoke(contract, caller, g_engine_frame_builder,
         renderer, frame, scene, found_label ? &label : nullptr,
         g_streamline_capture_generation.load(std::memory_order_acquire),
@@ -31216,7 +31304,8 @@ void __fastcall hook_remastered_normal_epilogue(void* task) {
         tag.modern_camera_lineage_complete};
     const RemasteredCoreThreadState labelled{
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
-        tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr};
+        tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,{},
+        {record.profile,record.renderer,label},tag};
     w3vr::render_core::invoke_epilogue(contract, g_remastered_normal_epilogue,
         task, record_valid ? &record : nullptr, found_label ? &label : nullptr,
         g_streamline_capture_generation.load(std::memory_order_acquire),
