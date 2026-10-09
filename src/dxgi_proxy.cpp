@@ -2340,6 +2340,7 @@ using EngineFrameBuilderFn = w3vr::render_core::NativeCore;
 EngineFrameBuilderFn g_engine_frame_builder{};
 w3vr::render_core::NativeEpilogue g_remastered_normal_epilogue{};
 std::atomic<bool> g_remastered_core_hooks_ready{};
+std::atomic<const w3vr::render_core::Profile*> g_remastered_core_installed_profile{};
 w3vr::modern_vegetation_view::NativeUpdate g_remastered_vegetation_update{};
 w3vr::modern_vegetation_view::NativePreselection g_remastered_vegetation_preselection{};
 thread_local w3vr::modern_vegetation_view::Context g_remastered_vegetation_context{};
@@ -31156,10 +31157,12 @@ void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* s
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     EngineFrameTag tag{};
     bool found_label{};
-    if (contract == &w3vr::engine_camera::remastered_500c &&
-        caller == w3vr::render_core::remastered_500c.normal_return && frame &&
+    const auto* profile = w3vr::render_core::modern_selected(contract);
+    if (profile && caller == profile->normal_return && frame &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
-        g_remastered_core_hooks_ready.load(std::memory_order_acquire)) {
+        w3vr::render_core::ready_for(contract,
+            g_remastered_core_installed_profile.load(std::memory_order_acquire),
+            g_remastered_core_hooks_ready.load(std::memory_order_acquire))) {
         std::scoped_lock lock{g_engine_dual_frame_mutex};
         const auto found = g_engine_dual_frame_eyes.find(frame);
         if (found != g_engine_dual_frame_eyes.end()) {
@@ -31184,19 +31187,22 @@ void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* s
     // list, ready image or a GPU fence. Do not publish any of those here.
 }
 
-bool read_remastered_epilogue_task(void* task, w3vr::render_core::TaskRecord& result) {
-    if (!task) return false;
+bool read_remastered_epilogue_task(const w3vr::engine_camera::TemporalContract* contract,
+    void* task, w3vr::render_core::TaskRecord& result) {
+    if (!w3vr::render_core::modern_selected(contract) || !task) return false;
     std::array<uint8_t, 0x30> prefix{};
     __try { std::memcpy(prefix.data(), task, prefix.size()); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return w3vr::render_core::read_epilogue_record(prefix,
+    return w3vr::render_core::read_epilogue_record(contract, prefix,
         reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), result);
 }
 void __fastcall hook_remastered_normal_epilogue(void* task) {
     const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     w3vr::render_core::TaskRecord record{};
-    const bool record_valid = contract == &w3vr::engine_camera::remastered_500c &&
-        read_remastered_epilogue_task(task, record);
+    const bool admitted = w3vr::render_core::ready_for(contract,
+        g_remastered_core_installed_profile.load(std::memory_order_acquire),
+        g_remastered_core_hooks_ready.load(std::memory_order_acquire));
+    const bool record_valid = admitted && read_remastered_epilogue_task(contract, task, record);
     EngineFrameTag tag{};
     bool found_label{};
     if (record_valid && g_engine_dual_render_active.load(std::memory_order_acquire) &&
@@ -31914,6 +31920,8 @@ bool install_remastered_render_core_hooks(uint8_t* module) {
         log_line("Remastered core hook activation incomplete; admission closed, originals retained");
         return false;
     }
+    g_remastered_core_installed_profile.store(&w3vr::render_core::remastered_500c,
+        std::memory_order_release);
     g_remastered_core_hooks_ready.store(true, std::memory_order_release);
     log_line("Remastered core, epilogue and primary-eye vegetation/world visibility adapters installed; GPU completion not implied");
     return true;
@@ -31934,8 +31942,10 @@ void install_engine_frame_builder_probe() {
     const auto* profile = w3vr::render_core::selected(
         g_engine_camera_temporal_contract.load(std::memory_order_acquire));
     if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) || !profile) return;
+    const auto route = w3vr::render_core::install_route(profile);
+    if (route == w3vr::render_core::InstallRoute::unsupported) return;
     const uintptr_t kEngineFrameBuilderRva = profile->entry;
-    const bool modern = profile == &w3vr::render_core::remastered_500c;
+    const bool modern = route == w3vr::render_core::InstallRoute::remastered_500c_bundle;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameBuilderRva : nullptr;
     if (modern) { install_remastered_render_core_hooks(module); return; }
