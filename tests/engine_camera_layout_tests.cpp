@@ -646,7 +646,8 @@ void test_copy_profiles_never_mix_builds() {
     const auto* current = &engine_camera::remastered_1048522;
     require(!layout::selected(current) && !layout::temporal_writer_rva(current) &&
         !layout::normal_temporal_route(current, 0x01C1B7B1) &&
-        !engine_camera_authority::selected(current) && !render_core::selected(current),
+        !engine_camera_authority::selected(current) &&
+        render_core::install_route(render_core::selected(current)) == render_core::InstallRoute::unsupported,
         "Camera copy profile silently admitted an unported subsystem");
 }
 
@@ -682,6 +683,7 @@ CoreFixtureState filled_core_state(int eye, std::uint64_t pair) {
 #else
 #define W3VR_CORE_TEST_CALL
 #endif
+const w3vr::engine_camera::TemporalContract* core_fixture_contract = &w3vr::engine_camera::remastered_500c;
 void W3VR_CORE_TEST_CALL core_fixture_original(void* renderer, void* frame, void* scene) {
     ++core_calls;
     core_seen_args = {renderer, frame, scene};
@@ -693,7 +695,7 @@ void W3VR_CORE_TEST_CALL core_fixture_original(void* renderer, void* frame, void
         const auto expected = core_expected;
         core_expected = {};
         core::FrameLabel inherited{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
-        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01C1DE0E,
+        core::invoke(core_fixture_contract, 0x01C1DE0E,
             core_fixture_original, renderer, frame, scene, &inherited, 7,
             expected, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
         require(core_state == outer, "Rejected nested core did not restore outer CPU label");
@@ -702,7 +704,7 @@ void W3VR_CORE_TEST_CALL core_fixture_original(void* renderer, void* frame, void
         const auto inner = filled_core_state(1, 999);
         core_expected = inner;
         const core::FrameLabel own{reinterpret_cast<std::uintptr_t>(frame), 7, 999, 1, true, true};
-        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01D05551,
+        core::invoke(core_fixture_contract, core::selected(core_fixture_contract)->normal_return,
             core_fixture_original, renderer, frame, scene, &own, 7,
             inner, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
         require(core_state == outer, "Accepted nested core did not restore all outer state");
@@ -715,6 +717,9 @@ void W3VR_CORE_TEST_CALL core_fixture_original(void* renderer, void* frame, void
 }
 #undef W3VR_CORE_TEST_CALL
 void test_core_native_arguments_labels_and_restoration() {
+    for (const auto* contract : {&w3vr::engine_camera::remastered_500c,
+                                &w3vr::engine_camera::remastered_1048522}) {
+    core_fixture_contract = contract;
     const auto prior = filled_core_state(1, 88);
     // Invalid-to-dereference opaque words expose accidental native pointer reads.
     void* renderer = reinterpret_cast<void*>(std::uintptr_t(0xFEDCBA9876543001ULL));
@@ -726,7 +731,7 @@ void test_core_native_arguments_labels_and_restoration() {
         const auto own = filled_core_state(eye, 123);
         core_expected = own;
         const core::FrameLabel label{reinterpret_cast<std::uintptr_t>(frame), 7, 123, eye, true, true};
-        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01D05551,
+        core::invoke(core_fixture_contract, core::selected(core_fixture_contract)->normal_return,
             core_fixture_original, renderer, frame, core_expected_args[2], &label, 7,
             own, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
         require(core_calls == 3 && core_state == prior,
@@ -738,25 +743,29 @@ void test_core_native_arguments_labels_and_restoration() {
     const core::FrameLabel label{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
     bool caught{};
     try {
-        core::invoke(&w3vr::engine_camera::remastered_500c, 0x01D05551,
+        core::invoke(core_fixture_contract, core::selected(core_fixture_contract)->normal_return,
             core_fixture_original, renderer, frame, scene, &label, 7,
             core_expected, CoreFixtureState{}, read_core_fixture, apply_core_fixture);
     } catch (int value) { caught = value == 31; }
     require(caught && core_calls == 1 && core_state == prior,
         "Core swallowed native C++ exception or left partial thread state");
     core_fixture_mode = 0;
+    }
 }
 void test_core_private_stale_and_unknown_labels_mask() {
+    for (const auto* active : {&w3vr::engine_camera::remastered_500c,
+                             &w3vr::engine_camera::remastered_1048522}) {
+    const auto normal_return = core::selected(active)->normal_return;
     void* renderer = reinterpret_cast<void*>(std::uintptr_t(0x1234567891ULL));
     void* frame = reinterpret_cast<void*>(std::uintptr_t(0x1234567892ULL));
     void* scene = reinterpret_cast<void*>(std::uintptr_t(0x1234567893ULL));
     const auto prior = filled_core_state(1, 88);
     const auto proposed = filled_core_state(0, 123);
-    const auto copied_contract = w3vr::engine_camera::remastered_500c;
+    const auto copied_contract = *active;
     for (int failure = 0; failure < 14; ++failure) {
         const auto* contract = failure == 0 ? nullptr : failure == 1 ? &copied_contract :
-            failure == 2 ? &w3vr::engine_camera::legacy_404 : &w3vr::engine_camera::remastered_500c;
-        auto caller = failure == 3 ? std::uintptr_t(0x01C1DE0E) : std::uintptr_t(0x01D05551);
+            failure == 2 ? &w3vr::engine_camera::legacy_404 : active;
+        auto caller = failure == 3 ? std::uintptr_t(0x01C1DE0E) : normal_return;
         core::FrameLabel label{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
         if (failure == 5) label.frame++;
         if (failure == 6) label.generation = 6;
@@ -775,10 +784,11 @@ void test_core_private_stale_and_unknown_labels_mask() {
         require(core_calls == 1 && core_state == prior, "Rejected core changed forwarding or leaked state");
     }
     const core::FrameLabel good{reinterpret_cast<std::uintptr_t>(frame), 7, 123, 0, true, true};
-    require(!core::accepts_label(&w3vr::engine_camera::remastered_500c, 0x1D05551, 0,
+    require(!core::accepts_label(active, normal_return, 0,
         reinterpret_cast<std::uintptr_t>(frame), &good, 7), "Null renderer accepted as label owner");
-    require(!core::accepts_label(&w3vr::engine_camera::remastered_500c, 0x1D05551,
+    require(!core::accepts_label(active, normal_return,
         reinterpret_cast<std::uintptr_t>(renderer), 0, &good, 7), "Null frame accepted as label owner");
+    }
 }
 void test_core_profile_and_native_prefix() {
     require(core::selected(&w3vr::engine_camera::legacy_404)->entry == 0x1D86400 &&
@@ -789,11 +799,11 @@ void test_core_profile_and_native_prefix() {
     require(!core::selected(&copy), "Copied unverified temporal contract selected core entry");
     const std::array<std::uint8_t, 16> independent{
         0x48,0x8B,0xC4,0x48,0x89,0x50,0x10,0x55,0x53,0x56,0x41,0x54,0x41,0x55,0x41,0x56};
-    require(core::modern_prefix_matches(independent), "Examined modern core bytes rejected");
+    require(core::modern_prefix_matches(&w3vr::engine_camera::remastered_500c, independent), "Examined modern core bytes rejected");
     for (std::size_t i = 0; i < independent.size(); ++i) {
         auto changed = independent; changed[i] ^= 0x80;
-        require(!core::modern_prefix_matches(changed), "Unknown core bytes accepted");
-        require(!core::modern_prefix_matches(std::span<const std::uint8_t>(independent).first(i)),
+        require(!core::modern_prefix_matches(&w3vr::engine_camera::remastered_500c, changed), "Unknown core bytes accepted");
+        require(!core::modern_prefix_matches(&w3vr::engine_camera::remastered_500c, std::span<const std::uint8_t>(independent).first(i)),
             "Truncated modern core entry accepted");
     }
 }
@@ -833,13 +843,13 @@ void test_normal_epilogue_record_and_task_scope() {
     put(prefix, 0x18, std::uint64_t(0xDEAD000012341234ULL)); // Other owner/scene, not frame.
     put(prefix, 0x28, std::uint64_t(frame));
     core::TaskRecord record{};
-    require(core::read_epilogue_record(prefix, module, record) &&
+    require(core::read_epilogue_record(&w3vr::engine_camera::remastered_500c, prefix, module, record) &&
         record.renderer == renderer && record.frame == frame,
         "Normal task record confused its native frame with descriptor/scene");
     const core::TaskRecord sentinel{81, 82};
     for (std::size_t bytes = 0; bytes < 0x30; ++bytes) {
         auto out = sentinel;
-        require(!core::read_epilogue_record(std::span<const std::uint8_t>(prefix).first(bytes), module, out) &&
+        require(!core::read_epilogue_record(&w3vr::engine_camera::remastered_500c, std::span<const std::uint8_t>(prefix).first(bytes), module, out) &&
             out.renderer == 81 && out.frame == 82, "Short task prefix was partially accepted");
     }
     for (int failure = 0; failure < 6; ++failure) {
@@ -850,7 +860,7 @@ void test_normal_epilogue_record_and_task_scope() {
         if (failure == 3) put(bytes, 0x28, std::uint64_t(0));
         if (failure == 4) base = 0;
         if (failure == 5) base = UINTPTR_MAX - 15;
-        require(!core::read_epilogue_record(bytes, base, out) && out.renderer == 81 && out.frame == 82,
+        require(!core::read_epilogue_record(&w3vr::engine_camera::remastered_500c, bytes, base, out) && out.renderer == 81 && out.frame == 82,
             "Unknown/incomplete native task was accepted or changed result");
     }
     core_expected_task = reinterpret_cast<void*>(std::uintptr_t(0xFACE123456789001ULL));
@@ -888,7 +898,128 @@ void test_normal_epilogue_record_and_task_scope() {
     epilogue_mode = 0;
 }
 
+
+void test_core_profiles_reject_mixed_calls_records_and_installation() {
+    using namespace w3vr;
+    const engine_camera::TemporalContract* contracts[]{&engine_camera::remastered_500c,
+        &engine_camera::remastered_1048522};
+    const core::Profile* profiles[]{&core::remastered_500c, &core::remastered_1048522};
+    const std::uintptr_t returns[]{0x01D05551, 0x01D0C5E1};
+    const std::uintptr_t tables[]{0x037A6C40, 0x037B1998};
+    const std::uintptr_t task_entries[]{0x01D57F90, 0x01D5EFC0};
+    const std::uintptr_t core_entries[]{0x01C13630, 0x01C1A210};
+    constexpr std::uintptr_t module = 0x140000000ULL, renderer = 0x12345001, frame = 0x12345002;
+    const core::FrameLabel good{frame, 7, 123, 0, true, true};
+    const auto prior = filled_core_state(1, 88), proposed = filled_core_state(0, 123);
+    const std::array<std::uint8_t,16> core_bytes{
+        0x48,0x8B,0xC4,0x48,0x89,0x50,0x10,0x55,0x53,0x56,0x41,0x54,0x41,0x55,0x41,0x56};
+    const std::array<std::uint8_t,16> task_bytes{
+        0x48,0x8B,0xC4,0x48,0x89,0x58,0x20,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56};
+    for (int version = 0; version < 2; ++version) {
+        const auto* contract = contracts[version];
+        const auto* profile = profiles[version];
+        require(core::selected(contract) == profile && profile->entry == core_entries[version] &&
+            profile->normal_return == returns[version] && profile->epilogue_entry == task_entries[version] &&
+            profile->epilogue_table == tables[version], "Normal core/task profile mixes versioned targets");
+        require(core::modern_prefix_matches(contract,core_bytes) &&
+            core::task_prefix_matches(contract,task_bytes), "Examined core/task entry prefix rejected");
+        for (std::size_t index = 0; index < 16; ++index) {
+            auto changed_core = core_bytes, changed_task = task_bytes;
+            changed_core[index] ^= 0x80; changed_task[index] ^= 0x80;
+            require(!core::modern_prefix_matches(contract,changed_core) &&
+                !core::task_prefix_matches(contract,changed_task) &&
+                !core::modern_prefix_matches(contract,std::span<const std::uint8_t>(core_bytes).first(index)) &&
+                !core::task_prefix_matches(contract,std::span<const std::uint8_t>(task_bytes).first(index)),
+                "Changed/truncated versioned core or task entry accepted");
+        }
+        const auto copied_contract = *contract;
+        const auto copied_profile = *profile;
+        for (const auto* installed : {profile,profiles[1-version],&copied_profile,
+                                     &core::legacy_404,static_cast<const core::Profile*>(nullptr)}) {
+            for (bool ready : {false,true})
+                require(core::ready_for(contract,installed,ready) == (ready && installed == profile),
+                    "Readiness belongs to a different or copied installed profile");
+        }
+        require(!core::ready_for(&copied_contract,profile,true), "Copied contract inherited readiness");
+        for (auto caller : {returns[version], returns[1-version], std::uintptr_t(0x01C69FC7),
+                            std::uintptr_t(0x01C6A1B6), std::uintptr_t(0)}) {
+            const bool admitted = caller == returns[version];
+            core_expected_args = {reinterpret_cast<void*>(renderer),reinterpret_cast<void*>(frame),nullptr};
+            core_fixture_mode = 0;core_calls = 0;core_state = prior;
+            core_expected = admitted ? proposed : CoreFixtureState{};
+            core::invoke(contract,caller,core_fixture_original,core_expected_args[0],core_expected_args[1],
+                nullptr,&good,7,proposed,CoreFixtureState{},read_core_fixture,apply_core_fixture);
+            require(core_calls == 1 && core_state == prior,
+                "Mixed/private normal-core caller changed forwarding or restored state");
+        }
+        std::vector<std::uint8_t> prefix(0x30,0xA7);
+        put(prefix,0,std::uint64_t(module+tables[version]));
+        put(prefix,0x10,std::uint64_t(renderer));put(prefix,0x28,std::uint64_t(frame));
+        core::TaskRecord record{};
+        require(core::read_epilogue_record(contract,prefix,module,record) &&
+            record.renderer == renderer && record.frame == frame && record.profile == profile,
+            "Task prefix lost the profile which validated its primary table");
+        const core::TaskRecord sentinel{81,82,profiles[1-version]};
+        for (int failure = 0; failure < 10; ++failure) {
+            auto bytes = prefix;auto out = sentinel;auto base = module;
+            const auto* selected_contract = contract;
+            if (failure == 0) put(bytes,0,std::uint64_t(module+tables[1-version]));
+            if (failure == 1) put(bytes,0,std::uint64_t(module+tables[version]+8));
+            if (failure == 2) selected_contract = &copied_contract;
+            if (failure == 3) selected_contract = nullptr;
+            if (failure == 4) selected_contract = &engine_camera::legacy_404;
+            if (failure == 5) base = 0;
+            if (failure == 6) base = UINTPTR_MAX-tables[version]+1;
+            if (failure == 7) bytes.resize(0x2F);
+            if (failure == 8) put(bytes,0x10,std::uint64_t(0));
+            if (failure == 9) put(bytes,0x28,std::uint64_t(0));
+            require(!core::read_epilogue_record(selected_contract,bytes,base,out) &&
+                out.renderer == 81 && out.frame == 82 && out.profile == sentinel.profile,
+                "Invalid mixed-version task changed output or received a profile");
+        }
+        core_expected_task = reinterpret_cast<void*>(std::uintptr_t(0x98765001));
+        for (int failure = 0; failure < 5; ++failure) {
+            auto candidate = record;auto* task = core_expected_task;
+            if (failure == 1) candidate.profile = profiles[1-version];
+            if (failure == 2) candidate.profile = &copied_profile;
+            if (failure == 3) candidate.profile = nullptr;
+            if (failure == 4) task = nullptr;
+            const bool admitted = failure == 0;
+            core_expected_task = task;epilogue_mode = admitted ? 1 : 0;epilogue_calls = 0;
+            core_state = prior;core_expected = admitted ? proposed : CoreFixtureState{};
+            core::invoke_epilogue(contract,epilogue_fixture_original,task,&candidate,&good,7,
+                proposed,CoreFixtureState{},read_core_fixture,apply_core_fixture);
+            require(epilogue_calls == (admitted ? 2 : 1) && core_state == prior,
+                "Task record from another profile inherited a label or changed native forwarding");
+        }
+        core_expected_task = reinterpret_cast<void*>(std::uintptr_t(0x98765001));
+        epilogue_mode = 2;epilogue_calls = 0;core_state = prior;core_expected = proposed;
+        bool caught{};
+        try {
+            core::invoke_epilogue(contract,epilogue_fixture_original,core_expected_task,&record,&good,7,
+                proposed,CoreFixtureState{},read_core_fixture,apply_core_fixture);
+        } catch (int value) { caught = value == 47; }
+        require(caught && epilogue_calls == 1 && core_state == prior,
+            "Versioned normal-task C++ unwind failed to restore CPU state");
+        epilogue_mode = 0;
+        require(core::install_route(&copied_profile) == core::InstallRoute::unsupported,
+            "Copied profile authorised a hook installer");
+    }
+    require(core::install_route(&core::legacy_404) == core::InstallRoute::legacy &&
+        core::install_route(&core::remastered_500c) == core::InstallRoute::remastered_500c_bundle &&
+        core::install_route(&core::remastered_1048522) == core::InstallRoute::unsupported &&
+        core::install_route(nullptr) == core::InstallRoute::unsupported,
+        "Current modern profile fell through to a legacy or mixed-target installer");
+    const auto forged = engine_camera::remastered_1048522;
+    for (const auto* contract : {static_cast<const engine_camera::TemporalContract*>(nullptr),
+                               &engine_camera::legacy_404,&forged}) {
+        require(!core::modern_prefix_matches(contract,core_bytes) &&
+            !core::task_prefix_matches(contract,task_bytes), "Unknown/legacy contract accepted modern entry bytes");
+    }
+}
+
 int main() {
+    test_core_profiles_reject_mixed_calls_records_and_installation();
     test_normal_epilogue_record_and_task_scope();
     test_core_native_arguments_labels_and_restoration();
     test_core_private_stale_and_unknown_labels_mask();
@@ -907,6 +1038,6 @@ int main() {
     test_copy_context_admission_and_signatures();
     test_abandoned_copy_scope_restores_context();
     test_copy_profiles_never_mix_builds();
-    std::cout << "Camera copy lineage checked for both builds, cross-build callers "
-        "rejected and unported subsystems closed (CPU fixtures only).\n";
+    std::cout << "Versioned normal core/task calls, profile-bound records, installation routing, "
+        "readiness and camera copy lineage checked (CPU fixtures only).\n";
 }
