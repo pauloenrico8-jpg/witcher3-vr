@@ -7,6 +7,51 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Desenho normal identificado por versão — 8 de outubro
+
+Adaptei a identificação da chamada principal de desenho e da tarefa que
+continua esse desenho para a atualização 1048522. Cada perfil reúne os
+endereços e os primeiros bytes examinados daquela versão. O perfil antigo
+continua separado do novo.
+
+O fluxo, passo a passo:
+
+1. Escolhe um perfil conhecido a partir da regra de câmera. Regras desconhecidas
+   ou copiadas não recebem autorização.
+2. Reconhece o desenho normal somente quando a chamada vem do ponto esperado
+   naquela versão e o registro do quadro tem olho, par e geração válidos.
+   Chamadas privadas e chamadas da outra versão ficam sem a marca de olho.
+3. Confere o tipo exato da tarefa normal em uma pequena cópia dos seus dados.
+   Guarda junto o perfil que fez a conferência; outro perfil não pode reutilizar
+   esse resultado para marcar uma tarefa.
+4. Encaminha os três dados originais da chamada principal e o único dado
+   original da tarefa, uma vez. Durante a chamada, conserva a marca daquele
+   olho; uma chamada interna rejeitada oculta a marca anterior e a restaura
+   exatamente ao terminar. Isso acompanha trabalho na CPU, o processador do PC.
+5. Exige que a versão conferida seja a mesma do conjunto de adaptações instalado.
+   O perfil novo ainda não autoriza instalar esse conjunto: vegetação e
+   visibilidade também precisam da adaptação. Ele não cai no instalador antigo.
+
+Escolhi vincular os registros à versão porque reconhecer uma função nova não
+adapta automaticamente as outras funções que trabalham junto com ela.
+A marca de olho não mantém objetos ou texturas vivos e o término da chamada
+não significa que a placa de vídeo terminou a imagem.
+
+A DLL de desenvolvimento compilou e **111/111 testes passaram em 16,85 segundos**.
+Os casos usam dados e chamadas fabricados: conferem versões misturadas,
+endereços de chamadas privadas, tarefas truncadas, limites de endereço,
+perfil copiado, encaminhamento dos argumentos e restauração em chamadas
+internas e exceções de C++. Não executaram o jogo, a instalação das adaptações,
+a placa de vídeo, o Quest ou o combate físico.
+
+**O bloqueio global permanece fechado para Remastered. Nada foi instalado no
+jogo e o VR ainda não está jogável.** O próximo trabalho continua sendo ligar
+as duas imagens reais aos recursos e às listas de desenho corretos, preservar
+os históricos e a vida útil por olho e completar as adaptações necessárias.
+Depois disso virão o teste de imagem/cabeça no Quest e a integração das mãos,
+armas, dano e bloqueio físicos. DLSS e IntelFG são opcionais; a meta de 60 FPS
+continua cancelada. As análises novas do executável permanecem privadas locais.
+
 ## Cópia da câmera identificada por versão — 8 de outubro
 
 Adaptei a identificação das cópias da câmera para a atualização 1048522. O
