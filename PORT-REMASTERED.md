@@ -7,6 +7,55 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Captura sem antisserrilhamento vinculada ao olho — 9 de outubro
+
+Liguei a identificação do desenho normal ao pedido de cópia da imagem daquele
+olho. Antisserrilhamento é o tratamento que suaviza as bordas da imagem; esta
+etapa usa a opção sem esse tratamento e não exige DLSS ou geração de quadros.
+
+O fluxo, passo a passo:
+
+1. Durante a chamada normal, guarda a versão conferida, o quadro, o olho,
+   o par e a visão congelada da cabeça. Uma chamada interna rejeitada oculta
+   essa marca; ao terminar, restaura exatamente o contexto anterior.
+2. Quando o jogo grava a mudança do buffer da tela de escrita para apresentação,
+   confere a marca daquela chamada e a lista DirectX concreta que a recebeu.
+   DirectX é a interface usada para enviar o desenho à placa de vídeo.
+3. Obtém a textura atualmente selecionada pela cadeia de apresentação, que
+   alterna os buffers da tela. Mantém uma referência dessa textura enquanto
+   grava a cópia. Texturas intermediárias com o mesmo tamanho não ganham
+   autorização; mudanças parciais ou divididas também são rejeitadas.
+4. Usa a cópia já existente para uma textura própria do mod e guarda um registro
+   independente por cópia. Se os dois olhos usam a mesma lista, continuam com
+   registros separados. A identificação não vem da fila antiga de tarefas
+   terminadas nem da alternância do número de apresentações.
+5. Encaminha esses registros à etapa existente de envio à GPU, com seus sinais
+   de término. GPU é a placa de vídeo. Terminar uma função no processador do PC
+   não publica uma imagem como pronta. A etapa consumidora ainda precisa
+   respeitar os sinais e selecionar o par correto.
+
+`modern_eye_capture.h` confere os dados do pedido; `dxgi_proxy.cpp` liga essas
+regras às chamadas DirectX e à cópia existente. O teste novo exercita versões,
+reutilização da mesma lista, chamadas internas, exceções e rejeições.
+Escolhi copiar no ponto de gravação para conservar a associação entre o olho
+conferido e aquela cópia antes que o jogo volte a escrever no buffer.
+
+A DLL compilou e **112/112 testes passaram em 8,37 segundos**. O teste novo
+fez **52 verificações na CPU**, com dados fabricados. Não executou o jogo,
+MinHook, a gravação ou submissão DirectX deste caminho, a placa de vídeo,
+o Quest ou o combate físico. Compilar uma chamada DirectX não prova que ela
+produziu a imagem correta no jogo.
+
+**Remastered e a reentrada continuam bloqueados. Nada foi instalado; o VR
+não está jogável.** Ainda faltam confirmar a ordem e a vida útil no jogo,
+o encerramento das chamadas, a seleção do par no consumidor e as demais
+adaptações de câmera, visibilidade, efeitos e históricos por olho. A referência
+obtida durante a gravação não resolve sozinha a vida útil até o término na GPU
+ou durante redimensionamento e desligamento. Depois das imagens reais virão
+cabeça no Quest, mãos, armas, dano e bloqueio físicos. A meta de 60 FPS
+continua cancelada; DLSS e IntelFG permanecem opcionais. As análises novas
+do executável permanecem privadas locais.
+
 ## Desenho normal identificado por versão — 8 de outubro
 
 Adaptei a identificação da chamada principal de desenho e da tarefa que
