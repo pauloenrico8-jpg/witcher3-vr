@@ -31264,7 +31264,8 @@ void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* s
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
         tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,
         {reinterpret_cast<uintptr_t>(renderer), reinterpret_cast<uintptr_t>(frame),
-            reinterpret_cast<uintptr_t>(scene), label, true},
+            reinterpret_cast<uintptr_t>(scene), label, true,w3vr::modern_vegetation_view::Phase::normal_core,0,
+            w3vr::modern_vegetation_view::selected(contract)},
         {profile, reinterpret_cast<uintptr_t>(renderer), label}, tag};
     w3vr::render_core::invoke(contract, caller, g_engine_frame_builder,
         renderer, frame, scene, found_label ? &label : nullptr,
@@ -31820,12 +31821,23 @@ bool remastered_render_entry_matches(const uint8_t* target,
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return std::equal(prefix.begin(), prefix.end(), expected.begin());
 }
-bool remastered_normal_epilogue_table_matches(const uint8_t* module) {
-    if (!module) return false;
+bool remastered_core_ready_for(const w3vr::engine_camera::TemporalContract* contract) {
+    return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) &&
+        w3vr::render_core::ready_for(contract,
+            g_remastered_core_installed_profile.load(std::memory_order_acquire),
+            g_remastered_core_hooks_ready.load(std::memory_order_acquire));
+}
+bool remastered_normal_epilogue_table_matches(const uint8_t* module,
+    const w3vr::render_core::Profile* profile) {
+    if (!module || (profile!=&w3vr::render_core::remastered_500c &&
+        profile!=&w3vr::render_core::remastered_1048522)) return false;
+    const auto base=reinterpret_cast<uintptr_t>(module);
+    if(base>UINTPTR_MAX-profile->epilogue_table-16-sizeof(uintptr_t) ||
+        base>UINTPTR_MAX-profile->epilogue_entry)return false;
     uintptr_t method{};
-    __try { std::memcpy(&method, module + w3vr::render_core::normal_epilogue_vtable_rva + 16, sizeof(method)); }
+    __try { std::memcpy(&method, module + profile->epilogue_table + 16, sizeof(method)); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return method == reinterpret_cast<uintptr_t>(module) + w3vr::render_core::normal_epilogue_rva;
+    return method == base + profile->epilogue_entry;
 }
 struct RemasteredVegetationCameraSnapshot {
     std::array<uint8_t,w3vr::modern_vegetation_view::camera_bytes> primary{},secondary{};
@@ -31889,14 +31901,14 @@ void __fastcall hook_remastered_vegetation_preselection(void* container,void* de
     const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
     const auto outer=g_remastered_vegetation_context;
     uintptr_t observed{};veg::Context replacement{};
-    const bool admitted=g_remastered_core_hooks_ready.load(std::memory_order_acquire) &&
+    const bool admitted=remastered_core_ready_for(contract) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
-        caller==veg::preselection_return && veg::accepts(contract,outer,generation) &&
+        veg::accepts(contract,outer,generation) && caller==outer.profile->preselection_return &&
         read_remastered_scene_vegetation_container(outer.scene,observed) &&
         veg::bind_preselection(contract,outer,generation,caller,reinterpret_cast<uintptr_t>(container),
             reinterpret_cast<uintptr_t>(descriptor),reinterpret_cast<uintptr_t>(scene),observed,replacement) &&
         generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
-        g_remastered_core_hooks_ready.load(std::memory_order_acquire);
+        remastered_core_ready_for(contract);
     // Unknown/nested paths get a neutral scope even while an outer normal core
     // is active. The previous eye/phase is restored after this native call.
     veg::invoke_preselection(g_remastered_vegetation_preselection,container,descriptor,scene,
@@ -31911,10 +31923,10 @@ bool __fastcall hook_remastered_vegetation_update(void* receiver,const float* po
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     const auto context=g_remastered_vegetation_context;
     const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
-    const auto route=veg::route(caller);
+    const auto route=veg::route(context.profile,caller);
     veg::Inputs incoming{},replacement{};
     RemasteredVegetationCameraSnapshot cameras{};uintptr_t container{};
-    const bool admitted=g_remastered_core_hooks_ready.load(std::memory_order_acquire) &&
+    const bool admitted=remastered_core_ready_for(contract) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
         route!=veg::Route::unknown && veg::accepts(contract,context,generation) && !final_mode &&
         read_remastered_vegetation_snapshot(context,route,receiver,position,projection,view,near_range,
@@ -31922,7 +31934,7 @@ bool __fastcall hook_remastered_vegetation_update(void* receiver,const float* po
         veg::prepare(contract,context,generation,caller,container,reinterpret_cast<uintptr_t>(receiver),
             incoming,final_mode,cameras.primary,cameras.secondary,replacement) &&
         generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
-        g_remastered_core_hooks_ready.load(std::memory_order_acquire);
+        remastered_core_ready_for(contract);
     return veg::invoke(g_remastered_vegetation_update,receiver,position,projection,view,
         near_range,far_range,final_mode,admitted ? &replacement : nullptr);
     // The native function still owns cache generation/return semantics. Its
@@ -31953,8 +31965,10 @@ void __fastcall hook_remastered_world_culling(void* manager,void* scene,void* fr
     const uintptr_t caller=module && return_address>=module?return_address-module:0;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+    const auto* visibility_profile=world::selected(contract);
     EngineFrameTag tag{};bool found{};
-    if(caller==world::consumer_return && frame) {
+    if(remastered_core_ready_for(contract) && visibility_profile &&
+        caller==visibility_profile->consumer_return && frame) {
         std::lock_guard<std::mutex> lock(g_engine_dual_frame_mutex);
         const auto it=g_engine_dual_frame_eyes.find(frame);
         if(it!=g_engine_dual_frame_eyes.end()) {tag=it->second;found=true;}
@@ -31962,39 +31976,47 @@ void __fastcall hook_remastered_world_culling(void* manager,void* scene,void* fr
     const w3vr::render_core::FrameLabel label{reinterpret_cast<uintptr_t>(frame),tag.generation,
         tag.pair_id,static_cast<int>(tag.eye),tag.render_view_valid,tag.modern_camera_lineage_complete};
     uintptr_t observed{};world::Context replacement{};
-    const bool admitted=found && g_remastered_core_hooks_ready.load(std::memory_order_acquire) &&
+    const bool admitted=found && remastered_core_ready_for(contract) &&
         g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
         read_remastered_world_culling_manager(reinterpret_cast<uintptr_t>(scene),observed) &&
         world::bind(contract,caller,reinterpret_cast<uintptr_t>(manager),reinterpret_cast<uintptr_t>(scene),
             reinterpret_cast<uintptr_t>(frame),label,generation,observed,replacement) &&
-        generation==g_streamline_capture_generation.load(std::memory_order_acquire);
+        generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
+        remastered_core_ready_for(contract) &&
+        g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire);
     // This worker receives its actual native frame/scene. Do not borrow a core
     // thread's TLS label. Unknown/nested consumers mask and restore this scope.
     world::invoke(g_remastered_world_culling,manager,scene,frame,admitted?&replacement:nullptr,
         read_remastered_world_culling_context,apply_remastered_world_culling_context);
 }
-bool install_remastered_render_core_hooks(uint8_t* module) {
-    if (g_remastered_core_hooks_ready.load(std::memory_order_acquire)) return true;
+bool install_remastered_render_core_hooks(uint8_t* module,
+    const w3vr::engine_camera::TemporalContract* contract,const w3vr::render_core::Profile* profile) {
+    const auto* vegetation=w3vr::modern_vegetation_view::selected(contract);
+    const auto* world=w3vr::world_culling_view::selected(contract);
+    if(!profile || profile!=w3vr::render_core::modern_selected(contract) || !vegetation || !world ||
+        contract!=g_engine_camera_temporal_contract.load(std::memory_order_acquire))return false;
+    if (g_remastered_core_hooks_ready.load(std::memory_order_acquire))return remastered_core_ready_for(contract);
     // Keep original trampolines on any partial failure; never remove/null/retry
     // them while entries may be in flight. This is NOT an unload barrier.
     if (!module || g_engine_frame_builder || g_remastered_normal_epilogue ||
         g_remastered_vegetation_update || g_remastered_vegetation_preselection || g_remastered_world_culling) return false;
     struct Hook { uintptr_t rva; void* detour; void** original; std::span<const uint8_t> signature; };
     const std::array<Hook, 5> hooks{{
-        {w3vr::render_core::remastered_500c.entry, reinterpret_cast<void*>(&hook_remastered_render_core),
-            reinterpret_cast<void**>(&g_engine_frame_builder), w3vr::render_core::modern_entry_signature},
-        {w3vr::render_core::normal_epilogue_rva, reinterpret_cast<void*>(&hook_remastered_normal_epilogue),
-            reinterpret_cast<void**>(&g_remastered_normal_epilogue), w3vr::render_core::epilogue_entry_signature},
-        {w3vr::modern_vegetation_view::update_rva, reinterpret_cast<void*>(&hook_remastered_vegetation_update),
-            reinterpret_cast<void**>(&g_remastered_vegetation_update), w3vr::modern_vegetation_view::entry_signature},
-        {w3vr::modern_vegetation_view::preselection_rva, reinterpret_cast<void*>(&hook_remastered_vegetation_preselection),
-            reinterpret_cast<void**>(&g_remastered_vegetation_preselection), w3vr::modern_vegetation_view::preselection_signature},
-        {w3vr::world_culling_view::consumer_rva,reinterpret_cast<void*>(&hook_remastered_world_culling),
-            reinterpret_cast<void**>(&g_remastered_world_culling),w3vr::world_culling_view::entry_signature}}};
-    if (!remastered_normal_epilogue_table_matches(module)) return false;
+        {profile->entry, reinterpret_cast<void*>(&hook_remastered_render_core),
+            reinterpret_cast<void**>(&g_engine_frame_builder), profile->core_prefix},
+        {profile->epilogue_entry, reinterpret_cast<void*>(&hook_remastered_normal_epilogue),
+            reinterpret_cast<void**>(&g_remastered_normal_epilogue), profile->task_prefix},
+        {vegetation->update_entry, reinterpret_cast<void*>(&hook_remastered_vegetation_update),
+            reinterpret_cast<void**>(&g_remastered_vegetation_update), vegetation->update_prefix},
+        {vegetation->preselection_entry, reinterpret_cast<void*>(&hook_remastered_vegetation_preselection),
+            reinterpret_cast<void**>(&g_remastered_vegetation_preselection), vegetation->preselection_prefix},
+        {world->consumer_entry,reinterpret_cast<void*>(&hook_remastered_world_culling),
+            reinterpret_cast<void**>(&g_remastered_world_culling),world->consumer_prefix}}};
+    if (!remastered_normal_epilogue_table_matches(module,profile)) return false;
     for (const auto& hook : hooks)
-        if (!remastered_render_entry_matches(module + hook.rva, hook.signature)) return false;
+        if (reinterpret_cast<uintptr_t>(module)>UINTPTR_MAX-hook.rva-hook.signature.size() ||
+            !remastered_render_entry_matches(module + hook.rva, hook.signature)) return false;
     for (const auto& hook : hooks) {
         if (MH_CreateHook(module + hook.rva, hook.detour, hook.original) != MH_OK) {
             log_line("Remastered core hook creation failed; admission closed, originals retained");
@@ -32004,15 +32026,14 @@ bool install_remastered_render_core_hooks(uint8_t* module) {
     size_t enabled{};
     for (; enabled < hooks.size(); ++enabled)
         if (MH_EnableHook(module + hooks[enabled].rva) != MH_OK) break;
-    if (enabled != hooks.size()) {
+    if (enabled != hooks.size() || contract!=g_engine_camera_temporal_contract.load(std::memory_order_acquire)) {
         for (size_t i = 0; i < enabled; ++i) MH_DisableHook(module + hooks[i].rva);
         log_line("Remastered core hook activation incomplete; admission closed, originals retained");
         return false;
     }
-    g_remastered_core_installed_profile.store(&w3vr::render_core::remastered_500c,
-        std::memory_order_release);
+    g_remastered_core_installed_profile.store(profile,std::memory_order_release);
     g_remastered_core_hooks_ready.store(true, std::memory_order_release);
-    log_line("Remastered core, epilogue and primary-eye vegetation/world visibility adapters installed; GPU completion not implied");
+    log_line("Version-matched core, epilogue and vegetation/world visibility adapters installed; GPU completion not implied");
     return true;
 }
 
@@ -32028,16 +32049,17 @@ void install_engine_frame_builder_probe() {
         return;
     }
 
-    const auto* profile = w3vr::render_core::selected(
-        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* profile = w3vr::render_core::selected(contract);
     if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire) || !profile) return;
     const auto route = w3vr::render_core::install_route(profile);
     if (route == w3vr::render_core::InstallRoute::unsupported) return;
     const uintptr_t kEngineFrameBuilderRva = profile->entry;
-    const bool modern = route == w3vr::render_core::InstallRoute::remastered_500c_bundle;
+    const bool modern = route == w3vr::render_core::InstallRoute::remastered_500c_bundle ||
+        route == w3vr::render_core::InstallRoute::remastered_1048522_bundle;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameBuilderRva : nullptr;
-    if (modern) { install_remastered_render_core_hooks(module); return; }
+    if (modern) { install_remastered_render_core_hooks(module,contract,profile); return; }
     auto* detour = reinterpret_cast<void*>(&hook_engine_frame_builder);
     if (target != nullptr &&
         MH_CreateHook(target, detour,
@@ -40816,8 +40838,8 @@ bool select_remastered_world_culling_camera(uintptr_t caller,uintptr_t destinati
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
     const auto context=g_remastered_world_culling_context;
-    if(caller!=world::camera_copy_return || !world::accepts(contract,context,generation) ||
-        !g_remastered_core_hooks_ready.load(std::memory_order_acquire) ||
+    if(!world::accepts(contract,context,generation) || caller!=context.profile->camera_copy_return ||
+        !remastered_core_ready_for(contract) ||
         !g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire) ||
         !g_engine_dual_render_active.load(std::memory_order_acquire))return false;
     uintptr_t p{},s{},end{},observed{};
@@ -40835,7 +40857,7 @@ bool select_remastered_world_culling_camera(uintptr_t caller,uintptr_t destinati
     if(primary!=repeat_primary || secondary!=repeat_secondary ||
         !world::select_primary(contract,context,generation,caller,destination,source,primary,secondary,candidate) ||
         generation!=g_streamline_capture_generation.load(std::memory_order_acquire) ||
-        !g_remastered_core_hooks_ready.load(std::memory_order_acquire) ||
+        !remastered_core_ready_for(contract) ||
         !g_remastered_camera_copy_hooks_ready.load(std::memory_order_acquire))return false;
     result=candidate;return true; // Still no native allocation lease or queued resource proof.
 }
