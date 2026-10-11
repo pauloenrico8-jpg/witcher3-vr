@@ -6,6 +6,60 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Visibilidade separada por versão — 11 de outubro
+
+Adaptei a escolha das câmeras de vegetação e dos objetos visíveis para a
+atualização 1048522. O perfil da versão anterior permanece separado.
+Um perfil é uma lista de pontos e regras conferidos para uma versão do jogo.
+
+O fluxo, passo a passo:
+
+1. Escolhe um perfil conhecido e guarda essa escolha junto do quadro e do olho.
+   Uma lista copiada, desconhecida ou pertencente à outra versão não ganha
+   autorização para mudar a câmera.
+2. Na vegetação, reconhece separadamente as atualizações antecipadas e tardias
+   de cada versão. Usa a posição, a visão, a projeção e o alcance próximo da
+   câmera principal daquele olho. Conserva o alcance distante escolhido pelo
+   jogo, os demais argumentos e a resposta original.
+3. Na seleção dos objetos do mundo, confere o quadro recebido pela própria
+   tarefa. Na cópia privada específica, oferece o endereço da câmera principal
+   ao jogo; o jogo continua fazendo a cópia, o ajuste próximo e a reconstrução.
+   O mod conserva o destino e o retorno original, sem construir uma câmera por
+   simples cópia de memória nem reaplicar o movimento da cabeça.
+4. O conjunto de cinco pontos de ligação usa os endereços, os primeiros bytes
+   das funções e o tipo da tarefa da mesma versão. Só anuncia disponibilidade
+   depois de ligar todos. Uma falha parcial fecha a admissão e conserva as
+   chamadas originais; isso ainda não resolve o desligamento seguro do mod.
+5. Confere a versão instalada antes e depois de preparar a troca. Chamadas
+   internas rejeitadas ficam com um contexto neutro e restauram o contexto
+   anterior quando terminam, inclusive em uma exceção testada em C++.
+
+`modern_vegetation_view.h` reúne as regras da vegetação;
+`modern_world_culling_view.h`, as regras da seleção de objetos;
+`engine_render_core.h` seleciona a rota e `dxgi_proxy.cpp` liga essas regras às
+chamadas do jogo. Escolhi manter a versão junto do contexto para impedir que
+um ponto da versão antiga aceite dados da atualização atual. As atualizações
+originais dos objetos do mundo continuam acontecendo uma vez.
+
+A DLL compilou e **112/112 testes passaram em 14,03 segundos**. Os dois testes
+de visibilidade fizeram **856 verificações na CPU**, usando dados fabricados:
+658 da vegetação e 198 do mundo. Exercitam as duas versões, os dois olhos,
+os limites geométricos da visão, as duas projeções, as etapas antecipadas e
+tardias, misturas de versão, chamadas internas, argumentos e exceções.
+Não executaram o jogo, a instalação real das ligações, a placa de vídeo,
+o Quest ou o combate. Igualdade de dados lidos não conserva sozinha a vida
+útil dos objetos nem prova a ordem do desenho.
+
+**O bloqueio geral de Remastered e da reentrada continua fechado. Nada
+experimental foi instalado; o VR ainda não funciona.** A organização e a
+autoridade das câmeras da atualização atual ainda precisam de adaptação,
+assim como os históricos, efeitos, recursos e a seleção do mesmo par de
+imagens. Também falta garantir a vida útil durante desenho e encerramento.
+Primeiro serão verificadas imagens reais no PC; depois, cabeça no Quest,
+mãos, armas, dano e bloqueio físicos. DLSS e IntelFG continuam opcionais;
+a meta de 60 FPS permanece cancelada. As análises novas do executável
+continuam privadas locais.
+
 ## Captura sem antisserrilhamento vinculada ao olho — 9 de outubro
 
 Liguei a identificação do desenho normal ao pedido de cópia da imagem daquele
