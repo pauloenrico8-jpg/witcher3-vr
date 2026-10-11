@@ -9,6 +9,7 @@
 namespace w3vr::scene_descriptor {
 
 struct CopyPolicy {
+    scene_factory::Version version{scene_factory::Version::unknown};
     std::size_t storage_bytes{};
     std::size_t requested_bytes{};
     std::size_t minimum_bytes{};
@@ -22,13 +23,13 @@ struct CopyPolicy {
 inline constexpr CopyPolicy copy_policy(scene_factory::Version version,
                                         bool asymmetric_taau) {
     if (version == scene_factory::Version::legacy_404)
-        return {0xC000, asymmetric_taau ? 0xBD00u : 0xC000u, 0xB000, false};
-    if (version == scene_factory::Version::remastered_500c)
-        return {0xF750, 0xF750, 0xF750, true};
+        return {version, 0xC000, asymmetric_taau ? 0xBD00u : 0xC000u, 0xB000, false};
+    if (scene_factory::modern(version))
+        return {version, 0xF750, 0xF750, 0xF750, true};
     return {};
 }
 
-// 5.00c: last fixed byte copied by 00324430 is +F748; the descriptor region
+// Both examined modern copies preserve the last fixed byte at +F748; the descriptor region
 // in the two observed frame constructors ends at +F750 (16-byte alignment).
 // Its inline array at EC20+80 has data at EC20+90, 60-byte elements, with
 // the next fixed field at EC20+210. At most four elements fit. Reject an
@@ -36,14 +37,14 @@ inline constexpr CopyPolicy copy_policy(scene_factory::Version version,
 inline bool copy_accepted(scene_factory::Version version,
     const CopyPolicy& policy, std::span<const std::uint8_t> snapshot,
     std::size_t copied_bytes) {
-    if (policy.storage_bytes == 0 || snapshot.size() < policy.storage_bytes ||
+    if (policy.version != version || policy.storage_bytes == 0 || snapshot.size() < policy.storage_bytes ||
         copied_bytes > policy.requested_bytes || copied_bytes < policy.minimum_bytes)
         return false;
     if (version == scene_factory::Version::legacy_404)
         return !policy.exact_copy && policy.storage_bytes == 0xC000 &&
             (policy.requested_bytes == 0xC000 || policy.requested_bytes == 0xBD00) &&
             policy.minimum_bytes == 0xB000;
-    if (version != scene_factory::Version::remastered_500c || !policy.exact_copy ||
+    if (!scene_factory::modern(version) || !policy.exact_copy ||
         policy.storage_bytes != 0xF750 || policy.requested_bytes != 0xF750 ||
         policy.minimum_bytes != 0xF750 || copied_bytes != policy.requested_bytes ||
         reinterpret_cast<std::uintptr_t>(snapshot.data()) % 16 != 0)

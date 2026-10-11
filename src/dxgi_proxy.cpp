@@ -41430,24 +41430,16 @@ size_t copy_readable_scene_descriptor(
 }
 
 w3vr::scene_factory::Version selected_scene_factory_version() {
-    const auto* contract = g_engine_camera_temporal_contract.load(
-        std::memory_order_acquire);
-    if (contract == &w3vr::engine_camera::legacy_404) {
-        return w3vr::scene_factory::Version::legacy_404;
-    }
-    if (contract == &w3vr::engine_camera::remastered_500c) {
-        return w3vr::scene_factory::Version::remastered_500c;
-    }
-    return w3vr::scene_factory::Version::unknown;
+    return w3vr::scene_factory::selected_version(
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
 }
 
-bool engine_scene_factory_inputs_ready(void* renderer, void* settings,
-    const void* descriptor) {
-    const auto version = selected_scene_factory_version();
+bool engine_scene_factory_inputs_ready(const w3vr::engine_camera::TemporalContract* contract,
+    void* renderer, void* settings, const void* descriptor) {
+    const auto version = w3vr::scene_factory::selected_version(contract);
     std::array<uint32_t, 2> extent{};
     bool extent_readable{};
-    if (version == w3vr::scene_factory::Version::remastered_500c &&
-        descriptor != nullptr) {
+    if (w3vr::scene_factory::modern(version) && descriptor != nullptr) {
         __try {
             memcpy(extent.data(), static_cast<const uint8_t*>(descriptor) +
                 w3vr::scene_factory::remastered_extent_offset, sizeof(extent));
@@ -41456,9 +41448,9 @@ bool engine_scene_factory_inputs_ready(void* renderer, void* settings,
             extent_readable = false;
         }
     }
-    return w3vr::scene_factory::inputs_ready(version, renderer != nullptr,
-        settings != nullptr, descriptor != nullptr, extent_readable,
-        extent[0], extent[1]);
+    return g_engine_camera_temporal_contract.load(std::memory_order_acquire)==contract &&
+        w3vr::scene_factory::inputs_ready(version, renderer != nullptr,
+            settings != nullptr, descriptor != nullptr, extent_readable, extent[0], extent[1]);
 }
 
 bool remastered_command_renderer_ready(uintptr_t module) {
@@ -41924,8 +41916,10 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const auto present = g_present_count.load();
     const bool asymmetric_factory_audit =
         asymmetric_authority_audit_active();
+    const auto* factory_contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto factory_version = w3vr::scene_factory::selected_version(factory_contract);
     const bool factory_inputs_ready = engine_scene_factory_inputs_ready(
-        render_context, render_settings, scene_descriptor);
+        factory_contract, render_context, render_settings, scene_descriptor);
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     // [FIX:ASYMMETRIC-TAAU-SCENE-DESCRIPTOR-HARDENING V1207 1/1]
@@ -42026,8 +42020,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         stereo_render_eligible && mode3_aer_presentation_active();
     bool duplicate_render =
         stereo_render_eligible && !mode3_aer_single_render;
-    const bool remastered_factory = selected_scene_factory_version() ==
-        w3vr::scene_factory::Version::remastered_500c;
+    const bool remastered_factory = w3vr::scene_factory::modern(factory_version);
     if (duplicate_render && remastered_factory) {
         auto* scope = g_remastered_producer_scope;
         RemasteredPreparationContext context{};
@@ -42074,9 +42067,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // generation} duplication and temporal-history route active in cinema;
     // only fullscreen menus remain single-view.
     if (duplicate_render) {
-        const auto descriptor_version = selected_scene_factory_version();
-        right_scene_descriptor = descriptor_version ==
-                w3vr::scene_factory::Version::remastered_500c
+        const auto descriptor_version = factory_version;
+        right_scene_descriptor = w3vr::scene_factory::modern(descriptor_version)
             ? &remastered_borrowed_descriptor
             : &g_engine_dual_scene_descriptors[
                 present % g_engine_dual_scene_descriptors.size()];
@@ -42204,9 +42196,12 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             pair_pose_display_time > 0 &&
             remastered_pair_pose.tracking.display_time == pair_pose_display_time &&
             right_scene_descriptor != nullptr &&
-            w3vr::modern_camera_pose::prepare_pair(*right_scene_descriptor,
+            w3vr::modern_camera_pose::prepare_pair(factory_contract,*right_scene_descriptor,
                 remastered_pair_pose.tracking,
-                {g_config.hmd_position_scale, g_config.hmd_lock_game_pitch}, remastered_pose_pair);
+                {g_config.hmd_position_scale, g_config.hmd_lock_game_pitch}, remastered_pose_pair) &&
+            w3vr::modern_camera_pose::prepared_for(remastered_pose_pair,factory_contract,pair_pose_display_time) &&
+            g_engine_camera_temporal_contract.load(std::memory_order_acquire)==factory_contract &&
+            g_streamline_capture_generation.load(std::memory_order_acquire)==remastered_pair_generation;
         if (remastered_pair_pose_prepared) {
             primary_scene_descriptor = remastered_pose_pair.descriptors[primary_eye].data();
             right_scene_descriptor = &remastered_pose_pair.descriptors[duplicate_eye];
@@ -42244,6 +42239,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     }
     g_engine_factory_eye = previous_eye;
     if (remastered_factory && duplicate_render && (!primary_camera_sequence ||
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire)!=factory_contract ||
+        !w3vr::modern_camera_pose::prepared_for(remastered_pose_pair,factory_contract,pair_pose_display_time) ||
         g_streamline_capture_generation.load(std::memory_order_acquire) != remastered_pair_generation)) {
         duplicate_render = false;
         g_engine_pair_retry_present.store(present + 2, std::memory_order_relaxed);
@@ -42518,12 +42515,16 @@ void install_engine_frame_factory_probe() {
         return;
     }
 
-    const uintptr_t kEngineFrameDataFactoryRva =
-        w3vr::scene_factory::factory_rva(selected_scene_factory_version());
+    const auto* factory_contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto factory_version=w3vr::scene_factory::selected_version(factory_contract);
+    const uintptr_t kEngineFrameDataFactoryRva = w3vr::scene_factory::factory_rva(factory_version);
     if (kEngineFrameDataFactoryRva == 0) return;
-    if (selected_scene_factory_version() == w3vr::scene_factory::Version::remastered_500c &&
+    // Every modern factory still requires the separately ported queue/preparation
+    // admission; recognizing the current input layout cannot bypass those gates.
+    if (w3vr::scene_factory::modern(factory_version) &&
         (!install_remastered_queue_lifecycle_hooks() || !install_remastered_camera_copy_hooks() ||
             !install_remastered_preparation_hooks())) return;
+    if (g_engine_camera_temporal_contract.load(std::memory_order_acquire)!=factory_contract) return;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameDataFactoryRva : nullptr;
     if (target != nullptr &&

@@ -26,6 +26,8 @@ struct Options {
     bool lock_game_pitch{true};
 };
 struct PreparedPair {
+    const engine_camera::TemporalContract* contract{};
+    XrTime display_time{};
     // Borrowed embedded pointers remain borrowed. These are byte buffers, not
     // constructed native objects. Never invoke a game destructor on them.
     std::array<std::vector<std::uint8_t>, 2> descriptors;
@@ -40,16 +42,21 @@ inline XrVector3f scaled(XrVector3f a, float s) { return {a.x*s,a.y*s,a.z*s}; }
 inline XrVector3f position(const engine_camera_layout::PoseFields& p) {
     return {p.position[0],p.position[1],p.position[2]};
 }
-inline bool read_pose(std::span<const std::uint8_t> camera,
+inline bool read_pose(const engine_camera::TemporalContract* contract,
+    std::span<const std::uint8_t> camera,
     engine_camera_layout::PoseFields& pose) {
-    if (camera.size() < engine_camera_layout::remastered_500c.camera_bytes) return false;
-    std::memcpy(pose.position.data(), camera.data(), sizeof(pose.position));
-    std::memcpy(pose.rotation_degrees.data(), camera.data()+0x10, sizeof(pose.rotation_degrees));
-    for (float v : pose.position) if (!std::isfinite(v)) return false;
-    for (float v : pose.rotation_degrees) if (!std::isfinite(v)) return false;
+    const auto* layout=engine_camera_layout::selected(contract);
+    if (!engine_camera_layout::modern(layout) || camera.size()<layout->camera_bytes) return false;
+    engine_camera_layout::PoseFields candidate{};
+    std::memcpy(candidate.position.data(), camera.data(), sizeof(candidate.position));
+    std::memcpy(candidate.rotation_degrees.data(), camera.data()+0x10, sizeof(candidate.rotation_degrees));
+    for (float v : candidate.position) if (!std::isfinite(v)) return false;
+    for (float v : candidate.rotation_degrees) if (!std::isfinite(v)) return false;
     float fov{};
     std::memcpy(&fov, camera.data()+0x1C, sizeof(fov));
-    return std::isfinite(fov) && fov > 0 && fov < 180; // Perspective only.
+    if (!std::isfinite(fov) || fov<=0 || fov>=180) return false;
+    pose=candidate;
+    return true; // Perspective only; no partial output on failure.
 }
 inline XrQuaternionf orientation(const engine_camera_layout::PoseFields& pose) {
     return openxr_eye_geometry::from_redengine_view_euler_degrees(
@@ -93,12 +100,15 @@ inline bool encode_orientation(XrQuaternionf q,
 // untouched; the game rebuilds them while copying the private descriptors.
 // Secondary visibility, temporal history, lifetime and the full renderer are
 // still pending. These inputs do not prove that an eye image was rendered.
-inline bool prepare_pair(std::span<const std::uint8_t> source,
+inline bool prepare_pair(const engine_camera::TemporalContract* contract,
+    std::span<const std::uint8_t> source,
     const TrackingSample& tracking, Options options, PreparedPair& result) {
     using namespace openxr_eye_geometry;
-    constexpr auto version = scene_factory::Version::remastered_500c;
-    constexpr auto policy = scene_descriptor::copy_policy(version,false);
-    const auto& layout = engine_camera_layout::remastered_500c;
+    const auto version=scene_factory::selected_version(contract);
+    const auto* selected_layout=engine_camera_layout::selected(contract);
+    if (!scene_factory::modern(version) || !engine_camera_layout::modern(selected_layout)) return false;
+    const auto policy=scene_descriptor::copy_policy(version,false);
+    const auto& layout=*selected_layout;
     if (!tracking.valid || tracking.display_time <= 0 ||
         !scene_descriptor::copy_accepted(version,policy,source,source.size()) ||
         !finite(tracking.origin_position) || !std::isfinite(options.head_translation_scale) ||
@@ -110,7 +120,7 @@ inline bool prepare_pair(std::span<const std::uint8_t> source,
     std::array<modern_camera_projection::LensFields,2> lenses{};
     const auto primary_camera=source.subspan(layout.descriptor_cameras[0],layout.camera_bytes);
     for (std::size_t eye=0;eye<2;++eye)
-        if (!modern_camera_projection::derive(primary_camera,tracking.views[eye].fov,lenses[eye])) return false;
+        if (!modern_camera_projection::derive(contract,primary_camera,tracking.views[eye].fov,lenses[eye])) return false;
     for (const auto& view:tracking.views) {
         AsymmetricProjectionDescriptor projection{};
         if (view.type!=XR_TYPE_VIEW || view.next!=nullptr ||
@@ -123,7 +133,7 @@ inline bool prepare_pair(std::span<const std::uint8_t> source,
         geometry.baseline_m>0.10f || geometry.cant_degrees>45) return false;
     std::array<engine_camera_layout::PoseFields,2> bases{};
     for (std::size_t i=0;i<2;++i)
-        if (!read_pose(source.subspan(layout.descriptor_cameras[i],layout.camera_bytes),bases[i])) return false;
+        if (!read_pose(contract,source.subspan(layout.descriptor_cameras[i],layout.camera_bytes),bases[i])) return false;
     XrQuaternionf original_anchor{}, anchor{};
     if (!normalize(orientation(bases[0]),original_anchor)) return false;
     auto level_base = bases[0];
@@ -156,6 +166,8 @@ inline bool prepare_pair(std::span<const std::uint8_t> source,
         }
     }
     PreparedPair candidate;
+    candidate.contract=contract;
+    candidate.display_time=tracking.display_time;
     try {
         for (std::size_t eye=0;eye<2;++eye) {
             candidate.descriptors[eye].assign(source.begin(),source.end());
@@ -164,12 +176,24 @@ inline bool prepare_pair(std::span<const std::uint8_t> source,
                 if (!engine_camera_layout::write_pose(
                     std::span<std::uint8_t>(candidate.descriptors[eye]).subspan(
                         layout.descriptor_cameras[i],layout.camera_bytes),&layout,poses[eye][i])) return false;
-            if (!modern_camera_projection::write(
+            if (!modern_camera_projection::write(contract,
                 std::span<std::uint8_t>(candidate.descriptors[eye]).subspan(
                     layout.descriptor_cameras[0],layout.camera_bytes),lenses[eye])) return false;
         }
     } catch (const std::bad_alloc&) { return false; }
     result=std::move(candidate);
+    return true;
+}
+// Input identity only: this does not validate native objects, tracking generation,
+// queue lifetime, rendering, or GPU completion. Both buffers publish together.
+inline bool prepared_for(const PreparedPair& pair,
+    const engine_camera::TemporalContract* contract, XrTime display_time) {
+    const auto version=scene_factory::selected_version(contract);
+    if (!scene_factory::modern(version) || pair.contract!=contract ||
+        display_time<=0 || pair.display_time!=display_time) return false;
+    const auto policy=scene_descriptor::copy_policy(version,false);
+    for (const auto& descriptor:pair.descriptors)
+        if (!scene_descriptor::copy_accepted(version,policy,descriptor,descriptor.size())) return false;
     return true;
 }
 } // namespace w3vr::modern_camera_pose
