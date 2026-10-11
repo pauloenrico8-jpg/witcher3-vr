@@ -30084,7 +30084,7 @@ void __fastcall hook_engine_temporal_writer(
         reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const auto* camera_contract = g_engine_camera_temporal_contract.load(
         std::memory_order_acquire);
-    if (camera_contract == &w3vr::engine_camera::remastered_500c) {
+    if (!w3vr::engine_camera_layout::legacy_temporal_writer_allowed(camera_contract)) {
         // The frozen runtime lens uses the modern stable normalized center,
         // separate from this writer's pixel jitter. Forward all five native
         // arguments once; private/restore/unknown calls also stay intact.
@@ -30313,8 +30313,9 @@ void install_engine_temporal_writer_hook() {
     // The startup preflight still rejects Remastered; no INI enables it.
     // Select entries by the accepted contract, never by ABI similarity.
     if (!g_legacy_engine_layout_accepted.load(std::memory_order_acquire)) return;
-    const auto writer_rva = w3vr::engine_camera_layout::temporal_writer_rva(
-        g_engine_camera_temporal_contract.load(std::memory_order_acquire));
+    const auto* contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto writer_rva = w3vr::engine_camera_layout::temporal_writer_rva(contract);
+    const auto* writer_profile = w3vr::engine_camera_layout::selected_writer(contract);
     if (writer_rva == 0) return;
     if ((!asymmetric_authority_audit_active() &&
             !native_asymmetric_noaa_route_active()) ||
@@ -30325,6 +30326,19 @@ void install_engine_temporal_writer_hook() {
     auto* target = module != nullptr
         ? module + writer_rva
         : nullptr;
+    bool prefix_matches = writer_profile == nullptr &&
+        contract == &w3vr::engine_camera::legacy_404;
+    if (target != nullptr && writer_profile != nullptr) {
+        __try {
+            prefix_matches = w3vr::engine_camera_layout::writer_prefix_matches(
+                writer_profile, {target, writer_profile->prefix.size()});
+        } __except (EXCEPTION_EXECUTE_HANDLER) { prefix_matches = false; }
+    }
+    if (!prefix_matches || contract !=
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire)) {
+        log_line("Temporal writer disabled: selected version/prefix mismatch");
+        return;
+    }
     if (target != nullptr &&
         MH_CreateHook(target,
             reinterpret_cast<void*>(&hook_engine_temporal_writer),
@@ -37683,7 +37697,7 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         g_engine_view_rebuild(view);
         return;
     }
-    if (camera_layout == &w3vr::engine_camera_layout::remastered_500c) {
+    if (w3vr::engine_camera_layout::modern(camera_layout)) {
         const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         const auto route = w3vr::camera_copy::observe_rebuild(
             g_remastered_camera_copy_context,
@@ -40805,7 +40819,8 @@ void install_engine_view_factory_probe() {
     const auto* contract = g_engine_camera_temporal_contract.load(
         std::memory_order_acquire);
     if (contract == nullptr) return;
-    if (contract == &w3vr::engine_camera::remastered_500c) {
+    if (w3vr::engine_camera_layout::modern(
+            w3vr::engine_camera_layout::selected(contract))) {
         install_remastered_camera_copy_hooks();
         return;
     }
@@ -40875,7 +40890,9 @@ float* invoke_remastered_camera_copy(float* destination, const float* source,
 
 float* __fastcall hook_engine_render_proxy_distance_scale(
     float* destination, const float* source) {
-    if (selected_engine_camera_layout() == &w3vr::engine_camera_layout::remastered_500c) {
+    const auto* camera_layout = selected_engine_camera_layout();
+    if (camera_layout == nullptr) return g_engine_view_copy_rebuild(destination, source);
+    if (w3vr::engine_camera_layout::modern(camera_layout)) {
         const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         return invoke_remastered_camera_copy(destination, source,
             reinterpret_cast<uintptr_t>(_ReturnAddress()) - module);
@@ -41036,8 +41053,7 @@ bool install_remastered_camera_copy_hooks() {
 }
 
 void install_engine_render_proxy_distance_scale_hook() {
-    if (g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
-        &w3vr::engine_camera::remastered_500c) {
+    if (w3vr::engine_camera_layout::modern(selected_engine_camera_layout())) {
         install_remastered_camera_copy_hooks();
         return;
     }

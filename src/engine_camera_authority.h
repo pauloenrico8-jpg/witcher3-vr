@@ -6,8 +6,8 @@
 #include <span>
 
 namespace w3vr::engine_camera_authority {
-// Versioned script callback entries and READ-ONLY authority fields. The 5.00c
-// candidates were checked against the installed executable; this subsystem
+// Versioned script callback entries and READ-ONLY authority fields. Modern
+// entries, named registration owners and fields were checked separately; this subsystem
 // does not authorize its renderer or enable the global version preflight.
 enum class Callback : std::size_t { head, bone_matrix, actor_gameplay,
     actor_cutscene, game_cutscene, manual_control, top_camera, loading_video,
@@ -50,14 +50,33 @@ inline constexpr Profile remastered_500c{{{
     Entry{0x02271A80, loading_video_signature},
     Entry{0x0237A1C0, direction_signature},
 }}, 0x2F3, 0x2F2, 0x11F, 0x269, 0x58, 0x60, 0x28, 0, 0x03805378};
+inline constexpr std::array<std::uint8_t, 24> manual_control_1048522_signature{
+    0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,
+    0x42,0x30,0x4C,0x8D,0x0D,0x5B,0x82,0xC6,0x03,0x48,0x8B,0xD9};
+inline constexpr Profile remastered_1048522{{{
+    Entry{0x0210A1F0, head_signature},
+    Entry{0x02259FC0, bone_matrix_signature},
+    Entry{0x0210B410, actor_gameplay_signature},
+    Entry{0x0210B430, actor_cutscene_signature},
+    Entry{0x022753C0, game_cutscene_signature},
+    Entry{0x01E0D800, manual_control_1048522_signature},
+    Entry{0x023825D0, top_camera_signature},
+    Entry{0x0227A0F0, loading_video_signature},
+    Entry{0x023826F0, direction_signature},
+}}, 0x2F3, 0x2F2, 0x11F, 0x269, 0x58, 0x60, 0x28, 0, 0x0380FC40};
+inline bool known(const Profile* profile) {
+    return profile == &legacy_404 || profile == &remastered_500c ||
+        profile == &remastered_1048522;
+}
 inline const Profile* selected(const engine_camera::TemporalContract* contract) {
     if (contract == &engine_camera::legacy_404) return &legacy_404;
     if (contract == &engine_camera::remastered_500c) return &remastered_500c;
+    if (contract == &engine_camera::remastered_1048522) return &remastered_1048522;
     return nullptr;
 }
 inline const Entry* entry(const Profile* profile, Callback callback) {
     const auto index = static_cast<std::size_t>(callback);
-    return profile && index < profile->entries.size() ? &profile->entries[index] : nullptr;
+    return known(profile) && index < profile->entries.size() ? &profile->entries[index] : nullptr;
 }
 inline bool is_custom_camera(const engine_camera::TemporalContract* contract,
     std::uintptr_t vtable_rva) {

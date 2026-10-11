@@ -6,6 +6,65 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Campos e controle da câmera separados por versão — 11 de outubro
+
+Adaptei a lista de campos da câmera, as rotas de atualização temporal e os
+nove pontos que informam o controle da câmera para a atualização 1048522.
+Um perfil é uma lista de posições e regras conferida para uma versão do jogo.
+A versão anterior conserva sua própria lista; cópias e listas desconhecidas
+não recebem autorização para escrever dados ou selecionar chamadas.
+
+O fluxo, passo a passo:
+
+1. Escolhe explicitamente o perfil da versão já selecionada. A posição do
+   jogador, a rotação, as dimensões inteiras da imagem e os campos históricos
+   são tratados separadamente. Não calcula todos os campos deslocando os
+   números da versão antiga pela mesma quantidade.
+2. As funções de escrita verificam tamanho e valores antes de alterar os
+   poucos campos previstos. Conservam todos os bytes vizinhos, inclusive
+   matrizes, referências e histórico. As duas câmeras internas pertencem
+   a um quadro do jogo; elas não são os dois olhos do headset.
+3. A atualização temporal distingue o desenho normal, a captura ampliada,
+   a restauração e a troca para desenho em duas dimensões. Cada versão tem
+   suas próprias rotas. A função moderna encaminha os cinco argumentos
+   originais uma vez e retorna antes das correções antigas, evitando somar
+   novamente o centro da lente à pequena variação temporal da imagem.
+4. Os nove pontos de controle incluem cabeça, posição de osso, cenas,
+   controle manual, câmera principal, vídeo de carregamento e direção.
+   Foram vinculados ao nome registrado e à classe correspondente no arquivo
+   do jogo. A identificação por classe impede escolher outra função que
+   tenha os mesmos primeiros bytes. A leitura continua sem alterar esses
+   estados; ainda não existe acompanhamento de mãos ou armas no jogo.
+5. O ponto de atualização temporal verifica os primeiros bytes da função
+   esperada antes de instalar sua ligação. O controle manual tem uma
+   assinatura própria por versão. Assinatura significa a sequência de bytes
+   esperada naquele ponto, não uma prova de funcionamento em execução.
+6. A cópia e a reconstrução modernas seguem a rota de encaminhamento antes
+   de qualquer correção antiga. O instalador do conjunto de três observadores
+   da atualização atual ainda precisa de adaptação; a seleção moderna não
+   pode cair no instalador individual antigo para contornar esse limite.
+
+`engine_camera_layout.h` reúne os campos e as rotas de atualização;
+`engine_camera_authority.h`, os pontos e estados de controle;
+`dxgi_proxy.cpp` aplica a seleção e encaminha as chamadas originais. Escolhi
+listas separadas porque campos iguais não significam endereços de funções
+iguais, nem a mesma classe em execução.
+
+A DLL compilou e **112/112 testes passaram em 11,20 segundos**. O teste de
+campos fez **15.872 verificações na CPU**, incluindo limites de tamanho,
+valores inválidos, preservação dos bytes vizinhos, as duas versões, os dois
+registros internos, rotas e assinaturas misturadas. São dados fabricados:
+não executaram as funções do jogo, a instalação real das ligações, a GPU,
+o Quest ou combate físico. As análises novas do executável continuam privadas.
+
+**O bloqueio geral de Remastered e da reentrada continua fechado. O VR ainda
+não funciona e nada experimental foi instalado.** Ainda faltam o instalador
+atual das cópias, a fábrica e seus dados de entrada, os efeitos e históricos,
+a vida útil dos recursos e a apresentação do mesmo par de imagens novas.
+Primeiro serão verificadas imagens reais no PC; depois, cabeça no Quest,
+mãos, armas, dano e bloqueio físicos. DLSS e IntelFG continuam opcionais;
+a meta de 60 FPS permanece cancelada.
+
 ## Visibilidade separada por versão — 11 de outubro
 
 Adaptei a escolha das câmeras de vegetação e dos objetos visíveis para a

@@ -10,7 +10,9 @@
 
 namespace layout = w3vr::engine_camera_layout;
 
+std::size_t checks{};
 void require(bool condition, const char* message) {
+    ++checks;
     if (!condition) {
         std::cerr << message << '\n';
         std::exit(1);
@@ -24,7 +26,7 @@ void put(std::vector<std::uint8_t>& bytes, std::size_t offset, const T& value) {
     std::memcpy(bytes.data() + offset, &value, sizeof(value));
 }
 
-void test_remastered_native_fixture() {
+void test_remastered_native_fixture(const layout::Layout& profile) {
     // Deliberately use independent native evidence offsets, not offsets read
     // back from the implementation. Frame+0x10 contains the descriptor; its
     // cameras start at +0x10/+0x5F0. Prefix bytes differ between the two internal camera records.
@@ -44,23 +46,23 @@ void test_remastered_native_fixture() {
         put(frame, view + 0x538, 91.0f);
         layout::Fields fields{};
         std::size_t camera_offset{};
-        require(layout::camera_offset(layout::remastered_500c,
+        require(layout::camera_offset(profile,
             layout::Origin::frame, camera_index, camera_offset), "Missing frame camera");
         require(layout::read_fields(std::span<const std::uint8_t>(frame)
-            .subspan(1 + camera_offset, 0x5E0), layout::remastered_500c, fields),
+            .subspan(1 + camera_offset, 0x5E0), profile, fields),
             "Complete unaligned Remastered camera rejected");
         require(fields.core == core && fields.alternate_fov == 91.0f &&
             fields.jitter == std::array<float, 2>{0.25f, -0.375f} &&
             fields.viewport == std::array<std::uint32_t, 2>{2064, 2208},
             "Camera read mixed matrix bytes, old fields, or the other camera");
         std::size_t descriptor_offset{};
-        require(layout::camera_offset(layout::remastered_500c,
+        require(layout::camera_offset(profile,
             layout::Origin::descriptor, camera_index, descriptor_offset) &&
             camera_offset == descriptor_offset + 0x10,
             "Descriptor and frame anchors were conflated");
     }
-    require(layout::remastered_500c.frame_descriptor +
-        layout::remastered_500c.descriptor_extent == 0xBEC,
+    require(profile.frame_descriptor +
+        profile.descriptor_extent == 0xBEC,
         "Frame input extent was confused with camera viewport");
 }
 
@@ -123,18 +125,18 @@ void test_selection_and_writer_route_gate() {
         !layout::legacy_temporal_writer_allowed(&remastered_500c) &&
         !layout::legacy_temporal_writer_allowed(&copied),
         "Camera layout evidence enabled legacy temporal hooks for Remastered");
-    require(layout::remastered_writer_purpose(0x01C14BD1) ==
+    require(layout::remastered_writer_purpose(&remastered_500c, 0x01C14BD1) ==
         layout::WriterPurpose::normal_temporal &&
-        layout::remastered_writer_purpose(0x01D59287) ==
+        layout::remastered_writer_purpose(&remastered_500c, 0x01D59287) ==
         layout::WriterPurpose::supersample_apply &&
-        layout::remastered_writer_purpose(0x01D59880) ==
+        layout::remastered_writer_purpose(&remastered_500c, 0x01D59880) ==
         layout::WriterPurpose::supersample_restore &&
-        layout::remastered_writer_purpose(0x01D59D27) ==
+        layout::remastered_writer_purpose(&remastered_500c, 0x01D59D27) ==
         layout::WriterPurpose::final_2d_override,
         "New writer callers lost their separate purpose");
     for (const auto address : {0x01C14BCC, 0x01D59282, 0x01D5987B, 0x01D59D22,
             0x01D86EA5, 0x01D87EC0, 0}) {
-        require(layout::remastered_writer_purpose(address) ==
+        require(layout::remastered_writer_purpose(&remastered_500c, address) ==
             layout::WriterPurpose::unknown,
             "CALL address or legacy return treated as a new writer route");
     }
@@ -258,7 +260,7 @@ void test_native_authority_entry_mismatch() {
         "Missing entry or evidence became a byte-verified callback");
 }
 
-void test_projection_writes_keep_integer_dimensions_and_other_records() {
+void test_projection_writes_keep_integer_dimensions_and_other_records(const layout::Layout* profile) {
     // Independent native byte offsets; these are two INTERNAL cameras of ONE
     // descriptor, not two headset images. Deliberately unalign the fixture.
     std::vector<std::uint8_t> descriptor(1 + 0xBDC + 16, 0x7A);
@@ -270,11 +272,11 @@ void test_projection_writes_keep_integer_dimensions_and_other_records() {
         put(expected, camera + 0x4C0, fields[i].center_px);
         put(expected, camera + 0x4C8, fields[i].viewport);
         require(layout::write_projection(std::span<std::uint8_t>(descriptor)
-            .subspan(camera, 0x5E0), &layout::remastered_500c, fields[i]),
+            .subspan(camera, 0x5E0), profile, fields[i]),
             "Examined modern projection rejected");
         layout::ProjectionFields read{};
         require(layout::read_projection(std::span<const std::uint8_t>(descriptor)
-            .subspan(camera, 0x5E0), &layout::remastered_500c, read) &&
+            .subspan(camera, 0x5E0), profile, read) &&
             read.center_px == fields[i].center_px && read.viewport == fields[i].viewport,
             "Dimensions became floating-point bit patterns or camera fields were mixed");
     }
@@ -288,40 +290,40 @@ void test_projection_writes_keep_integer_dimensions_and_other_records() {
         legacy == legacy_expected, "Legacy projection placement or other fields changed");
 }
 
-void test_failed_projection_is_not_partially_published() {
+void test_failed_projection_is_not_partially_published(const layout::Layout* profile) {
     std::vector<std::uint8_t> camera(0x5E0, 0x7A);
     const auto unchanged = camera;
     const layout::ProjectionFields fields{{17.5f, -20.25f}, {2064, 2208}};
-    const auto copied_layout = layout::remastered_500c;
+    const auto copied_layout = *profile;
     layout::ProjectionFields result{{-1, -2}, {13, 14}};
     const auto sentinel = result;
     for (std::size_t size = 0; size < camera.size(); ++size) {
         require(!layout::write_projection(std::span<std::uint8_t>(camera).first(size),
-            &layout::remastered_500c, fields) && camera == unchanged,
+            profile, fields) && camera == unchanged,
             "Truncated camera received partial projection writes");
         require(!layout::read_projection(std::span<const std::uint8_t>(camera).first(size),
-            &layout::remastered_500c, result) && result.center_px == sentinel.center_px &&
+            profile, result) && result.center_px == sentinel.center_px &&
             result.viewport == sentinel.viewport, "Failed read published partial projection");
     }
-    for (const auto* profile : {static_cast<const layout::Layout*>(nullptr), &copied_layout}) {
-        require(!layout::write_projection(camera, profile, fields) && camera == unchanged &&
-            !layout::read_projection(camera, profile, result), "Unknown layout wrote projection");
+    for (const auto* unknown : {static_cast<const layout::Layout*>(nullptr), &copied_layout}) {
+        require(!layout::write_projection(camera, unknown, fields) && camera == unchanged &&
+            !layout::read_projection(camera, unknown, result), "Unknown layout wrote projection");
     }
     for (std::size_t i = 0; i < 2; ++i) {
         auto invalid = fields; invalid.viewport[i] = 0;
-        require(!layout::write_projection(camera, &layout::remastered_500c, invalid) &&
+        require(!layout::write_projection(camera, profile, invalid) &&
             camera == unchanged, "Zero dimension partially changed camera");
         for (float bad : {std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::quiet_NaN()}) {
             invalid = fields; invalid.center_px[i] = bad;
-            require(!layout::write_projection(camera, &layout::remastered_500c, invalid) &&
+            require(!layout::write_projection(camera, profile, invalid) &&
                 camera == unchanged, "Nonfinite projection partially changed camera");
         }
     }
 }
 
 void test_canted_pose_commits_only_six_floats() {
-    for (const auto* profile : {&layout::legacy_404, &layout::remastered_500c}) {
+    for (const auto* profile : {&layout::legacy_404, &layout::remastered_500c, &layout::remastered_1048522}) {
         std::vector<std::uint8_t> camera(1 + profile->camera_bytes + 64, 0x7A);
         const layout::PoseFields pose{{4, -8, 16}, {32, -64, 128}};
         auto expected = camera;
@@ -641,13 +643,15 @@ void test_copy_profiles_never_mix_builds() {
         require(run_copy_descriptor(context, outer_profile->frame_return, final_frame+0x10, scratch_desc,
             copy::Stage::frame, 0, 901) && outer.finish(final_frame), "Restored outer factory failed");
     }
-    // Declaring the new temporal/copy contract does not silently port other
-    // versioned subsystems or admit the game's global executable preflight.
+    // Subsystem selections are explicit. They still cannot authorize legacy
+    // temporal corrections or change the separate global executable gate.
     const auto* current = &engine_camera::remastered_1048522;
-    require(!layout::selected(current) && !layout::temporal_writer_rva(current) &&
-        !layout::normal_temporal_route(current, 0x01C1B7B1) &&
-        !engine_camera_authority::selected(current),
-        "Camera copy profile silently admitted an unported subsystem");
+    require(layout::selected(current) == &layout::remastered_1048522 &&
+        layout::temporal_writer_rva(current) == 0x022BD750 &&
+        layout::normal_temporal_route(current, 0x01C1B7B1) &&
+        engine_camera_authority::selected(current) == &engine_camera_authority::remastered_1048522 &&
+        !layout::legacy_temporal_writer_allowed(current),
+        "Current subsystem profile leaked legacy temporal authority");
 }
 
 // Opaque addresses and a manufactured CPU state. No native game calls or GPU
@@ -1017,19 +1021,111 @@ void test_core_profiles_reject_mixed_calls_records_and_installation() {
     }
 }
 
+void test_current_camera_profiles_and_writer_are_separate() {
+    namespace cam = w3vr::engine_camera;
+    namespace auth = w3vr::engine_camera_authority;
+    const cam::TemporalContract* contracts[]{&cam::remastered_500c, &cam::remastered_1048522};
+    const layout::Layout* layouts[]{&layout::remastered_500c,&layout::remastered_1048522};
+    const layout::WriterProfile* writers[]{&layout::writer_500c,&layout::writer_1048522};
+    const auth::Profile* authorities[]{&auth::remastered_500c,&auth::remastered_1048522};
+    const std::uintptr_t entries[]{0x022B51E0,0x022BD750};
+    const std::array<std::uintptr_t,4> returns[]{
+        {0x01C14BD1,0x01D59287,0x01D59880,0x01D59D27},
+        {0x01C1B7B1,0x01D602B7,0x01D608B0,0x01D60D57}};
+    const layout::WriterPurpose purposes[]{layout::WriterPurpose::normal_temporal,
+        layout::WriterPurpose::supersample_apply,layout::WriterPurpose::supersample_restore,
+        layout::WriterPurpose::final_2d_override};
+    const std::array<std::uint8_t,15> prefix{
+        0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x40};
+    const std::array<std::uintptr_t,9> callback_entries[]{
+        {0x02102690,0x02251A40,0x02103880,0x021038A0,0x0226CDB0,0x01E07620,0x0237A0A0,0x02271A80,0x0237A1C0},
+        {0x0210A1F0,0x02259FC0,0x0210B410,0x0210B430,0x022753C0,0x01E0D800,0x023825D0,0x0227A0F0,0x023826F0}};
+    const std::uintptr_t primary_tables[]{0x03805378,0x0380FC40};
+    const std::array<std::uintptr_t,2> secondary_tables[]{{0x038058A0,0x038058D0},{0x03810168,0x03810198}};
+    for (int v=0;v<2;++v) {
+        const auto* c=contracts[v];const auto* l=layouts[v];const auto* w=writers[v];const auto* au=authorities[v];
+        require(layout::selected(c)==l && layout::modern(l) && layout::known(l) &&
+            layout::selected_writer(c)==w && layout::temporal_writer_rva(c)==entries[v],
+            "Camera layout or writer selected another build");
+        require(l->camera_bytes==0x5E0 && l->descriptor_cameras==std::array<std::size_t,2>{0x10,0x5F0} &&
+            l->frame_descriptor==0x10 && l->jitter==0x4C0 && l->viewport==0x4C8 &&
+            l->alternate_fov==0x538 && l->descriptor_extent==0xBDC,
+            "Current lens, integer dimensions or history used a uniform legacy field delta");
+        require(layout::writer_prefix_matches(w,prefix),"Examined writer prefix rejected");
+        for (std::size_t i=0;i<prefix.size();++i) {
+            auto bad=prefix;bad[i]^=0x80;
+            require(!layout::writer_prefix_matches(w,bad) &&
+                !layout::writer_prefix_matches(w,std::span<const std::uint8_t>(prefix).first(i)),
+                "Changed or truncated writer entry accepted");
+        }
+        for (std::size_t i=0;i<4;++i) {
+            require(layout::remastered_writer_purpose(c,returns[v][i])==purposes[i] &&
+                layout::normal_temporal_route(c,returns[v][i])==(i==0) &&
+                layout::remastered_writer_purpose(c,returns[1-v][i])==layout::WriterPurpose::unknown &&
+                layout::remastered_writer_purpose(c,returns[v][i]-5)==layout::WriterPurpose::unknown &&
+                !layout::normal_temporal_route(c,returns[1-v][i]),
+                "Writer mixed a CALL, private/restore route or the other version");
+        }
+        require(auth::selected(c)==au && au->actor_gameplay==0x2F3 && au->actor_cutscene==0x2F2 &&
+            au->game_cutscene==0x11F && au->manual_control==0x269 && au->director_entries==0x58 &&
+            au->director_count==0x60 && au->entry_stride==0x28 && au->native_camera==0,
+            "Authority fields confused native camera pointers and script handles");
+        for (std::size_t i=0;i<9;++i) {
+            const auto cb=static_cast<auth::Callback>(i);const auto* e=auth::entry(au,cb);
+            require(e && e->rva==callback_entries[v][i] && e->rva!=callback_entries[1-v][i],
+                "Named callback used another build's address");
+            const std::vector<std::uint8_t> bytes(e->signature.begin(),e->signature.end());
+            require(auth::signature_matches(*e,bytes),"Known callback prefix rejected");
+            for (std::size_t j=0;j<bytes.size();++j) {
+                auto bad=bytes;bad[j]^=0x80;
+                require(!auth::signature_matches(*e,bad) &&
+                    !auth::signature_matches(*e,std::span<const std::uint8_t>(bytes).first(j)),
+                    "Changed or truncated callback prefix accepted");
+            }
+        }
+        const auto* manual=auth::entry(au,auth::Callback::manual_control);
+        const auto* other_manual=auth::entry(authorities[1-v],auth::Callback::manual_control);
+        require(!auth::signature_matches(*manual,other_manual->signature),
+            "Manual-control signature reused the other version's RIP displacement");
+        require(auth::is_custom_camera(c,primary_tables[v]) &&
+            !auth::is_custom_camera(c,primary_tables[1-v]) &&
+            !auth::is_custom_camera(c,secondary_tables[v][0]) &&
+            !auth::is_custom_camera(c,secondary_tables[v][1]),
+            "Secondary subobject or other build acquired camera authority");
+        const auto copied_c=*c;const auto copied_l=*l;const auto copied_w=*w;const auto copied_au=*au;
+        require(!layout::selected(&copied_c) && !layout::selected_writer(&copied_c) &&
+            !layout::temporal_writer_rva(&copied_c) && !layout::normal_temporal_route(&copied_c,returns[v][0]) &&
+            !layout::known(&copied_l) && !layout::modern(&copied_l) &&
+            !layout::writer_prefix_matches(&copied_w,prefix) && !auth::selected(&copied_c) &&
+            !auth::known(&copied_au) && !auth::entry(&copied_au,auth::Callback::head),
+            "Copied profile became a version capability");
+        std::array<std::size_t,2> offsets{};
+        require(layout::descriptor_jitter_offsets(c,offsets) && offsets==std::array<std::size_t,2>{0x4D0,0xAB0} &&
+            !layout::legacy_temporal_writer_allowed(c),"Current descriptor jitter admitted legacy correction");
+    }
+    require(!layout::writer_prefix_matches(nullptr,prefix) && !layout::modern(nullptr) &&
+        !layout::modern(&layout::legacy_404) &&
+        !layout::selected_writer(&cam::legacy_404) && !auth::known(nullptr),
+        "Unknown or legacy profile acquired modern forwarding");
+}
+
 int main() {
     test_core_profiles_reject_mixed_calls_records_and_installation();
     test_normal_epilogue_record_and_task_scope();
     test_core_native_arguments_labels_and_restoration();
     test_core_private_stale_and_unknown_labels_mask();
     test_core_profile_and_native_prefix();
-    test_remastered_native_fixture();
+    for (const auto* profile : {&layout::remastered_500c,&layout::remastered_1048522})
+        test_remastered_native_fixture(*profile);
     test_legacy_fixture_and_failed_reads();
     test_selection_and_writer_route_gate();
     test_native_authority_version_and_unknowns();
     test_native_authority_entry_mismatch();
-    test_projection_writes_keep_integer_dimensions_and_other_records();
-    test_failed_projection_is_not_partially_published();
+    for (const auto* profile : {&layout::remastered_500c,&layout::remastered_1048522}) {
+        test_projection_writes_keep_integer_dimensions_and_other_records(profile);
+        test_failed_projection_is_not_partially_published(profile);
+    }
+    test_current_camera_profiles_and_writer_are_separate();
     test_canted_pose_commits_only_six_floats();
     test_normal_copy_lineage_for_both_factory_eyes();
     test_unknown_and_nested_copy_scopes_mask_outer_authority();
@@ -1037,6 +1133,7 @@ int main() {
     test_copy_context_admission_and_signatures();
     test_abandoned_copy_scope_restores_context();
     test_copy_profiles_never_mix_builds();
-    std::cout << "Versioned normal core/task calls, profile-bound records, installation routing, "
+    std::cout << checks << " CPU checks. Versioned camera/writer/authority profiles and "
+        "normal core/task calls, profile-bound records, installation routing, "
         "readiness and camera copy lineage checked (CPU fixtures only).\n";
 }

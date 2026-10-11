@@ -11,8 +11,8 @@
 namespace w3vr::engine_camera_layout {
 
 // Field placement and bounded writer-route data. This does not authorize a
-// game version, matrix semantics, or a complete temporal/optical-center port. The 5.00c data
-// were examined in executable SHA-256 9406ECCC12B68E08920931442EF6A57340E910D3E01F2082E88232487433FE51.
+// game version, matrix semantics, or a complete temporal/optical-center port.
+// Each modern profile was checked independently against its executable.
 struct Layout {
     std::size_t camera_bytes;
     std::array<std::size_t, 2> descriptor_cameras;
@@ -27,12 +27,21 @@ inline constexpr Layout legacy_404{0x510, {0x10, 0x520}, 0x10,
     0x400, 0x408, 0x468, 0xA3C};
 inline constexpr Layout remastered_500c{0x5E0, {0x10, 0x5F0}, 0x10,
     0x4C0, 0x4C8, 0x538, 0xBDC};
+inline constexpr Layout remastered_1048522{0x5E0, {0x10, 0x5F0}, 0x10,
+    0x4C0, 0x4C8, 0x538, 0xBDC};
+inline bool modern(const Layout* layout) {
+    return layout == &remastered_500c || layout == &remastered_1048522;
+}
+inline bool known(const Layout* layout) {
+    return layout == &legacy_404 || modern(layout);
+}
 
 // Share the already-selected temporal contract; never select by an INI flag
 // or silently default a null/unknown contract to legacy offsets.
 inline const Layout* selected(const engine_camera::TemporalContract* contract) {
     if (contract == &engine_camera::legacy_404) return &legacy_404;
     if (contract == &engine_camera::remastered_500c) return &remastered_500c;
+    if (contract == &engine_camera::remastered_1048522) return &remastered_1048522;
     return nullptr;
 }
 
@@ -91,7 +100,7 @@ struct ProjectionFields {
 static_assert(sizeof(ProjectionFields) == 16);
 static_assert(offsetof(ProjectionFields, viewport) == 8);
 inline bool projection_range(std::size_t bytes, const Layout* layout) {
-    return (layout == &legacy_404 || layout == &remastered_500c) &&
+    return known(layout) &&
         bytes >= layout->camera_bytes && layout->jitter <= bytes &&
         sizeof(ProjectionFields) <= bytes - layout->jitter &&
         layout->viewport == layout->jitter + sizeof(ProjectionFields::center_px);
@@ -119,11 +128,11 @@ struct PoseFields {
     std::array<float, 3> position{};
     std::array<float, 3> rotation_degrees{};
 };
-// The six source pose floats have the same placement in both examined versions.
+// The six source pose floats have the same placement in the examined profiles.
 // Keep position W, FOV, matrices, projection, history and adjacent objects intact.
 inline bool write_pose(std::span<std::uint8_t> view,
     const Layout* layout, const PoseFields& pose) {
-    if ((layout != &legacy_404 && layout != &remastered_500c) ||
+    if (!known(layout) ||
         view.size() < layout->camera_bytes) return false;
     for (float value : pose.position) if (!std::isfinite(value)) return false;
     for (float value : pose.rotation_degrees) if (!std::isfinite(value)) return false;
@@ -140,17 +149,41 @@ struct WriterCandidate {
     WriterPurpose purpose;
 };
 
-inline constexpr std::uint32_t remastered_writer_rva = 0x022B51E0;
-inline constexpr std::array<WriterCandidate, 4> remastered_writer_candidates{{
+struct WriterProfile {
+    std::uintptr_t entry;
+    std::array<WriterCandidate, 4> routes;
+    std::array<std::uint8_t, 15> prefix;
+};
+inline constexpr WriterProfile writer_500c{0x022B51E0, {{
     {0x01C14BD1, WriterPurpose::normal_temporal},
     {0x01D59287, WriterPurpose::supersample_apply},
     {0x01D59880, WriterPurpose::supersample_restore},
-    {0x01D59D27, WriterPurpose::final_2d_override}}};
-
-inline WriterPurpose remastered_writer_purpose(std::uintptr_t return_rva) {
-    for (const auto& route : remastered_writer_candidates) {
+    {0x01D59D27, WriterPurpose::final_2d_override}}},
+    {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x40}};
+inline constexpr WriterProfile writer_1048522{0x022BD750, {{
+    {0x01C1B7B1, WriterPurpose::normal_temporal},
+    {0x01D602B7, WriterPurpose::supersample_apply},
+    {0x01D608B0, WriterPurpose::supersample_restore},
+    {0x01D60D57, WriterPurpose::final_2d_override}}},
+    {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x40}};
+inline const WriterProfile* selected_writer(const engine_camera::TemporalContract* contract) {
+    if (contract == &engine_camera::remastered_500c) return &writer_500c;
+    if (contract == &engine_camera::remastered_1048522) return &writer_1048522;
+    return nullptr;
+}
+inline bool writer_prefix_matches(const WriterProfile* profile,
+    std::span<const std::uint8_t> bytes) {
+    if ((profile != &writer_500c && profile != &writer_1048522) ||
+        bytes.size() < profile->prefix.size()) return false;
+    for (std::size_t i=0; i<profile->prefix.size(); ++i)
+        if (bytes[i] != profile->prefix[i]) return false;
+    return true;
+}
+inline WriterPurpose remastered_writer_purpose(
+    const engine_camera::TemporalContract* contract, std::uintptr_t return_rva) {
+    const auto* profile = selected_writer(contract);
+    if (profile != nullptr) for (const auto& route : profile->routes)
         if (route.return_rva == return_rva) return route.purpose;
-    }
     return WriterPurpose::unknown;
 }
 
@@ -159,12 +192,12 @@ inline constexpr std::array<std::uintptr_t, 8> legacy_writer_returns{
     0x01D86EA5, 0x01D87606, 0x01D87925, 0x01D87EC0};
 
 // Entry/route selection is reached only after the main version preflight.
-// Adding the 5.00c data does not change that preflight's rejection of 5.00c.
+// Selecting a subsystem profile does not change global render admission.
 inline std::uintptr_t temporal_writer_rva(
     const engine_camera::TemporalContract* contract) {
     if (contract == &engine_camera::legacy_404) return 0x015E5A90;
-    if (contract == &engine_camera::remastered_500c) return remastered_writer_rva;
-    return 0;
+    const auto* profile = selected_writer(contract);
+    return profile != nullptr ? profile->entry : 0;
 }
 
 inline bool normal_temporal_route(const engine_camera::TemporalContract* contract,
@@ -172,9 +205,7 @@ inline bool normal_temporal_route(const engine_camera::TemporalContract* contrac
     if (contract == &engine_camera::legacy_404) {
         for (const auto rva : legacy_writer_returns) if (rva == return_rva) return true;
     }
-    if (contract == &engine_camera::remastered_500c)
-        return remastered_writer_purpose(return_rva) == WriterPurpose::normal_temporal;
-    return false;
+    return remastered_writer_purpose(contract, return_rva) == WriterPurpose::normal_temporal;
 }
 
 inline bool legacy_centered_writer_hint(
@@ -193,14 +224,11 @@ inline bool descriptor_jitter_offsets(const engine_camera::TemporalContract* con
     return true;
 }
 
-// These new calls are NOT one-to-one replacements for the eight legacy routes. The
-// supersampling loop restores values it captured; adding the optical center
-// again on restore would accumulate it. Final2D's inputs need a separate
-// ownership/source contract. Do not install either an old RVA or this candidate
-// as a complete Remastered port merely because its ABI matches. The normal
-// call was reached through the validated mode table at 01C14B72. The builder
-// separately stores previous jitter at descriptor+4E0/+4E4 AFTER the setter;
-// that write is not proof that the previous projection has been ported.
+// Modern callers have distinct source contracts. Supersampling restores values
+// it captured; adding a center on restore would accumulate it. Final2D inputs
+// remain separate. The normal call is reached through the checked mode table,
+// and previous jitter is written separately after it. These bounded routes do
+// not authorize legacy temporal corrections, history isolation or reentry.
 inline bool legacy_temporal_writer_allowed(
     const engine_camera::TemporalContract* contract) {
     return contract == &engine_camera::legacy_404;
