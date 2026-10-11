@@ -7,14 +7,22 @@
 namespace w3vr::world_culling_view {
 // The native consumer supplies a borrowed frame/scene on its executing thread.
 // Registry identity is not ownership, a worker lease or proof of GPU completion.
-inline constexpr std::uintptr_t consumer_rva=0x01BF5420;
-inline constexpr std::uintptr_t consumer_return=0x01BF2CA1;
-inline constexpr std::uintptr_t camera_copy_return=0x01BF54B1;
 inline constexpr std::size_t scene_manager_offset=0x80518;
 inline constexpr std::size_t primary_offset=0x20,secondary_offset=0x600;
 inline constexpr std::size_t camera_bytes=engine_camera_layout::remastered_500c.camera_bytes;
 inline constexpr std::array<std::uint8_t,16> entry_signature{
     0x40,0x55,0x53,0x57,0x41,0x55,0x48,0x8D,0xAC,0x24,0xF8,0x67,0xFE,0xFF,0xB8,0x08};
+struct Profile {
+    std::uintptr_t consumer_entry, consumer_return, camera_copy_return;
+    std::array<std::uint8_t,16> consumer_prefix;
+};
+inline constexpr Profile remastered_500c{0x01BF5420,0x01BF2CA1,0x01BF54B1,entry_signature};
+inline constexpr Profile remastered_1048522{0x01BFBD20,0x01BF95A1,0x01BFBDB1,entry_signature};
+inline const Profile* selected(const engine_camera::TemporalContract* contract) {
+    if(contract==&engine_camera::remastered_500c)return &remastered_500c;
+    if(contract==&engine_camera::remastered_1048522)return &remastered_1048522;
+    return nullptr;
+}
 inline bool add(std::uintptr_t base,std::size_t offset,std::uintptr_t& out) {
     if(!base || base>std::numeric_limits<std::uintptr_t>::max()-offset)return false;
     out=base+offset;return true;
@@ -23,10 +31,12 @@ struct Context {
     std::uintptr_t manager{},scene{},frame{};
     render_core::FrameLabel label{};
     bool normal_task{};
+    const Profile* profile{};
 };
 inline bool accepts(const engine_camera::TemporalContract* contract,const Context& context,
     std::uint32_t generation) {
-    return contract==&engine_camera::remastered_500c && context.normal_task &&
+    const auto* profile=selected(contract);
+    return profile && context.profile==profile && context.normal_task &&
         context.manager && context.scene &&
         render_core::accepts_frame_identity(context.frame,&context.label,generation);
 }
@@ -34,8 +44,10 @@ inline bool bind(const engine_camera::TemporalContract* contract,std::uintptr_t 
     std::uintptr_t manager,std::uintptr_t scene,std::uintptr_t frame,
     const render_core::FrameLabel& label,std::uint32_t generation,
     std::uintptr_t observed_manager,Context& result) {
-    Context candidate{manager,scene,frame,label,true};
-    if(caller!=consumer_return || manager!=observed_manager || !accepts(contract,candidate,generation))return false;
+    const auto* profile=selected(contract);
+    Context candidate{manager,scene,frame,label,true,profile};
+    if(!profile || caller!=profile->consumer_return || manager!=observed_manager ||
+        !accepts(contract,candidate,generation))return false;
     result=candidate;return true;
 }
 inline bool camera_valid(std::span<const std::uint8_t> bytes) {
@@ -51,7 +63,7 @@ inline bool select_primary(const engine_camera::TemporalContract* contract,const
     std::uint32_t generation,std::uintptr_t caller,std::uintptr_t destination,std::uintptr_t source,
     std::span<const std::uint8_t> primary,std::span<const std::uint8_t> secondary,std::uintptr_t& result) {
     std::uintptr_t p{},s{},pend{},send{},dend{};
-    if(!accepts(contract,context,generation) || caller!=camera_copy_return ||
+    if(!accepts(contract,context,generation) || caller!=context.profile->camera_copy_return ||
         !add(context.frame,primary_offset,p) || !add(context.frame,secondary_offset,s) ||
         !add(p,camera_bytes,pend) || !add(s,camera_bytes,send) ||
         source!=s || !add(destination,camera_bytes,dend) ||

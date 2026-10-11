@@ -8,13 +8,29 @@ namespace w3vr::modern_vegetation_view {
 // Adapt the early and late normal SpeedTree view updates, not every world-visibility
 // consumer. A borrowed native frame/scene is usable only during its labelled
 // synchronous core call. This is not native ownership or a worker-task lease.
-inline constexpr std::uintptr_t update_rva = 0x014A5D50;
 inline constexpr std::array<std::uint8_t,16> entry_signature{
     0x48,0x8B,0xC4,0x48,0x89,0x58,0x18,0x48,0x89,0x70,0x20,0x55,0x57,0x41,0x56,0x48};
-inline constexpr std::uintptr_t preselection_rva = 0x01CE5970;
-inline constexpr std::uintptr_t preselection_return = 0x01C14538;
 inline constexpr std::array<std::uint8_t,16> preselection_signature{
     0x48,0x8B,0xC4,0x48,0x89,0x50,0x10,0x55,0x53,0x57,0x41,0x57,0x48,0x8D,0x6C,0x24};
+// Entries and callers are independently identified for each executable version.
+// Equal input fields do not imply a uniform address relocation or camera ownership.
+struct Profile {
+    std::uintptr_t update_entry, preselection_entry, preselection_return;
+    std::array<std::uintptr_t,2> normal_returns, early_returns;
+    std::array<std::uint8_t,16> update_prefix, preselection_prefix;
+};
+inline constexpr Profile remastered_500c{0x014A5D50,0x01CE5970,0x01C14538,
+    {0x01C14D43,0x01C14D79},{0x01CE6345,0x01CE6379},entry_signature,preselection_signature};
+inline constexpr Profile remastered_1048522{0x0131B8E0,0x01CEC9D0,0x01C1B118,
+    {0x01C1B923,0x01C1B959},{0x01CED3A5,0x01CED3D9},entry_signature,preselection_signature};
+inline const Profile* selected(const engine_camera::TemporalContract* contract) {
+    if(contract==&engine_camera::remastered_500c)return &remastered_500c;
+    if(contract==&engine_camera::remastered_1048522)return &remastered_1048522;
+    return nullptr;
+}
+inline bool known(const Profile* profile) {
+    return profile==&remastered_500c || profile==&remastered_1048522;
+}
 inline constexpr std::size_t scene_container_offset = 0x188;
 inline constexpr std::size_t frame_descriptor_offset = 0x10;
 inline constexpr std::size_t camera_bytes = engine_camera_layout::remastered_500c.camera_bytes;
@@ -22,9 +38,10 @@ inline constexpr std::size_t frame_primary_offset = 0x20;
 inline constexpr std::size_t frame_secondary_offset = 0x600;
 
 enum class Route { unknown, ordinary_projection, renderer_projection };
-inline Route route(std::uintptr_t caller) {
-    if (caller == 0x01C14D43 || caller == 0x01CE6345) return Route::ordinary_projection;
-    if (caller == 0x01C14D79 || caller == 0x01CE6379) return Route::renderer_projection;
+inline Route route(const Profile* profile,std::uintptr_t caller) {
+    if(!known(profile))return Route::unknown;
+    if(caller==profile->normal_returns[0] || caller==profile->early_returns[0])return Route::ordinary_projection;
+    if(caller==profile->normal_returns[1] || caller==profile->early_returns[1])return Route::renderer_projection;
     return Route::unknown;
 }
 inline std::size_t projection_offset(Route selected) {
@@ -47,26 +64,30 @@ struct Context {
     bool normal_core{};
     Phase phase{Phase::normal_core};
     std::uintptr_t early_container{};
+    const Profile* profile{}; // Exact captured version, never inferred from caller alone.
 };
 inline bool accepts(const engine_camera::TemporalContract* contract,const Context& context,
     std::uint32_t generation) {
-    return contract == &engine_camera::remastered_500c && context.normal_core && context.scene &&
+    const auto* profile=selected(contract);
+    return profile && context.profile==profile && context.normal_core && context.scene &&
         render_core::accepts_frame_label(context.renderer,context.frame,&context.label,generation);
 }
 // The early updates require their own exact parent-call scope. A thread label
 // alone must not grant the same authority to a private/reentrant preselection.
 inline bool allows_update(const Context& context,std::uintptr_t caller,std::uintptr_t container) {
+    if(!known(context.profile))return false;
     if (context.phase == Phase::normal_core)
-        return caller == 0x01C14D43 || caller == 0x01C14D79;
+        return caller==context.profile->normal_returns[0] || caller==context.profile->normal_returns[1];
     return context.phase == Phase::preselection && context.early_container != 0 &&
-        container == context.early_container && (caller == 0x01CE6345 || caller == 0x01CE6379);
+        container == context.early_container &&
+        (caller==context.profile->early_returns[0] || caller==context.profile->early_returns[1]);
 }
 inline bool bind_preselection(const engine_camera::TemporalContract* contract,const Context& outer,
     std::uint32_t generation,std::uintptr_t caller,std::uintptr_t container,
     std::uintptr_t descriptor,std::uintptr_t scene,std::uintptr_t observed_container,Context& result) {
     std::uintptr_t expected{};
     if (!accepts(contract,outer,generation) || outer.phase != Phase::normal_core ||
-        caller != preselection_return || scene != outer.scene || !container ||
+        caller != outer.profile->preselection_return || scene != outer.scene || !container ||
         container != observed_container || !add(outer.frame,frame_descriptor_offset,expected) ||
         descriptor != expected) return false;
     Context candidate=outer;candidate.phase=Phase::preselection;candidate.early_container=container;
@@ -119,7 +140,7 @@ inline bool prepare(const engine_camera::TemporalContract* contract,const Contex
     std::uint32_t generation,std::uintptr_t caller,std::uintptr_t container,
     std::uintptr_t receiver,const Inputs& incoming,bool final_mode,
     std::span<const std::uint8_t> primary,std::span<const std::uint8_t> secondary,Inputs& result) {
-    const Route selected=route(caller);
+    const Route selected=route(context.profile,caller);
     if (!accepts(contract,context,generation) || !allows_update(context,caller,container) ||
         !receiver_matches(selected,container,receiver) ||
         final_mode) return false;

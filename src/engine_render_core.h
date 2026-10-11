@@ -23,9 +23,6 @@ inline constexpr Profile remastered_500c{0x01C13630, 0x01D05551,
     0x01D57F90, 0x037A6C40, modern_entry_signature, epilogue_entry_signature};
 inline constexpr Profile remastered_1048522{0x01C1A210, 0x01D0C5E1,
     0x01D5EFC0, 0x037B1998, modern_entry_signature, epilogue_entry_signature};
-// Existing bundle still installs ONLY the independently ported 500c targets.
-inline constexpr std::uintptr_t normal_epilogue_rva = remastered_500c.epilogue_entry;
-inline constexpr std::uintptr_t normal_epilogue_vtable_rva = remastered_500c.epilogue_table;
 inline const Profile* selected(const engine_camera::TemporalContract* contract) {
     if (contract == &engine_camera::legacy_404) return &legacy_404;
     if (contract == &engine_camera::remastered_500c) return &remastered_500c;
@@ -36,11 +33,12 @@ inline const Profile* modern_selected(const engine_camera::TemporalContract* con
     const auto* profile = selected(contract);
     return profile == &remastered_500c || profile == &remastered_1048522 ? profile : nullptr;
 }
-enum class InstallRoute { unsupported, legacy, remastered_500c_bundle };
+enum class InstallRoute { unsupported, legacy, remastered_500c_bundle, remastered_1048522_bundle };
 inline InstallRoute install_route(const Profile* profile) {
     if (profile == &legacy_404) return InstallRoute::legacy;
     if (profile == &remastered_500c) return InstallRoute::remastered_500c_bundle;
-    // The new core profile alone cannot authorize the other four bundle hooks.
+    if (profile == &remastered_1048522) return InstallRoute::remastered_1048522_bundle;
+    // Only exact known profiles may select their corresponding five-hook bundle.
     return InstallRoute::unsupported;
 }
 inline bool ready_for(const engine_camera::TemporalContract* contract,
