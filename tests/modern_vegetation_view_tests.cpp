@@ -7,6 +7,8 @@ namespace core=w3vr::render_core;
 namespace cam=w3vr::engine_camera;
 namespace {
 int checks{},failures{},calls{};
+const cam::TemporalContract* tested_contract=&cam::remastered_500c;
+const veg::Profile* tested_profile=&veg::remastered_500c;
 void require(bool value,const char* why) {++checks;if(!value){++failures;std::fprintf(stderr,"FAIL: %s\n",why);}}
 using Bytes=std::array<std::uint8_t,veg::camera_bytes>;
 using Matrix=std::array<float,16>;
@@ -36,7 +38,7 @@ Bytes camera(bool primary,int eye) {
     }
     return bytes;
 }
-veg::Context context(int eye=0) {return {0x100000,0x200000,0x300000,{0x200000,7,55,eye,true,true},true};}
+veg::Context context(int eye=0) {return {0x100000,0x200000,0x300000,{0x200000,7,55,eye,true,true},true,veg::Phase::normal_core,0,tested_profile};}
 struct CallRecord {
     void* receiver{};const float* position{};const float* projection{};const float* view{};
     veg::Inputs copied{};std::uint32_t far_bits{};bool mode{},result{};
@@ -70,18 +72,18 @@ void test_routing_and_boundary_geometry() {
     for(int eye:{0,1})for(int variant:{0,1})for(int early:{0,1}) {
         auto primary=camera(true,eye),secondary=camera(false,eye);const auto before_primary=primary,before_secondary=secondary;
         const auto route=variant?veg::Route::renderer_projection:veg::Route::ordinary_projection;
-        const std::uintptr_t caller=early?(variant?0x1CE6379:0x1CE6345):(variant?0x1C14D79:0x1C14D43);
+        const std::uintptr_t caller=early?(variant?tested_profile->early_returns[1]:tested_profile->early_returns[0]):(variant?tested_profile->normal_returns[1]:tested_profile->normal_returns[0]);
         const std::uintptr_t container=0x400000;auto ctx=context(eye);
         if(early) {
             veg::Context bound{};
-            require(veg::bind_preselection(&cam::remastered_500c,ctx,7,veg::preselection_return,
+            require(veg::bind_preselection(tested_contract,ctx,7,tested_profile->preselection_return,
                 container,ctx.frame+veg::frame_descriptor_offset,ctx.scene,container,bound),"early parent scope rejected");
             ctx=bound;
         }
         const auto receiver=container+(variant?0x794:0x4BC);veg::Inputs incoming{},output{},expected{};
         require(veg::read_inputs(secondary,route,incoming),"secondary fixture");
         require(veg::read_inputs(primary,route,expected),"primary fixture");
-        require(veg::prepare(&cam::remastered_500c,ctx,7,caller,container,receiver,incoming,false,
+        require(veg::prepare(tested_contract,ctx,7,caller,container,receiver,incoming,false,
             primary,secondary,output),"known core route rejected");
         require(veg::same(output,expected),"primary position/view/projection/near not routed");
         record={};calls=0;record.result=eye==0;const float grid_far=4096.f;
@@ -116,8 +118,8 @@ void test_rejections_preserve_output() {
     veg::read_inputs(secondary,veg::Route::ordinary_projection,incoming);
     for(int failure=0;failure<20;++failure) {
         auto ctx=context();auto p=primary,s=secondary;auto original=incoming;
-        auto contract=&cam::remastered_500c;std::uint32_t generation=7;
-        std::uintptr_t caller=0x1C14D43,container=0x400000,receiver=0x4004BC;bool mode=false;
+        auto contract=tested_contract;std::uint32_t generation=7;
+        std::uintptr_t caller=tested_profile->normal_returns[0],container=0x400000,receiver=0x4004BC;bool mode=false;
         std::span<const std::uint8_t> pspan=p,sspan=s;
         switch(failure) {
         case 0:contract=&cam::legacy_404;break;case 1:contract=nullptr;break;
@@ -125,7 +127,7 @@ void test_rejections_preserve_output() {
         case 4:ctx.frame+=16;break;case 5:ctx.label.normal_factory_lineage=false;break;
         case 6:generation=8;break;case 7:ctx.label.eye=2;break;
         case 8:ctx.label.pair=UINT64_MAX;break;case 9:ctx.label.view_valid=false;break;
-        case 10:caller=0x1CE6345;break;case 11:receiver+=16;break;
+        case 10:caller=tested_profile->early_returns[0];break;case 11:receiver+=16;break;
         case 12:container=UINTPTR_MAX-8;break;case 13:mode=true;break;
         case 14:original.position[0]+=.1f;break;case 15:original.projection[8]+=.1f;break;
         case 16:original.view[12]+=.1f;break;case 17:original.near_range+=.1f;break;
@@ -141,7 +143,7 @@ void test_rejections_preserve_output() {
         const auto route=offset==0x340?veg::Route::renderer_projection:veg::Route::ordinary_projection;
         auto original=incoming;if(route==veg::Route::renderer_projection)veg::read_inputs(secondary,route,original);
         veg::Inputs out=incoming,saved=out;
-        require(!veg::prepare(&cam::remastered_500c,context(),7,route==veg::Route::renderer_projection?0x1C14D79:0x1C14D43,
+        require(!veg::prepare(tested_contract,context(),7,route==veg::Route::renderer_projection?tested_profile->normal_returns[1]:tested_profile->normal_returns[0],
             0x400000,route==veg::Route::renderer_projection?0x400794:0x4004BC,original,false,p,secondary,out),"nonfinite source admitted");
         require(veg::same(out,saved),"nonfinite source changed output");
     }
@@ -157,17 +159,17 @@ veg::Context read_context(){return current_context;}
 void apply_context(const veg::Context& c){current_context=c;}
 bool expect_context{};
 void core_probe(void*,void*,void*) {
-    require(veg::accepts(&cam::remastered_500c,current_context,7)==expect_context,"CPU scope inherited wrong authority");
+    require(veg::accepts(tested_contract,current_context,7)==expect_context,"CPU scope inherited wrong authority");
 }
 void test_nested_core_masks_and_restores() {
     current_context=context(1);const auto outer=current_context;
     expect_context=false;
-    core::invoke(&cam::remastered_500c,0xBAD,core_probe,reinterpret_cast<void*>(0x100000),
+    core::invoke(tested_contract,0xBAD,core_probe,reinterpret_cast<void*>(0x100000),
         reinterpret_cast<void*>(0x200000),reinterpret_cast<void*>(0x300000),&outer.label,7,
         context(0),veg::Context{},read_context,apply_context);
     require(current_context.label.eye==1 && current_context.frame==outer.frame,"rejected nested core lost outer context");
     expect_context=true;
-    core::invoke(&cam::remastered_500c,core::remastered_500c.normal_return,core_probe,
+    core::invoke(tested_contract,core::selected(tested_contract)->normal_return,core_probe,
         reinterpret_cast<void*>(0x100000),reinterpret_cast<void*>(0x200000),reinterpret_cast<void*>(0x300000),
         &outer.label,7,context(0),veg::Context{},read_context,apply_context);
     require(current_context.label.eye==1,"accepted nested core did not restore outer eye");
@@ -177,7 +179,7 @@ bool equal_context(const veg::Context& a,const veg::Context& b) {
         a.label.frame==b.label.frame && a.label.generation==b.label.generation &&
         a.label.pair==b.label.pair && a.label.eye==b.label.eye &&
         a.label.view_valid==b.label.view_valid && a.label.normal_factory_lineage==b.label.normal_factory_lineage &&
-        a.normal_core==b.normal_core && a.phase==b.phase && a.early_container==b.early_container;
+        a.normal_core==b.normal_core && a.phase==b.phase && a.early_container==b.early_container && a.profile==b.profile;
 }
 int parent_calls{};void* seen_container{};void* seen_descriptor{};void* seen_scene{};
 veg::Context expected_parent{};bool nested_parent{},throw_parent{};
@@ -193,13 +195,13 @@ void preselection_probe(void* container,void* descriptor,void* scene) {
 }
 void test_preselection_scope_and_cross_phase_rejections() {
     const auto outer=context(1);veg::Context bound{};
-    require(veg::bind_preselection(&cam::remastered_500c,outer,7,veg::preselection_return,
+    require(veg::bind_preselection(tested_contract,outer,7,tested_profile->preselection_return,
         0x400000,0x200010,0x300000,0x400000,bound),"valid early scope failed");
     require(bound.phase==veg::Phase::preselection && bound.early_container==0x400000 &&
         bound.label.eye==1 && bound.label.pair==outer.label.pair,"early scope lost actual identity");
     for(int failure=0;failure<17;++failure) {
-        auto ctx=outer;auto contract=&cam::remastered_500c;std::uint32_t generation=7;
-        std::uintptr_t caller=veg::preselection_return,container=0x400000,descriptor=0x200010,
+        auto ctx=outer;auto contract=tested_contract;std::uint32_t generation=7;
+        std::uintptr_t caller=tested_profile->preselection_return,container=0x400000,descriptor=0x200010,
             scene=0x300000,observed=0x400000;
         switch(failure) {
         case 0:contract=nullptr;break;case 1:contract=&cam::legacy_404;break;
@@ -222,12 +224,12 @@ void test_preselection_scope_and_cross_phase_rejections() {
         veg::Inputs incoming{};veg::read_inputs(secondary,route,incoming);
         for(int failure=0;failure<4;++failure) {
             auto ctx=failure==0?outer:bound;
-            std::uintptr_t caller=variant?0x1CE6379:0x1CE6345;
-            if(failure==1)caller=variant?0x1C14D79:0x1C14D43;
+            std::uintptr_t caller=variant?tested_profile->early_returns[1]:tested_profile->early_returns[0];
+            if(failure==1)caller=variant?tested_profile->normal_returns[1]:tested_profile->normal_returns[0];
             if(failure==2)ctx.early_container+=16;
             if(failure==3)ctx.phase=static_cast<veg::Phase>(99);
             auto out=incoming,saved=out;
-            require(!veg::prepare(&cam::remastered_500c,ctx,7,caller,0x400000,
+            require(!veg::prepare(tested_contract,ctx,7,caller,0x400000,
                 variant?0x400794:0x4004BC,incoming,false,primary,secondary,out),"cross-phase update admitted");
             require(veg::same(out,saved),"cross-phase rejection changed output");
         }
@@ -250,7 +252,52 @@ void test_preselection_scope_and_cross_phase_rejections() {
     catch(int error){caught=error==23;}
     require(caught && equal_context(current_context,outer),"CPU exception did not preserve propagation/restore");
 }
+void test_version_separation() {
+    const auto* other=tested_contract==&cam::remastered_500c ? &cam::remastered_1048522 : &cam::remastered_500c;
+    const auto* other_profile=veg::selected(other);
+    const auto copied_contract=*tested_contract;
+    const auto copied_profile=*tested_profile;
+    require(!veg::selected(nullptr) && !veg::selected(&cam::legacy_404) && !veg::selected(&copied_contract),
+        "unknown/copied contract received visibility profile");
+    const auto primary=camera(true,1),secondary=camera(false,1);
+    for(int phase:{0,1})for(int variant:{0,1}) {
+        auto c=context(1);
+        if(phase)require(veg::bind_preselection(tested_contract,c,7,tested_profile->preselection_return,
+            0x400000,c.frame+0x10,c.scene,0x400000,c),"known version early scope failed");
+        veg::Inputs incoming{};veg::read_inputs(secondary,variant?veg::Route::renderer_projection:veg::Route::ordinary_projection,incoming);
+        for(int failure=0;failure<6;++failure) {
+            auto bad=c;auto contract=tested_contract;
+            auto caller=phase?tested_profile->early_returns[variant]:tested_profile->normal_returns[variant];
+            switch(failure){case 0:bad.profile=nullptr;break;case 1:bad.profile=other_profile;break;
+            case 2:bad.profile=&copied_profile;break;case 3:contract=other;break;
+            case 4:contract=&copied_contract;break;
+            case 5:caller=phase?other_profile->early_returns[variant]:other_profile->normal_returns[variant];break;}
+            auto out=incoming;
+            require(!veg::prepare(contract,bad,7,caller,0x400000,variant?0x400794:0x4004BC,
+                incoming,false,primary,secondary,out) && veg::same(out,incoming),"mixed version wrote a vegetation replacement");
+        }
+        require(veg::route(&copied_profile,tested_profile->normal_returns[variant])==veg::Route::unknown &&
+            veg::route(nullptr,tested_profile->early_returns[variant])==veg::Route::unknown,
+            "copied/null profile gained a caller route");
+    }
+    for(int failure=0;failure<5;++failure) {
+        auto bad=context(1);auto contract=tested_contract;auto caller=tested_profile->preselection_return;
+        switch(failure){case 0:bad.profile=other_profile;break;case 1:bad.profile=&copied_profile;break;
+        case 2:contract=other;break;case 3:contract=&copied_contract;break;case 4:caller=other_profile->preselection_return;break;}
+        auto out=context(0),saved=out;
+        require(!veg::bind_preselection(contract,bad,7,caller,0x400000,bad.frame+0x10,bad.scene,0x400000,out) &&
+            equal_context(out,saved),"mixed preselection changed published context");
+    }
+    require(!core::ready_for(tested_contract,core::selected(other),true) &&
+        !core::ready_for(tested_contract,core::selected(tested_contract),false) &&
+        core::ready_for(tested_contract,core::selected(tested_contract),true),"mixed/unready installed profile gained authority");
 }
-int main(){test_routing_and_boundary_geometry();test_rejections_preserve_output();test_nested_core_masks_and_restores();
-    test_preselection_scope_and_cross_phase_rejections();
-    std::printf("Modern vegetation eye routing: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;}
+}
+int main(){
+    for(const auto* contract:{&cam::remastered_500c,&cam::remastered_1048522}) {
+        tested_contract=contract;tested_profile=veg::selected(contract);
+        test_routing_and_boundary_geometry();test_rejections_preserve_output();test_nested_core_masks_and_restores();
+        test_preselection_scope_and_cross_phase_rejections();test_version_separation();
+    }
+    std::printf("Modern vegetation eye routing: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;
+}

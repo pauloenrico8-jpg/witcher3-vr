@@ -646,8 +646,7 @@ void test_copy_profiles_never_mix_builds() {
     const auto* current = &engine_camera::remastered_1048522;
     require(!layout::selected(current) && !layout::temporal_writer_rva(current) &&
         !layout::normal_temporal_route(current, 0x01C1B7B1) &&
-        !engine_camera_authority::selected(current) &&
-        render_core::install_route(render_core::selected(current)) == render_core::InstallRoute::unsupported,
+        !engine_camera_authority::selected(current),
         "Camera copy profile silently admitted an unported subsystem");
 }
 
@@ -1007,7 +1006,7 @@ void test_core_profiles_reject_mixed_calls_records_and_installation() {
     }
     require(core::install_route(&core::legacy_404) == core::InstallRoute::legacy &&
         core::install_route(&core::remastered_500c) == core::InstallRoute::remastered_500c_bundle &&
-        core::install_route(&core::remastered_1048522) == core::InstallRoute::unsupported &&
+        core::install_route(&core::remastered_1048522) == core::InstallRoute::remastered_1048522_bundle &&
         core::install_route(nullptr) == core::InstallRoute::unsupported,
         "Current modern profile fell through to a legacy or mixed-target installer");
     const auto forged = engine_camera::remastered_1048522;

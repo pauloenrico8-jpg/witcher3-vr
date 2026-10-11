@@ -7,6 +7,8 @@ namespace cam=w3vr::engine_camera;
 namespace core=w3vr::render_core;
 namespace {
 int checks{},failures{},copies{},consumers{};
+const cam::TemporalContract* tested_contract=&cam::remastered_500c;
+const world::Profile* tested_profile=&world::remastered_500c;
 void require(bool ok,const char* why){++checks;if(!ok){++failures;std::fprintf(stderr,"FAIL: %s\n",why);}}
 using Bytes=std::array<std::uint8_t,world::camera_bytes>;
 using Matrix=std::array<float,16>;
@@ -24,7 +26,7 @@ Bytes camera(bool primary,int eye){
     put(b,0x520,p[8]);put(b,0x524,p[9]);b.back()=primary?0xA1:0xB2;return b;
 }
 world::Context ctx(Frame& frame,int eye=0){const auto address=reinterpret_cast<std::uintptr_t>(frame.data.data());
-    return {0x400000,0x300000,address,{address,7,55,eye,true,true},true};}
+    return {0x400000,0x300000,address,{address,7,55,eye,true,true},true,tested_profile};}
 const float* copied_source{};float* copied_destination{};float* copy_return{};
 float* copy_spy(float* destination,const float* source){++copies;copied_source=source;copied_destination=destination;
     if(destination&&source)std::memcpy(destination,source,world::camera_bytes);return copy_return;}
@@ -42,7 +44,7 @@ void geometry_and_native_copy_arguments(){
         const auto before=frame.data;const auto context=ctx(frame,eye);Bytes destination{};
         const auto dst=reinterpret_cast<std::uintptr_t>(destination.data());
         const auto original=context.frame+world::secondary_offset;std::uintptr_t selected{};
-        require(world::select_primary(&cam::remastered_500c,context,7,world::camera_copy_return,dst,
+        require(world::select_primary(tested_contract,context,7,tested_profile->camera_copy_return,dst,
             original,primary,secondary,selected),"world private copy not selected");
         require(selected==context.frame+world::primary_offset,"snapshot address used instead of native primary address");
         copies=0;copy_return=reinterpret_cast<float*>(0x12345);
@@ -66,8 +68,8 @@ void rejecting_sources(){
     Frame frame{};const auto primary=camera(true,0),secondary=camera(false,0);Bytes destination{};
     const auto original=ctx(frame);const auto dst=reinterpret_cast<std::uintptr_t>(destination.data());
     for(int failure=0;failure<18;++failure){
-        auto c=original;auto contract=&cam::remastered_500c;std::uint32_t generation=7;
-        std::uintptr_t caller=world::camera_copy_return,d=dst,source=c.frame+world::secondary_offset;
+        auto c=original;auto contract=tested_contract;std::uint32_t generation=7;
+        std::uintptr_t caller=tested_profile->camera_copy_return,d=dst,source=c.frame+world::secondary_offset;
         std::span<const std::uint8_t> p=primary,s=secondary;
         switch(failure){case 0:contract=nullptr;break;case 1:contract=&cam::legacy_404;break;
         case 2:c.normal_task=false;break;case 3:c.manager=0;break;case 4:c.scene=0;break;
@@ -82,13 +84,13 @@ void rejecting_sources(){
     }
     for(auto offset:{0x1Cu,0x28u,0x2Cu,0x30u,0x520u,0x524u}){auto bad=primary;
         put(bad,offset,std::numeric_limits<float>::quiet_NaN());std::uintptr_t out=0xBAD;
-        require(!world::select_primary(&cam::remastered_500c,original,7,world::camera_copy_return,dst,
+        require(!world::select_primary(tested_contract,original,7,tested_profile->camera_copy_return,dst,
             original.frame+world::secondary_offset,bad,secondary,out)&&out==0xBAD,"nonfinite primary admitted");}
     copies=0;copy_return=nullptr;copied_source=reinterpret_cast<const float*>(0x1);
     require(world::invoke_copy(copy_spy,nullptr,nullptr,0)==nullptr&&copies==1&&copied_source==nullptr&&copied_destination==nullptr,
         "fallback null arguments/return/count changed");
-    for(int failure=0;failure<9;++failure){auto c=original;auto contract=&cam::remastered_500c;
-        std::uintptr_t caller=world::consumer_return,manager=c.manager,scene=c.scene,frame_address=c.frame,observed=manager;
+    for(int failure=0;failure<9;++failure){auto c=original;auto contract=tested_contract;
+        std::uintptr_t caller=tested_profile->consumer_return,manager=c.manager,scene=c.scene,frame_address=c.frame,observed=manager;
         std::uint32_t generation=7;switch(failure){case 0:contract=nullptr;break;case 1:contract=&cam::legacy_404;break;
         case 2:caller+=1;break;case 3:manager=0;break;case 4:observed+=16;break;case 5:scene=0;break;
         case 6:frame_address+=16;break;case 7:generation=8;break;case 8:c.label.pair=0;break;}
@@ -103,30 +105,61 @@ void apply_context(const world::Context& c){current=c;}
 world::Context expected{};bool nested{},throw_probe{};
 void* expected_manager{};void* expected_scene{};void* expected_frame{};
 void consumer_spy(void* manager,void* scene,void* frame){++consumers;
-    require(current.frame==expected.frame&&current.label.eye==expected.label.eye&&current.normal_task==expected.normal_task,
+    require(current.frame==expected.frame&&current.label.eye==expected.label.eye&&current.normal_task==expected.normal_task && current.profile==expected.profile,
         "consumer inherits incorrect frame/eye authority");
     require(manager==expected_manager&&scene==expected_scene&&frame==expected_frame,"consumer original arguments changed");
     if(nested){nested=false;const auto outer=current;expected={};expected_manager=expected_scene=expected_frame=nullptr;
         world::invoke(consumer_spy,nullptr,nullptr,nullptr,nullptr,read_context,apply_context);
-        require(current.frame==outer.frame&&current.label.eye==outer.label.eye,"unknown nested consumer lost outer eye");}
+        require(current.frame==outer.frame&&current.label.eye==outer.label.eye&&current.profile==outer.profile,"unknown nested consumer lost outer eye");}
     if(throw_probe){throw_probe=false;throw 23;}
 }
 void scopes_and_thread_boundary(){Frame frame{};auto c=ctx(frame,1);world::Context bound{};
-    require(world::bind(&cam::remastered_500c,world::consumer_return,c.manager,c.scene,c.frame,c.label,7,c.manager,bound),
+    require(world::bind(tested_contract,tested_profile->consumer_return,c.manager,c.scene,c.frame,c.label,7,c.manager,bound),
         "valid actual native frame/scene parent rejected");
     current=ctx(frame,0);const auto outer=current;expected=bound;
     expected_manager=reinterpret_cast<void*>(c.manager);expected_scene=reinterpret_cast<void*>(c.scene);expected_frame=reinterpret_cast<void*>(c.frame);
     consumers=0;world::invoke(consumer_spy,expected_manager,expected_scene,expected_frame,&bound,read_context,apply_context);
-    require(consumers==1&&current.label.eye==0,"accepted parent failed to restore outer eye");
+    require(consumers==1&&current.label.eye==0&&current.profile==outer.profile,"accepted parent failed to restore outer eye");
     nested=true;expected=bound;consumers=0;
     world::invoke(consumer_spy,expected_manager,expected_scene,expected_frame,&bound,read_context,apply_context);
-    require(consumers==2&&current.label.eye==0,"nested parent count/restore failed");
+    require(consumers==2&&current.label.eye==0&&current.profile==outer.profile,"nested parent count/restore failed");
     expected=bound;expected_manager=reinterpret_cast<void*>(c.manager);expected_scene=reinterpret_cast<void*>(c.scene);expected_frame=reinterpret_cast<void*>(c.frame);
     throw_probe=true;bool caught{};try{world::invoke(consumer_spy,expected_manager,expected_scene,expected_frame,&bound,read_context,apply_context);}
-    catch(int error){caught=error==23;}require(caught&&current.label.eye==outer.label.eye,"CPU exception propagation/restoration changed");
-    bool separate_thread{};std::thread worker([&]{separate_thread=current.frame==0&&!current.normal_task;});worker.join();
+    catch(int error){caught=error==23;}require(caught&&current.label.eye==outer.label.eye&&current.profile==outer.profile,"CPU exception propagation/restoration changed");
+    bool separate_thread{};std::thread worker([&]{separate_thread=current.frame==0&&!current.normal_task&&!current.profile;});worker.join();
     require(separate_thread&&current.frame==outer.frame,"worker borrowed another thread's context");
 }
+void version_separation() {
+    const auto* other=tested_contract==&cam::remastered_500c?&cam::remastered_1048522:&cam::remastered_500c;
+    const auto* other_profile=world::selected(other);const auto copied_profile=*tested_profile;
+    const auto copied_contract=*tested_contract;
+    require(!world::selected(nullptr)&&!world::selected(&cam::legacy_404)&&!world::selected(&copied_contract),
+        "unknown/copied world contract selected profile");
+    for(int eye:{0,1}) {
+        Frame frame{};const auto c=ctx(frame,eye);const auto primary=camera(true,eye),secondary=camera(false,eye);Bytes destination{};
+        for(int failure=0;failure<6;++failure) {
+            auto bad=c;auto contract=tested_contract;auto caller=tested_profile->camera_copy_return;
+            switch(failure){case 0:bad.profile=nullptr;break;case 1:bad.profile=other_profile;break;
+            case 2:bad.profile=&copied_profile;break;case 3:contract=other;break;case 4:contract=&copied_contract;break;
+            case 5:caller=other_profile->camera_copy_return;break;}
+            std::uintptr_t out=0xBAD;
+            require(!world::select_primary(contract,bad,7,caller,reinterpret_cast<std::uintptr_t>(destination.data()),
+                c.frame+world::secondary_offset,primary,secondary,out)&&out==0xBAD,"mixed world version published camera source");
+        }
+        for(int failure=0;failure<3;++failure) {
+            auto contract=tested_contract;auto caller=tested_profile->consumer_return;
+            if(failure==0)contract=other;else if(failure==1)contract=&copied_contract;else caller=other_profile->consumer_return;
+            auto out=c;
+            require(!world::bind(contract,caller,c.manager,c.scene,c.frame,c.label,7,c.manager,out)&&
+                out.profile==c.profile&&out.label.eye==eye,"mixed consumer binding changed captured profile");
+        }
+    }
 }
-int main(){geometry_and_native_copy_arguments();rejecting_sources();scopes_and_thread_boundary();
-    std::printf("World culling primary camera: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;}
+}
+int main(){
+    for(const auto* contract:{&cam::remastered_500c,&cam::remastered_1048522}) {
+        tested_contract=contract;tested_profile=world::selected(contract);
+        geometry_and_native_copy_arguments();rejecting_sources();scopes_and_thread_boundary();version_separation();
+    }
+    std::printf("World culling primary camera: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;
+}
