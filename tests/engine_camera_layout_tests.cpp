@@ -385,7 +385,7 @@ void test_normal_copy_lineage_for_both_factory_eyes() {
     copy::Context context{};
     for (int eye : {1, 0}) {
         copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
-            input_desc, 123, eye, true, true);
+            input_desc, 123, eye, true, copy::selected(&w3vr::engine_camera::remastered_500c), true);
         require(copy::observe_rebuild(context, 0x0228AA4F, scratch_desc + 0x10).stage == copy::Stage::unknown,
             "Rebuild return alone granted a camera route");
         require(run_copy_descriptor(context, 0x01B8067B, scratch_desc, input_desc,
@@ -394,8 +394,8 @@ void test_normal_copy_lineage_for_both_factory_eyes() {
             "Finished scratch leaked camera pointers");
         require(run_copy_descriptor(context, 0x01B80709, final_frame + 0x10, scratch_desc,
             copy::Stage::frame, eye, 123), "Final descriptor copy rejected");
-        require(factory.finish(final_frame), "Returned frame does not match final descriptor");
-        require(!factory.finish(final_frame), "Factory sequence consumed twice");
+        require(factory.finish(final_frame, factory.profile, true), "Returned frame does not match final descriptor");
+        require(!factory.finish(final_frame, factory.profile, true), "Factory sequence consumed twice");
     }
     require(context.factory == nullptr && context.descriptor == nullptr && context.camera == nullptr,
         "Factory scope leaked borrowed addresses");
@@ -404,13 +404,13 @@ void test_normal_copy_lineage_for_both_factory_eyes() {
 void test_unknown_and_nested_copy_scopes_mask_outer_authority() {
     copy::Context context{};
     copy::FactoryScope outer(context, &w3vr::engine_camera::remastered_500c,
-        input_desc, 123, 0, true, true);
+        input_desc, 123, 0, true, copy::selected(&w3vr::engine_camera::remastered_500c), true);
     {
         copy::DescriptorScope descriptor(context, 0x01B8067B, scratch_desc, input_desc);
         copy::CameraScope camera(context, 0x00324460, scratch_desc + 0x10, input_desc + 0x10);
         {
             copy::FactoryScope rejected(context, &w3vr::engine_camera::legacy_404,
-                input_desc, 123, 0, true, true);
+                input_desc, 123, 0, true, copy::selected(&w3vr::engine_camera::legacy_404), true);
             require(copy::observe_rebuild(context, 0x0228AA4F, scratch_desc + 0x10).stage == copy::Stage::unknown,
                 "Nested rejected factory inherited outer camera");
         }
@@ -422,11 +422,11 @@ void test_unknown_and_nested_copy_scopes_mask_outer_authority() {
         }
         {
             copy::FactoryScope inner(context, &w3vr::engine_camera::remastered_500c,
-                0x700000, 124, 1, true, true);
+                0x700000, 124, 1, true, copy::selected(&w3vr::engine_camera::remastered_500c), true);
             require(run_copy_descriptor(context, 0x01B8067B, 0x800000, 0x700000,
                 copy::Stage::scratch, 1, 124) &&
                 run_copy_descriptor(context, 0x01B80709, 0x900010, 0x800000,
-                    copy::Stage::frame, 1, 124) && inner.finish(0x900000),
+                    copy::Stage::frame, 1, 124) && inner.finish(0x900000, inner.profile, true),
                 "Nested accepted factory mixed outer addresses or eye identity");
         }
         require(context.factory == &outer && context.descriptor == &descriptor && context.camera == &camera,
@@ -438,14 +438,14 @@ void test_unknown_and_nested_copy_scopes_mask_outer_authority() {
             descriptor.finish(scratch_desc), "Outer descriptor could not complete");
     }
     require(run_copy_descriptor(context, 0x01B80709, final_frame + 0x10, scratch_desc,
-        copy::Stage::frame, 0, 123) && outer.finish(final_frame), "Nested flow lost lineage");
+        copy::Stage::frame, 0, 123) && outer.finish(final_frame, outer.profile, true), "Nested flow lost lineage");
 }
 
 void test_copy_context_rejects_missing_mismatched_and_repeated_steps() {
     for (int failure = 0; failure < 9; ++failure) {
         copy::Context context{};
         copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
-            input_desc, 123, 0, true, true);
+            input_desc, 123, 0, true, copy::selected(&w3vr::engine_camera::remastered_500c), true);
         if (failure == 0) {
             copy::DescriptorScope final_first(context, 0x01B80709, final_frame + 0x10, scratch_desc);
             require(final_first.stage == copy::Stage::unknown, "Final copy accepted before scratch");
@@ -478,25 +478,25 @@ void test_copy_context_rejects_missing_mismatched_and_repeated_steps() {
                 require(!descriptor.finish(scratch_desc + 16), "Wrong native descriptor return accepted");
             }
         }
-        require(!factory.finish(final_frame), "Incomplete or broken lineage accepted a rendered frame");
+        require(!factory.finish(final_frame, factory.profile, true), "Incomplete or broken lineage accepted a rendered frame");
     }
     copy::Context context{};
     {
         copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
-            input_desc, 123, 0, true, true);
+            input_desc, 123, 0, true, copy::selected(&w3vr::engine_camera::remastered_500c), true);
         require(run_copy_descriptor(context, 0x01B8067B, scratch_desc, input_desc, copy::Stage::scratch, 0, 123),
             "Scratch fixture failed");
         copy::DescriptorScope bad_final(context, 0x01B80709, final_frame + 0x10, input_desc);
-        require(bad_final.stage == copy::Stage::unknown && !factory.finish(final_frame),
+        require(bad_final.stage == copy::Stage::unknown && !factory.finish(final_frame, factory.profile, true),
             "Final copy reused input instead of completed scratch");
     }
     {
         copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
-            input_desc, 123, 0, true, true);
+            input_desc, 123, 0, true, copy::selected(&w3vr::engine_camera::remastered_500c), true);
         require(run_copy_descriptor(context, 0x01B8067B, scratch_desc, input_desc, copy::Stage::scratch, 0, 123) &&
             run_copy_descriptor(context, 0x01B80709, final_frame + 0x10, scratch_desc, copy::Stage::frame, 0, 123),
             "Complete fixture failed");
-        require(!factory.finish(final_frame + 16), "Native returned frame mismatch accepted");
+        require(!factory.finish(final_frame + 16, factory.profile, true), "Native returned frame mismatch accepted");
     }
 }
 
@@ -504,14 +504,14 @@ void test_abandoned_copy_scope_restores_context() {
     copy::Context context{};
     {
         copy::FactoryScope factory(context, &w3vr::engine_camera::remastered_500c,
-            input_desc, 123, 0, true, true);
+            input_desc, 123, 0, true, copy::selected(&w3vr::engine_camera::remastered_500c), true);
         try {
             copy::DescriptorScope descriptor(context, 0x01B8067B, scratch_desc, input_desc);
             copy::CameraScope camera(context, 0x00324460, scratch_desc + 0x10, input_desc + 0x10);
             throw 7; // C++ unwinding only; this is not a native SEH/access-fault test.
         } catch (int) {}
         require(context.factory == &factory && !context.descriptor && !context.camera &&
-            factory.phase == copy::Phase::broken && !factory.finish(final_frame),
+            factory.phase == copy::Phase::broken && !factory.finish(final_frame, factory.profile, true),
             "Abandoned native call scope retained pointers or accepted an incomplete copy");
     }
     require(!context.factory && !context.descriptor && !context.camera,
@@ -527,16 +527,127 @@ void test_copy_context_admission_and_signatures() {
         copy::FactoryScope factory(context, contract,
             failure == 3 ? 0 : failure == 4 ? UINTPTR_MAX - 15 : input_desc,
             failure == 5 ? 0 : failure == 6 ? UINT64_MAX : 123,
-            failure == 7 ? 2 : 0, failure != 8, failure != 9);
-        require(!factory.admitted && !factory.finish(final_frame), "Unknown or incomplete producer admission accepted");
+            failure == 7 ? 2 : 0, failure != 8, copy::selected(contract), failure != 9);
+        require(!factory.admitted && !factory.finish(final_frame, factory.profile, true), "Unknown or incomplete producer admission accepted");
     }
-    for (const auto* signature : {&copy::descriptor_signature, &copy::camera_signature, &copy::rebuild_signature}) {
-        require(copy::signature_matches(*signature, *signature), "Matching native prefix rejected");
-        for (std::size_t i = 0; i < signature->size(); ++i) {
-            auto wrong = *signature; wrong[i] ^= 0x80;
-            require(!copy::signature_matches(*signature, wrong), "Different native prefix accepted");
-            require(!copy::signature_matches(*signature, std::span<const std::uint8_t>(*signature).first(i)),
-                "Truncated native prefix accepted");
+    for (std::span<const std::uint8_t> signature : {std::span<const std::uint8_t>(copy::descriptor_signature),
+        std::span<const std::uint8_t>(copy::camera_signature), std::span<const std::uint8_t>(copy::rebuild_signature)}) {
+        require(copy::signature_matches(signature, signature), "Matching native prefix rejected");
+        for (std::size_t i = 0; i < signature.size(); ++i) {
+            std::vector<std::uint8_t> wrong(signature.begin(), signature.end()); wrong[i] ^= 0x80;
+            require(!copy::signature_matches(signature, wrong), "Different native prefix accepted");
+            require(!copy::signature_matches(signature, signature.first(i)), "Truncated native prefix accepted");
+        }
+    }
+}
+
+
+void test_camera_copy_installation_identity_and_failures() {
+    using namespace w3vr;
+    const engine_camera::TemporalContract* contracts[]{&engine_camera::remastered_500c,&engine_camera::remastered_1048522};
+    const copy::Profile* profiles[]{&copy::remastered_500c,&copy::remastered_1048522};
+    constexpr std::uintptr_t targets[][3]{{0x00324430,0x0228A970,0x0228AB40},{0x00322F40,0x02293070,0x02293240}};
+    constexpr std::array<std::uint8_t,15> descriptor{0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
+    constexpr std::array<std::uint8_t,16> camera{0x40,0x53,0x48,0x83,0xEC,0x30,0x8B,0x02,0x48,0x8B,0xD9,0x89,0x01,0x8B,0x42,0x04};
+    constexpr std::array<std::uint8_t,14> rebuild{0x48,0x8B,0xC4,0x55,0x53,0x56,0x57,0x48,0x8D,0xA8,0x08,0xFB,0xFF,0xFF};
+    const std::span<const std::uint8_t> prefixes[]{descriptor,camera,rebuild};
+    for(int build : {0,1}) {
+        const auto* p=profiles[build];const auto copied_profile=*p;const auto copied_contract=*contracts[build];
+        require(copy::known(p) && !copy::known(&copied_profile),"Copied installation plan became a capability");
+        require(copy::ready_for(contracts[build],p,true) && !copy::ready_for(contracts[build],p,false),"Readiness ignored activation state");
+        for(const auto* wrong : {profiles[1-build],&copied_profile,static_cast<const copy::Profile*>(nullptr)})
+            require(!copy::ready_for(contracts[build],wrong,true),"Mixed/copied/null installed profile became ready");
+        require(!copy::ready_for(&copied_contract,p,true) && !copy::ready_for(nullptr,p,true) &&
+            !copy::ready_for(&engine_camera::legacy_404,p,true),"Unknown contract inherited observer readiness");
+        for(std::size_t i=0;i<3;++i) {
+            const auto kind=static_cast<copy::HookKind>(i);const auto* target=copy::hook_target(p,kind);
+            require(target && target->rva==targets[build][i] &&
+                copy::signature_matches(prefixes[i],target->signature) && target->signature.size()==prefixes[i].size(),
+                "Installation mixed target or independently expected complete prefix");
+            require(!copy::hook_target(&copied_profile,kind) && !copy::hook_target(nullptr,kind),"Copied plan exposed targets");
+            for(std::size_t byte=0;byte<prefixes[i].size();++byte) {
+                std::vector<std::uint8_t> wrong(prefixes[i].begin(),prefixes[i].end());wrong[byte]^=1;
+                require(!copy::signature_matches(target->signature,wrong) &&
+                    !copy::signature_matches(target->signature,prefixes[i].first(byte)),"Mutated/truncated hook prefix accepted");
+            }
+        }
+        require(!copy::hook_target(p,static_cast<copy::HookKind>(99)),"Unknown hook kind exposed memory");
+        // Real installation helper, fake create/enable/disable callbacks. No
+        // MinHook, target bytes, live threads or Native functions are executed.
+        for(int phase : {0,1}) for(int failure : {-1,0,1,2}) {
+            std::array<bool,3> retained{},enabled{};int create_calls{},enable_calls{},disable_calls{};
+            const bool ok=copy::install_observers(contracts[build],p,
+                [&](std::size_t i) {++create_calls;if(phase==0 && static_cast<int>(i)==failure)return false;retained[i]=true;return true;},
+                [&](std::size_t i) {++enable_calls;if(phase==1 && static_cast<int>(i)==failure)return false;require(retained[i],"Enabled uncreated observer");enabled[i]=true;return true;},
+                [&](std::size_t i) {++disable_calls;require(enabled[i] && retained[i],"Disabled unenabled/null observer");enabled[i]=false;},[] {return true;});
+            require(ok==(failure==-1),"Partial installation published success");
+            const int expected_created=phase==0 && failure>=0?failure:3;
+            const int expected_enabled=phase==1 && failure>=0?failure:failure==-1?3:0;
+            require(create_calls==(phase==0 && failure>=0?failure+1:3) &&
+                enable_calls==(phase==0 && failure>=0?0:phase==1 && failure>=0?failure+1:3),"Installation repeated a Native operation");
+            require(disable_calls==(ok?0:expected_enabled),"Failure disabled the wrong observer set");
+            for(int i=0;i<3;++i) require(retained[i]==(i<expected_created) && enabled[i]==ok,
+                "Failure removed trampoline identity or left admission enabled");
+        }
+        for(int stopped_check=0;stopped_check<7;++stopped_check) {
+            std::array<bool,3> retained{},enabled{};int check{};
+            const bool ok=copy::install_observers(contracts[build],p,
+                [&](std::size_t i) {retained[i]=true;return true;},
+                [&](std::size_t i) {enabled[i]=true;return true;},
+                [&](std::size_t i) {enabled[i]=false;},[&] {return check++!=stopped_check;});
+            require(!ok,"Changed contract during create/enable/final check published readiness");
+            for(int i=0;i<3;++i) require(!enabled[i],"Changed contract left an observer admitted");
+            for(int i=0;i<3;++i) require(retained[i]==(i<std::min(stopped_check,3)),"Changed contract cleared a created trampoline");
+        }
+        int touched{};
+        for(const auto* invalid : {profiles[1-build],&copied_profile,static_cast<const copy::Profile*>(nullptr)}) {
+            require(!copy::install_observers(contracts[build],invalid,[&](std::size_t){++touched;return true;},
+                [&](std::size_t){++touched;return true;},[&](std::size_t){++touched;},[&]{++touched;return true;}),
+                "Mixed installation plan accepted");
+        }
+        require(touched==0,"Rejected installation still touched Native operations");
+    }
+}
+
+void test_camera_copy_installed_scope_and_completion() {
+    using namespace w3vr;
+    const engine_camera::TemporalContract* contracts[]{&engine_camera::remastered_500c,&engine_camera::remastered_1048522};
+    const copy::Profile* profiles[]{&copy::remastered_500c,&copy::remastered_1048522};
+    for(int build : {0,1}) for(int eye : {0,1}) {
+        const auto* p=profiles[build];const auto other=*p;
+        for(const auto* installed : {p,profiles[1-build],&other,static_cast<const copy::Profile*>(nullptr)}) {
+            copy::Context context{};copy::FactoryScope rejected(context,contracts[build],input_desc,901,eye,true,installed,false);
+            require(!rejected.admitted && !rejected.finish(final_frame,p,true),"Late readiness admitted a rejected factory");
+            copy::FactoryScope factory(context,contracts[build],input_desc,902,eye,true,installed,true);
+            require(factory.admitted==(installed==p),"Factory admission ignored installed identity");
+        }
+        for(bool ready : {false,true}) {
+            copy::Context context{};copy::FactoryScope factory(context,contracts[build],input_desc,903,eye,true,p,true);
+            copy::DescriptorScope descriptor_scope(context,p->scratch_return,scratch_desc,input_desc);
+            copy::CameraScope camera_scope(context,p->camera_returns[0],scratch_desc+0x10,input_desc+0x10);
+            for(const auto* installed : {p,profiles[1-build],&other,static_cast<const copy::Profile*>(nullptr)}) {
+                try {
+                    copy::ObserverScope observer(context,contracts[build],installed,ready);
+                    require(observer.admitted==(installed==p && ready),"Observer ignored installed identity/readiness");
+                    if(!observer.admitted) require(!context.factory && !context.descriptor && !context.camera,
+                        "Rejected observer borrowed outer factory/camera");
+                    else require(context.factory==&factory && context.camera==&camera_scope,"Matching observer lost its scope");
+                    throw 17; // C++ unwind only, not SEH/Native exception validation.
+                } catch(int) {}
+                require(context.factory==&factory && context.descriptor==&descriptor_scope && context.camera==&camera_scope,
+                    "Observer failed to restore exact context on unwind");
+            }
+            copy::ObserverScope mixed_contract(context,contracts[1-build],profiles[1-build],true);
+            require(!mixed_contract.admitted && !context.factory,"Observer inherited a different build's factory");
+        }
+        for(int finish_state : {0,1,2,3}) {
+            copy::Context context{};copy::FactoryScope factory(context,contracts[build],input_desc,904,eye,true,p,true);
+            require(run_copy_descriptor(context,p->scratch_return,scratch_desc,input_desc,copy::Stage::scratch,eye,904) &&
+                run_copy_descriptor(context,p->frame_return,final_frame+0x10,scratch_desc,copy::Stage::frame,eye,904),
+                "Complete installation fixture failed");
+            const auto* installed=finish_state==2?profiles[1-build]:finish_state==3?&other:p;
+            require(factory.finish(final_frame,installed,finish_state!=1)==(finish_state==0),
+                "Factory completion ignored lost readiness or changed/copied installation");
         }
     }
 }
@@ -563,17 +674,17 @@ void test_copy_profiles_never_mix_builds() {
             p->rebuild_return == expected[build][5], "Copy profile selected another build");
         for (int eye : {0,1}) {
             copy::Context context{};
-            copy::FactoryScope factory(context, contracts[build], input_desc, 901, eye, true, true);
+            copy::FactoryScope factory(context, contracts[build], input_desc, 901, eye, true, copy::selected(contracts[build]), true);
             require(factory.admitted && factory.profile == p &&
                 run_copy_descriptor(context, p->scratch_return, scratch_desc, input_desc,
                     copy::Stage::scratch, eye, 901) &&
                 run_copy_descriptor(context, p->frame_return, final_frame+0x10, scratch_desc,
-                    copy::Stage::frame, eye, 901) && factory.finish(final_frame),
+                    copy::Stage::frame, eye, 901) && factory.finish(final_frame, factory.profile, true),
                 "Complete own-build copy lineage rejected");
         }
         for (int failure = 0; failure < 5; ++failure) {
             copy::Context context{};
-            copy::FactoryScope factory(context, contracts[build], input_desc, 901, 0, true, true);
+            copy::FactoryScope factory(context, contracts[build], input_desc, 901, 0, true, copy::selected(contracts[build]), true);
             if (failure == 0) {
                 copy::DescriptorScope wrong(context, other->scratch_return, scratch_desc, input_desc);
                 require(wrong.stage == copy::Stage::unknown && !wrong.finish(scratch_desc),
@@ -601,12 +712,12 @@ void test_copy_profiles_never_mix_builds() {
                         !camera.finish(camera.destination), "Rebuild caller from another build accepted");
                 }
             }
-            require(!factory.finish(final_frame), "Mixed-build copy produced complete lineage");
+            require(!factory.finish(final_frame, factory.profile, true), "Mixed-build copy produced complete lineage");
         }
         const auto copied = *contracts[build];
         for (const auto* unknown : {static_cast<const engine_camera::TemporalContract*>(nullptr), &copied}) {
             copy::Context context{};
-            copy::FactoryScope rejected(context, unknown, input_desc, 901, 0, true, true);
+            copy::FactoryScope rejected(context, unknown, input_desc, 901, 0, true, copy::selected(unknown), true);
             require(!copy::selected(unknown) && !rejected.admitted && !rejected.profile,
                 "Unknown/copy contract inherited a known copy profile");
         }
@@ -616,20 +727,20 @@ void test_copy_profiles_never_mix_builds() {
         const auto* outer_profile = profiles[outer_build];
         const auto* inner_profile = profiles[inner_build];
         copy::Context context{};
-        copy::FactoryScope outer(context, contracts[outer_build], input_desc, 901, 0, true, true);
+        copy::FactoryScope outer(context, contracts[outer_build], input_desc, 901, 0, true, copy::selected(contracts[outer_build]), true);
         {
             copy::DescriptorScope descriptor(context, outer_profile->scratch_return, scratch_desc, input_desc);
             copy::CameraScope camera(context, outer_profile->camera_returns[0], scratch_desc+0x10, input_desc+0x10);
             {
-                copy::FactoryScope inner(context, contracts[inner_build], 0x700000, 902, 1, true, true);
+                copy::FactoryScope inner(context, contracts[inner_build], 0x700000, 902, 1, true, copy::selected(contracts[inner_build]), true);
                 require(copy::observe_rebuild(context, outer_profile->rebuild_return,
                     camera.destination).stage == copy::Stage::unknown,
                     "Nested different build inherited the outer camera");
                 require(run_copy_descriptor(context, inner_profile->scratch_return, 0x800000, 0x700000,
                     copy::Stage::scratch, 1, 902) &&
                     run_copy_descriptor(context, inner_profile->frame_return, 0x900010, 0x800000,
-                        copy::Stage::frame, 1, 902) && inner.finish(0x900000) &&
-                    !inner.finish(0x900000), "Nested copy mixed profile or finished twice");
+                        copy::Stage::frame, 1, 902) && inner.finish(0x900000, inner.profile, true) &&
+                    !inner.finish(0x900000, inner.profile, true), "Nested copy mixed profile or finished twice");
             }
             require(context.factory == &outer && context.descriptor == &descriptor &&
                 context.camera == &camera && outer.profile == outer_profile,
@@ -641,7 +752,7 @@ void test_copy_profiles_never_mix_builds() {
                 descriptor.finish(scratch_desc), "Restored outer descriptor failed");
         }
         require(run_copy_descriptor(context, outer_profile->frame_return, final_frame+0x10, scratch_desc,
-            copy::Stage::frame, 0, 901) && outer.finish(final_frame), "Restored outer factory failed");
+            copy::Stage::frame, 0, 901) && outer.finish(final_frame, outer.profile, true), "Restored outer factory failed");
     }
     // Subsystem selections are explicit. They still cannot authorize legacy
     // temporal corrections or change the separate global executable gate.
@@ -1132,6 +1243,8 @@ int main() {
     test_copy_context_rejects_missing_mismatched_and_repeated_steps();
     test_copy_context_admission_and_signatures();
     test_abandoned_copy_scope_restores_context();
+    test_camera_copy_installation_identity_and_failures();
+    test_camera_copy_installed_scope_and_completion();
     test_copy_profiles_never_mix_builds();
     std::cout << checks << " CPU checks. Versioned camera/writer/authority profiles and "
         "normal core/task calls, profile-bound records, installation routing, "

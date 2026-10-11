@@ -6,6 +6,61 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Cópias de câmera vinculadas à instalação da mesma versão — 11 de outubro
+
+Adaptei o conjunto de três observadores de cópia e reconstrução para a
+atualização atual. Um observador acompanha a chamada do jogo e encaminha
+seus argumentos e resultado; ele não cria uma imagem nem controla uma mão.
+A instalação usa a lista de funções e assinaturas da versão escolhida.
+Assinatura aqui significa os primeiros bytes esperados da função.
+
+O fluxo, passo a passo:
+
+1. Escolhe uma lista conhecida e confere os três pontos antes de criar as
+   ligações. As assinaturas terminam no fim de instruções completas e foram
+   conferidas separadamente nos arquivos das duas versões.
+2. Cria as três ligações, depois ativa as três. Só anuncia prontidão quando
+   todas passam e a versão escolhida continua igual. Uma falha fecha a
+   admissão; conserva os caminhos de encaminhamento e impede nova tentativa.
+3. Cada chamada confere a versão instalada e a selecionada antes de observar
+   os dados e depois de executar a função original. Outra versão, uma lista
+   copiada, uma lista desconhecida ou prontidão perdida não completam a cópia.
+4. Uma chamada rejeitada recebe um contexto vazio durante sua execução.
+   Contexto é o registro temporário de quem iniciou aquela sequência. Ao
+   retornar, restaura o registro anterior, inclusive em chamadas encaixadas
+   ou quando uma exceção comum de C++ interrompe o caminho.
+5. A conclusão da criação de um quadro exige a sequência de cópias completa
+   e a instalação correspondente ainda pronta. A atualização atual e versões
+   desconhecidas deixam de receber conclusão automática por serem diferentes
+   da versão anterior. As duas câmeras internas continuam sendo registros de
+   um quadro, não os dois olhos do headset.
+6. As ligações modernas seguem o encaminhamento moderno mesmo se a seleção
+   mudar durante uma chamada. Preservam a função original uma vez e não
+   entram nas correções antigas de posição, lente ou distância de desenho.
+
+`engine_camera_copy_context.h` reúne as listas, a instalação em conjunto e
+os registros temporários; `dxgi_proxy.cpp` liga essas regras às chamadas do
+jogo. Separei o acompanhamento moderno da função antiga com proteção de
+memória do Windows para permitir a compilação sem mudar essa proteção.
+Escolhi conferir a instalação junto com o contexto porque um sinal geral de
+“pronto” não identifica a versão das funções realmente ligadas.
+
+A DLL compilou e **112/112 testes passaram em 8,20 segundos**. O teste de
+câmeras fez **16.472 verificações na CPU**, 600 a mais nesta etapa. Incluem
+falhas em cada ponto de criação e ativação, troca de contrato, preservação
+dos encaminhamentos, versões misturadas e restauração do contexto. Os testes
+substituem as operações de instalação por funções simuladas; não executaram
+MinHook no jogo, falhas reais de memória, GPU, Quest ou combate físico.
+As evidências novas do executável permanecem privadas.
+
+**O bloqueio geral de Remastered e da reentrada continua fechado. O VR ainda
+não funciona e nada experimental foi instalado.** Esse acompanhamento não
+retém os objetos do jogo nem protege sozinho a retirada da DLL enquanto
+outras chamadas estejam em execução. Ainda faltam a criação dos quadros e
+seus dados de entrada, históricos, efeitos, vida útil dos recursos e a
+apresentação do mesmo par de imagens novas. Primeiro imagens reais no PC;
+depois Quest, cabeça, mãos, armas, dano e bloqueio físicos.
+
 ## Campos e controle da câmera separados por versão — 11 de outubro
 
 Adaptei a lista de campos da câmera, as rotas de atualização temporal e os
