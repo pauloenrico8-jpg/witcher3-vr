@@ -8,7 +8,9 @@
 #include <span>
 
 namespace w3vr::modern_camera_projection {
-// Current primary-camera lens inputs only. The examined modern rebuild applies
+// Current primary-camera lens inputs only, with an explicit known contract.
+// The scalar placements below were checked independently for both modern builds.
+// The examined modern rebuild applies
 // the stable normalized shift AFTER its pixel jitter. Keep these independent:
 // a native temporal-writer call must not remove or duplicate the HMD center.
 // These fields are not a matrix receipt, render permission or GPU completion.
@@ -29,9 +31,11 @@ inline bool valid(const LensFields& lens) {
         lens.projection_scale==1 && std::isfinite(lens.center_ndc[0]) &&
         std::isfinite(lens.center_ndc[1]);
 }
-inline bool derive(std::span<const std::uint8_t> camera,
+inline bool derive(const engine_camera::TemporalContract* contract,
+    std::span<const std::uint8_t> camera,
     const XrFovf& fov, LensFields& result) {
-    if (camera.size()<engine_camera_layout::remastered_500c.camera_bytes) return false;
+    const auto* layout=engine_camera_layout::selected(contract);
+    if (!engine_camera_layout::modern(layout) || camera.size()<layout->camera_bytes) return false;
     // Preserve the game's depth range and require a valid perspective source.
     // XYZ/W/rotation, temporal history and embedded references are not written.
     engine_camera::TemporalInputs source{};
@@ -49,8 +53,10 @@ inline bool derive(std::span<const std::uint8_t> camera,
     result=candidate;
     return true;
 }
-inline bool write(std::span<std::uint8_t> camera, const LensFields& lens) {
-    if (camera.size()<engine_camera_layout::remastered_500c.camera_bytes || !valid(lens)) return false;
+inline bool write(const engine_camera::TemporalContract* contract,
+    std::span<std::uint8_t> camera, const LensFields& lens) {
+    const auto* layout=engine_camera_layout::selected(contract);
+    if (!engine_camera_layout::modern(layout) || camera.size()<layout->camera_bytes || !valid(lens)) return false;
     // Replace the game's current lens with the runtime lens, including its
     // absolute center. Never add to a possibly nonzero source center. The game
     // builds current/derived matrices while copying the private descriptor.

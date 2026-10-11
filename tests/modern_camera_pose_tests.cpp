@@ -9,6 +9,9 @@ namespace layout = w3vr::engine_camera_layout;
 namespace lens = w3vr::modern_camera_projection;
 namespace {
 int failures{},checks{};
+using Contract=w3vr::engine_camera::TemporalContract;
+const Contract* fixture_contract{};
+const layout::Layout& fixture_layout() { return *layout::selected(fixture_contract); }
 void require(bool ok,const char* why) { ++checks; if (!ok) {++failures;std::fprintf(stderr,"FAIL: %s\n",why);} }
 bool near(float a,float b,float eps=2e-4f) { return std::fabs(a-b)<=eps; }
 using Matrix=std::array<float,9>;
@@ -24,21 +27,21 @@ Matrix basis(float roll,float pitch,float yaw) {
 }
 layout::PoseFields get(const std::vector<std::uint8_t>& descriptor,std::size_t index=0) {
     layout::PoseFields p;
-    require(pose::read_pose(std::span(descriptor).subspan(layout::remastered_500c.descriptor_cameras[index],0x5E0),p),"read output pose");
+    require(pose::read_pose(fixture_contract,std::span(descriptor).subspan(fixture_layout().descriptor_cameras[index],0x5E0),p),"read output pose");
     return p;
 }
 std::vector<std::uint8_t> source() {
     std::vector<std::uint8_t> s(0xF750,0xA5);
     const std::uint32_t count=0;std::memcpy(s.data()+0xECA0,&count,4);
     const float fov=75;
-    for (auto offset:layout::remastered_500c.descriptor_cameras) {
-        layout::write_pose(std::span(s).subspan(offset,0x5E0),&layout::remastered_500c,{});
+    for (auto offset:fixture_layout().descriptor_cameras) {
+        layout::write_pose(std::span(s).subspan(offset,0x5E0),&fixture_layout(),{});
         std::memcpy(s.data()+offset+0x1C,&fov,4);
         const float parameters[]{1.777f,2.0f,.1f,5000.f};
         std::memcpy(s.data()+offset+0x28,parameters,sizeof(parameters));
         const float center[]{.31f,-.27f};std::memcpy(s.data()+offset+0x520,center,sizeof(center));
         const layout::ProjectionFields jitter{{0,0},{1920,1080}};
-        require(layout::write_projection(std::span(s).subspan(offset,0x5E0),&layout::remastered_500c,jitter),"fixture native pixel jitter");
+        require(layout::write_projection(std::span(s).subspan(offset,0x5E0),&fixture_layout(),jitter),"fixture native pixel jitter");
     }
     return s;
 }
@@ -50,7 +53,7 @@ pose::TrackingSample tracked() {
     return t;
 }
 void set_pose(std::vector<std::uint8_t>& s,std::size_t index,layout::PoseFields p) {
-    require(layout::write_pose(std::span(s).subspan(layout::remastered_500c.descriptor_cameras[index],0x5E0),&layout::remastered_500c,p),"set fixture pose");
+    require(layout::write_pose(std::span(s).subspan(fixture_layout().descriptor_cameras[index],0x5E0),&fixture_layout(),p),"set fixture pose");
 }
 // Independent CPU model of the reached modern matrix convention. Perspective
 // is multiplied by pixel-jitter translation and then stable lens translation.
@@ -66,7 +69,7 @@ Matrix4 product(const Matrix4& a,const Matrix4& b) {
     return c;
 }
 std::array<double,3> project(const std::vector<std::uint8_t>& s,double x,double y,double z) {
-    const auto c=layout::remastered_500c.descriptor_cameras[0];
+    const auto c=fixture_layout().descriptor_cameras[0];
     const double cot=1/std::tan(scalar(s,c+0x1C)*3.14159265358979323846/360);
     const double n=scalar(s,c+0x30),f=scalar(s,c+0x34),scale=scalar(s,c+0x2C);
     const Matrix4 perspective{scale*cot/scalar(s,c+0x28),0,0,0,
@@ -88,10 +91,11 @@ void place(pose::TrackingSample& t,XrQuaternionf q,XrVector3f center) {
     t.views[0].pose={q,pose::add(center,left)};t.views[1].pose={q,pose::add(center,right)};
 }
 }
-int main() {
+void exercise_profile(const Contract* contract) {
+    fixture_contract=contract;
     auto s=source();const auto untouched=s;
     auto t=tracked();pose::PreparedPair out;
-    require(pose::prepare_pair(s,t,{},out),"prepare both eyes");
+    require(pose::prepare_pair(fixture_contract,s,t,{},out),"prepare both eyes");
     require(s==untouched,"original descriptor unchanged");
     require(near(get(out.descriptors[0]).position[0],-0.032f) &&
         near(get(out.descriptors[1]).position[0],0.032f),"64mm physical eye separation");
@@ -99,9 +103,9 @@ int main() {
         bool guards=true;
         for (std::size_t b=0;b<s.size();++b) {
             bool written=false;
-            for (auto c:layout::remastered_500c.descriptor_cameras)
+            for (auto c:fixture_layout().descriptor_cameras)
                 written|=(b>=c && b<c+12)||(b>=c+0x10 && b<c+0x1C);
-            const auto c=layout::remastered_500c.descriptor_cameras[0];
+            const auto c=fixture_layout().descriptor_cameras[0];
             written|=(b>=c+0x1C && b<c+0x20)||(b>=c+0x28 && b<c+0x30)||
                 (b>=c+0x520 && b<c+0x528);
             if (!written) guards &= out.descriptors[eye][b]==s[b];
@@ -110,21 +114,21 @@ int main() {
     }
     set_pose(s,0,{{10,20,30},{0,0,90}});set_pose(s,1,{{10,20,30},{0,0,90}});
     t=tracked();place(t,{0,0,0,1},{1,2,-3});
-    require(pose::prepare_pair(s,t,{1,true},out),"translated yawed game anchor");
+    require(pose::prepare_pair(fixture_contract,s,t,{1,true},out),"translated yawed game anchor");
     auto p=get(out.descriptors[0]);
     require(near(p.position[0],7) && near(p.position[1],20.968f) && near(p.position[2],32),"right up forward map onto yawed game world");
-    require(pose::prepare_pair(s,t,{0,true},out),"zero room translation scale");
+    require(pose::prepare_pair(fixture_contract,s,t,{0,true},out),"zero room translation scale");
     auto left=get(out.descriptors[0]);auto right=get(out.descriptors[1]);
     require(near(left.position[0],10) && near(left.position[2],30) &&
         near(right.position[1]-left.position[1],0.064f),"translation scale never shrinks physical IPD");
     // Recenter heading and room origin cancel only their common components.
     s=source();t=tracked();t.origin_heading=geo::from_hmd_euler_degrees(0,90,0);t.origin_position={3,4,5};
     place(t,t.origin_heading,t.origin_position);
-    require(pose::prepare_pair(s,t,{},out),"heading-only recenter");
+    require(pose::prepare_pair(fixture_contract,s,t,{},out),"heading-only recenter");
     p=get(out.descriptors[0]);require(near(p.position[0],-0.032f)&&near(p.position[1],0)&&near(p.position[2],0)&&near(p.rotation_degrees[2],0),"recenter removes heading and position but preserves eyes");
     // Explicit expected basis checks exercise roll sign, pitch sign and heading.
     t=tracked();place(t,geo::from_hmd_euler_degrees(23,37,11),{});
-    require(pose::prepare_pair(s,t,{},out),"mixed physical head orientation");
+    require(pose::prepare_pair(fixture_contract,s,t,{},out),"mixed physical head orientation");
     p=get(out.descriptors[0]);const auto actual=basis(p.rotation_degrees[0],p.rotation_degrees[1],p.rotation_degrees[2]);
     const auto expected=basis(-11,23,37);
     bool same=true;for (std::size_t i=0;i<9;++i) same &= near(actual[i],expected[i]);
@@ -132,7 +136,7 @@ int main() {
     // Native cameras are a rig, not HMD eyes: preserve secondary relative pose.
     set_pose(s,0,{{10,20,30},{4,19,25}});set_pose(s,1,{{12,23,34},{-7,-12,50}});
     t=tracked();place(t,geo::from_hmd_euler_degrees(17,-31,9),{.2f,.4f,-.3f});
-    require(pose::prepare_pair(s,t,{1,false},out),"unequal internal camera rig");
+    require(pose::prepare_pair(fixture_contract,s,t,{1,false},out),"unequal internal camera rig");
     for (std::size_t eye=0;eye<2;++eye) {
         auto a=get(out.descriptors[eye],0),b=get(out.descriptors[eye],1);
         auto world_delta=pose::subtract(pose::position(b),pose::position(a));
@@ -158,7 +162,7 @@ int main() {
     // assumption. Eye position follows the actual runtime pose as well.
     s=source();t=tracked();t.views[0].pose.orientation=geo::from_hmd_euler_degrees(0,-5,0);
     t.views[1].pose.orientation=geo::from_hmd_euler_degrees(0,5,0);
-    require(pose::prepare_pair(s,t,{},out),"canted eye pair");
+    require(pose::prepare_pair(fixture_contract,s,t,{},out),"canted eye pair");
     require(near(get(out.descriptors[0]).rotation_degrees[2],-5)&&
         near(get(out.descriptors[1]).rotation_degrees[2],5),"distinct eye cant retained");
     // Different, asymmetric lenses must map their actual edge rays to all
@@ -167,9 +171,9 @@ int main() {
     s=source();t=tracked();
     t.views[0].fov={-.9f,.6f,.85f,-.65f};
     t.views[1].fov={-.6f,.9f,.75f,-.8f};
-    require(pose::prepare_pair(s,t,{},out),"prepare distinct asymmetric lenses");
+    require(pose::prepare_pair(fixture_contract,s,t,{},out),"prepare distinct asymmetric lenses");
     for (std::size_t eye=0;eye<2;++eye) {
-        const auto c=layout::remastered_500c.descriptor_cameras[0];
+        const auto c=fixture_layout().descriptor_cameras[0];
         const auto& camera=out.descriptors[eye];const auto fov=t.views[eye].fov;
         require(scalar(camera,c+0x2C)==1,"old game projection zoom replaced by physical runtime lens");
         require(scalar(camera,c+0x30)==scalar(s,c+0x30) && scalar(camera,c+0x34)==scalar(s,c+0x34),"native near and far range preserved");
@@ -195,8 +199,8 @@ int main() {
         auto recentered=camera;const float different_source_center[]{.6f,-.8f};
         std::memcpy(recentered.data()+c+0x520,different_source_center,8);
         lens::LensFields fields;
-        require(lens::derive(std::span(recentered).subspan(c,0x5E0),fov,fields) &&
-            lens::write(std::span(recentered).subspan(c,0x5E0),fields),"lens center uses absolute assignment");
+        require(lens::derive(fixture_contract,std::span(recentered).subspan(c,0x5E0),fov,fields) &&
+            lens::write(fixture_contract,std::span(recentered).subspan(c,0x5E0),fields),"lens center uses absolute assignment");
         require(recentered==camera,"lens preparation never accumulates an existing source center");
     }
     // Reject bad native perspective inputs before either prepared eye escapes.
@@ -204,24 +208,24 @@ int main() {
     for (auto offset:{0x28u,0x2Cu,0x30u,0x34u}) {
         auto invalid=source();const float zero=0;
         std::memcpy(invalid.data()+0x10+offset,&zero,4);
-        require(!pose::prepare_pair(invalid,t,{},out),"invalid native perspective or depth rejected");
+        require(!pose::prepare_pair(fixture_contract,invalid,t,{},out),"invalid native perspective or depth rejected");
         require(out.descriptors==projection_sentinel,"bad native lens leaves both eye outputs intact");
     }
     auto writable=out.descriptors[0];const auto unchanged=writable;
     lens::LensFields bad{90,1,1,{0,std::numeric_limits<float>::infinity()}};
-    require(!lens::write(std::span(writable).subspan(0x10,0x5E0),bad) && writable==unchanged,"invalid lens write leaves all bytes intact");
+    require(!lens::write(fixture_contract,std::span(writable).subspan(0x10,0x5E0),bad) && writable==unchanged,"invalid lens write leaves all bytes intact");
     lens::LensFields sentinel_lens{42,3,1,{.2f,.1f}},derived=sentinel_lens;
-    require(!lens::derive(std::span(writable).subspan(0x10,0x5DF),t.views[0].fov,derived) &&
+    require(!lens::derive(fixture_contract,std::span(writable).subspan(0x10,0x5DF),t.views[0].fov,derived) &&
         derived.vertical_fov_degrees==sentinel_lens.vertical_fov_degrees,"short camera rejects without publishing lens");
     // Restore the canted-eye fixture for the frozen tracking checks below.
     s=source();t=tracked();t.views[0].pose.orientation=geo::from_hmd_euler_degrees(0,-5,0);
     t.views[1].pose.orientation=geo::from_hmd_euler_degrees(0,5,0);
     const auto frozen=t;place(t,geo::from_hmd_euler_degrees(0,40,0),{});
-    require(pose::prepare_pair(s,frozen,{},out),"copied locate result is immutable");
+    require(pose::prepare_pair(fixture_contract,s,frozen,{},out),"copied locate result is immutable");
     require(near(get(out.descriptors[0]).rotation_degrees[2],-5),"later tracking changes cannot change frozen input");
     const auto sentinel=out.descriptors;
     const auto fail=[&](std::span<const std::uint8_t> input,pose::TrackingSample tracking,pose::Options options={}) {
-        require(!pose::prepare_pair(input,tracking,options,out),"invalid input rejected");
+        require(!pose::prepare_pair(fixture_contract,input,tracking,options,out),"invalid input rejected");
         require(out.descriptors==sentinel,"failure preserves both existing output descriptors");
     };
     t=tracked();t.valid=false;fail(s,t);t=tracked();t.display_time=0;fail(s,t);
@@ -238,6 +242,46 @@ int main() {
     s=source();float nan=std::numeric_limits<float>::quiet_NaN();std::memcpy(s.data()+0x5F0+0x14,&nan,4);fail(s,t);
     s=source();float ortho=0;std::memcpy(s.data()+0x5F0+0x1C,&ortho,4);fail(s,t);
     require(source()!=s,"fixtures exercised failures");
+    // A prepared byte pair identifies its source contract/time, not a native
+    // render receipt. Equal field positions do not authorize another build.
+    s=source();t=tracked();
+    require(pose::prepare_pair(fixture_contract,s,t,{},out),"fresh pair for identity checks");
+    require(out.contract==fixture_contract && out.display_time==t.display_time &&
+        pose::prepared_for(out,fixture_contract,t.display_time),"both buffers and identity published together");
+    const auto preserved_pair=out;
+    const auto* other=fixture_contract==&w3vr::engine_camera::remastered_500c?
+        &w3vr::engine_camera::remastered_1048522:&w3vr::engine_camera::remastered_500c;
+    require(!pose::prepared_for(out,other,t.display_time),"mixed version pair rejected");
+    require(!pose::prepared_for(out,fixture_contract,t.display_time+1) &&
+        !pose::prepared_for(out,fixture_contract,0),"wrong or absent locate time rejected");
+    auto short_pair=out;short_pair.descriptors[1].resize(0xF74F);
+    require(!pose::prepared_for(short_pair,fixture_contract,t.display_time),"one incomplete eye cannot publish a pair");
+    auto count_pair=out;const std::uint32_t bad_count=5;
+    std::memcpy(count_pair.descriptors[1].data()+0xECA0,&bad_count,4);
+    require(!pose::prepared_for(count_pair,fixture_contract,t.display_time),"one invalid eye count rejects pair");
+    Contract copied=*fixture_contract,unknown{};
+    for (const Contract* denied:std::array<const Contract*,4>{nullptr,&copied,&unknown,&w3vr::engine_camera::legacy_404}) {
+        require(!pose::prepare_pair(denied,s,t,{},out),"unknown copied null or legacy input rejected");
+        require(out.descriptors==preserved_pair.descriptors && out.contract==preserved_pair.contract &&
+            out.display_time==preserved_pair.display_time,"rejected contract preserves both bytes and identity");
+        auto camera=std::span(writable).subspan(0x10,0x5E0);
+        const auto saved=writable;auto fields=sentinel_lens;
+        require(!lens::derive(denied,camera,t.views[0].fov,fields) &&
+            fields.vertical_fov_degrees==sentinel_lens.vertical_fov_degrees,"rejected contract publishes no lens");
+        require(!lens::write(denied,camera,sentinel_lens) && writable==saved,"rejected contract changes no camera bytes");
+        layout::PoseFields position_sentinel{{7,8,9},{10,11,12}},position=position_sentinel;
+        require(!pose::read_pose(denied,camera,position) && position.position==position_sentinel.position &&
+            position.rotation_degrees==position_sentinel.rotation_degrees,"rejected pose read leaves output intact");
+        require(!pose::prepared_for(out,denied,t.display_time),"denied contract cannot consume existing pair");
+    }
+    t.valid=false;
+    require(!pose::prepare_pair(fixture_contract,s,t,{},out) &&
+        out.contract==preserved_pair.contract && out.display_time==preserved_pair.display_time &&
+        out.descriptors==preserved_pair.descriptors,"failed tracking preserves complete previous publication");
+}
+int main() {
+    exercise_profile(&w3vr::engine_camera::remastered_500c);
+    exercise_profile(&w3vr::engine_camera::remastered_1048522);
     std::printf("Modern camera pose/lens: %d checks, %d failures; CPU fixtures and matrix model only.\n",checks,failures);
     return failures?1:0;
 }
