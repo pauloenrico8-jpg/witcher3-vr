@@ -6,6 +6,65 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Preparação dos dois olhos ligada à versão atual — 11 de outubro
+
+Adaptei os dados de entrada da criação de quadros e a preparação de posição
+e lente para a atualização 1048522. Dados de entrada são o bloco que o jogo
+recebe antes de construir um quadro. Preparar esses dados não desenha a imagem.
+
+O fluxo, passo a passo:
+
+1. Escolhe explicitamente a versão já identificada. Uma seleção ausente,
+   desconhecida ou copiada não recebe uma versão por padrão. A versão antiga
+   conserva sua própria rota; as duas versões modernas têm endereços próprios.
+2. Confere que existem o responsável pelo desenho e os dados da cena, e que
+   largura e altura são legíveis e maiores que zero. Nas versões modernas, o
+   segundo argumento de configurações pode estar vazio, como na chamada do jogo.
+3. Copia somente um bloco de bytes emprestado durante a chamada original.
+   Exige o bloco moderno completo, alinhamento e uma quantidade limitada de
+   elementos internos. A regra de cópia identifica sua versão; tamanho igual
+   não permite usar a regra de outra versão. Os ponteiros continuam emprestados:
+   a cópia não cria nem passa a possuir os objetos do jogo.
+4. Congela as duas posições, rotações e lentes fornecidas pelo headset junto
+   com a centralização. Escolhe os campos da mesma versão para ler e escrever.
+   Calcula os dois olhos antes de entregar qualquer um; preserva a distância
+   física entre os olhos e a relação entre as duas câmeras internas de cada
+   quadro. Essas câmeras internas não são os dois olhos do headset.
+5. Altera só os campos previstos em duas cópias privadas. A lente é aplicada
+   apenas à câmera principal, substituindo o centro existente. Conserva a
+   pequena variação temporal da imagem, suas dimensões inteiras, profundidade,
+   matrizes, histórico e referências. Uma leitura de posição inválida também
+   deixa o resultado anterior intacto.
+6. Entrega as duas cópias com a versão e o instante da leitura do headset.
+   Se qualquer lado falhar, não entrega metade do par nem muda sua identificação
+   anterior. Antes de usar o par, confere ambos os blocos, versão e instante;
+   a integração também reconfere a geração de imagens e a seleção vigente.
+7. Reconhecer os dados da versão atual não permite instalar a fábrica ignorando
+   a fila e a preparação ainda não adaptadas. Os bloqueios dessas partes e o
+   bloqueio geral permanecem fechados. Essas conferências não impedem sozinhas
+   a destruição de objetos ou a retirada da DLL durante chamadas em execução.
+
+`engine_scene_factory.h` escolhe a versão e confere os dados de entrada;
+`engine_scene_descriptor.h` limita a cópia; `modern_camera_pose.h` prepara o
+par e sua identificação; `modern_camera_projection.h` calcula a lente;
+`dxgi_proxy.cpp` liga essas regras ao caminho existente. Escolhi passar a
+versão explicitamente porque campos iguais não comprovam que uma chamada
+pertence à mesma atualização.
+
+A DLL compilou e **112/112 testes passaram em 8,53 segundos**. Os três testes
+alterados fizeram **39, 68 e 914 verificações na CPU**, respectivamente.
+Incluem ambas as versões, rejeição de seleções misturadas e copiadas, campos
+inválidos, preservação de bytes, lentes diferentes e comparação com contas
+independentes de projeção. Usam dados fabricados; não executaram as funções
+do jogo, instalação real das ligações, falhas reais de memória, GPU ou Quest.
+As análises novas do executável continuam privadas.
+
+**O VR ainda não funciona; Remastered e a reentrada continuam bloqueados.
+Nada experimental foi instalado.** Faltam a preparação nativa completa,
+recursos, históricos, efeitos, vida útil e apresentação de duas imagens novas
+do mesmo par. Depois vêm o teste de imagem e cabeça no Quest e a integração
+de mãos, armas, dano e bloqueio físicos. DLSS continua complementar.
+
 ## Cópias de câmera vinculadas à instalação da mesma versão — 11 de outubro
 
 Adaptei o conjunto de três observadores de cópia e reconstrução para a
