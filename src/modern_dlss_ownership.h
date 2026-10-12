@@ -26,6 +26,7 @@ struct StreamlineAccess {
     std::uint64_t initialized_epoch{};
     bool serialized_host_call{};
     VerifyBaseQuery verified_base_query{};
+    bool allow_reshade_base{true}; // Binding acquisition needs separate class proofs.
 };
 
 // Independently verified installed command-list QI. Checks module-relative
@@ -35,6 +36,19 @@ bool installed_streamline_command_base(const IUnknown*) noexcept;
 // A separate installed queue-class proof. The command-list profile must NOT
 // be used to authorize QI on a queue (or vice versa).
 bool installed_streamline_queue_base(const IUnknown*) noexcept;
+// Device is an independent installed class. Never lend command/queue evidence
+// to a device or resource. No private object field or positive cache is read.
+bool installed_streamline_device_base(const IUnknown*) noexcept;
+struct OwnedDevice {
+    ComPtr<ID3D12Device> device;
+    ComPtr<IUnknown> device_identity;
+    Failure failure{Failure::None};
+    explicit operator bool()const{return device && failure==Failure::None;}
+};
+OwnedDevice acquire_device(IUnknown*,Classify,const StreamlineAccess& = {});
+// Only device/queue binding endpoints. Native or exact installed Streamline
+// class proofs; no SDK API, resource proof or unsupported nested proxy fallback.
+HRESULT resolve_binding_endpoint(IUnknown*,REFIID,void**,Classify) noexcept;
 
 struct NativeInterface {
     ComPtr<IUnknown> object; // Owns the requested interface, not a borrowed key.

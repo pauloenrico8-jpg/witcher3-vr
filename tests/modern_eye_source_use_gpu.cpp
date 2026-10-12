@@ -3,6 +3,7 @@
 #include "modern_graphics_binding.h"
 #include "modern_backbuffer_source.h"
 #include "modern_backbuffer_hooks.h"
+#include "modern_dlss_ownership.h"
 #include <MinHook.h>
 #include <barrier>
 #include <thread>
@@ -14,6 +15,16 @@
 namespace use=w3vr::modern_eye_source_use;
 using Microsoft::WRL::ComPtr;
 unsigned checks{},copies{};
+w3vr::command_list_identity::Owner binding_owner(const IUnknown* input){
+    using w3vr::command_list_identity::Owner;if(!input)return Owner::Unknown;
+    const auto table=*reinterpret_cast<void* const* const*>(input);HMODULE module{};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(table[0]),&module);
+    return module && (module==GetModuleHandleW(L"D3D12Core.dll") || module==GetModuleHandleW(L"d3d12.dll"))?Owner::Native:Owner::Unknown;
+}
+HRESULT binding_endpoint(IUnknown* input,REFIID iid,void** output) noexcept {
+    return w3vr::modern_dlss_ownership::resolve_binding_endpoint(input,iid,output,binding_owner);
+}
 void require(bool yes,const char* why){++checks;if(!yes)throw std::runtime_error(why);}
 void check(HRESULT hr,const char* why){if(FAILED(hr)){std::printf("HRESULT %08lx %s\n",static_cast<unsigned long>(hr),why);throw std::runtime_error(why);}}
 struct TrackedUse:use::Use {
@@ -302,13 +313,23 @@ void binding_case(ID3D12Device* device,IDXGIFactory6* factory){
         ComPtr<IDXGISwapChain1> chain;
         const HRESULT created=factory->CreateSwapChainForHwnd(original_queue.Get(),window,&desc,nullptr,nullptr,&chain);
         check(created,"actual hidden native swapchain factory");
-        binding::Registry registry;
+        binding::Registry absent(nullptr);
+        require(!absent.publish_factory(created,original_queue.Get(),chain.Get()) && !absent.ready(),"registry without endpoint policy admitted factory");
+        binding::Registry registry(binding_endpoint);
         require(!registry.ready() && !registry.acquire_backbuffer().resource,"empty binding adopted a buffer");
         require(!registry.publish_factory(E_FAIL,original_queue.Get(),chain.Get()) && !registry.ready(),
             "explicit failed factory HRESULT published binding");
         require(registry.publish_factory(created,original_queue.Get(),chain.Get()),"actual factory queue/output binding rejected");
         auto first=registry.acquire();require(first && registry.current(first) && first->width==32 && first->height==32,
             "factory snapshot is not exact current owner");
+        require(first->factory_queue_argument.Get()==original_queue.Get() && first->reported_chain_device &&
+            first->present_arguments[0].Get()==original_queue.Get() && first->present_arguments[1].Get()==original_queue.Get(),
+            "forwarded factory arguments lost independent owned storage");
+        auto native_device=w3vr::modern_dlss_ownership::acquire_device(device,binding_owner);
+        require(native_device && native_device.device_identity.Get()==first->device_identity.Get(),"typed physical native device identity mismatch");
+        void* unsupported{};require(FAILED(binding_endpoint(device,__uuidof(ID3D12Resource),&unsupported)) && !unsupported,
+            "device binding policy lent authority to a resource");
+        std::puts("PASS physical native binding endpoint adapter: typed device identity, exact original queue storage, absent-policy and resource-class rejection; installed Streamline device NOT executed");
         require(registry.publish_factory(created,original_queue.Get(),chain.Get()) && registry.acquire().get()==first.get(),
             "same callback advanced epoch or replaced owner");
         auto copied=std::make_shared<binding::Data>(*first);
@@ -405,7 +426,7 @@ void resize1_case(ID3D12Device* device,IDXGIFactory6* factory){
         DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=16;desc.Height=16;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
         ComPtr<IDXGISwapChain1> chain1;check(factory->CreateSwapChainForHwnd(first_queue.Get(),window,&desc,nullptr,nullptr,&chain1),"resize1 factory");
-        ComPtr<IDXGISwapChain3> chain;check(chain1.As(&chain),"resize1 interface");binding::Registry registry;
+        ComPtr<IDXGISwapChain3> chain;check(chain1.As(&chain),"resize1 interface");binding::Registry registry(binding_endpoint);
         require(registry.publish_factory(S_OK,first_queue.Get(),chain.Get()),"resize1 initial binding");
         auto initial=registry.acquire();auto held=registry.acquire_backbuffer();
         require(initial->present_count==2 && held.present_queue.Get()==first_queue.Get(),"factory queue per-buffer binding");
@@ -459,6 +480,8 @@ void resize1_case(ID3D12Device* device,IDXGIFactory6* factory){
         require(!registry.acquire() && !registry.acquire_backbuffer().resource,"plain resize guessed explicit queue association");
         check(resize(2,16,masks,explicit_queues),"explicit queue association recovery");
         require(registry.ready() && registry.acquire()->epoch>zero->epoch,"explicit actual remap did not recover acquisition");
+        require(mapped->present_arguments[0].Get()==explicit_queues[0] && mapped->present_arguments[1].Get()==explicit_queues[1],
+            "Resize1 did not retain exact forwarded per-buffer queue arguments");
         first_queue.Reset();second_queue.Reset();
         require(mapped->present_queues[0]->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT,"old snapshot lost remapped queue reference");
         std::printf("PASS actual ResizeBuffers1: per-buffer queue remap, native pixels, retained-source failure, zero-count unreadable extent rejected, explicit recovery, auxiliary isolation, plain-map rejection/recovery; Original calls=%u plus auxiliary=%u\n",originals,foreign_calls);
@@ -524,7 +547,7 @@ void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned m
         desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;
         desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;ComPtr<IDXGISwapChain1> chain;
         const HRESULT created=factory->CreateSwapChainForHwnd(producer.Get(),window,&desc,nullptr,nullptr,&chain);
-        check(created,"source real factory");graphics::Registry binding;
+        check(created,"source real factory");graphics::Registry binding(binding_endpoint);
         require(binding.publish_factory(created,producer.Get(),chain.Get()),"source binding publish");
         auto acquired=binding.acquire_backbuffer();require(acquired.resource!=nullptr,"source real GetBuffer");
         auto snapshot=acquired.binding;auto* native_source=acquired.resource.Get();
@@ -664,7 +687,7 @@ void read_only_source_case(ID3D12Device* device,IDXGIFactory6* factory){
         DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=16;desc.Height=16;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
         ComPtr<IDXGISwapChain1> chain;const HRESULT created=factory->CreateSwapChainForHwnd(renderer.Get(),window,&desc,nullptr,nullptr,&chain);
-        check(created,"read source actual factory");w3vr::modern_graphics_binding::Registry binding;
+        check(created,"read source actual factory");w3vr::modern_graphics_binding::Registry binding(binding_endpoint);
         require(binding.publish_factory(created,renderer.Get(),chain.Get()),"read source binding");auto snapshot=binding.acquire();
         std::array<ComPtr<ID3D12Resource>,2> inputs,destinations{texture(device),texture(device)};
         auto acquired=binding.acquire_backbuffer();require(acquired.resource!=nullptr,"current real read source");

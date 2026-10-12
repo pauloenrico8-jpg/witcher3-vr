@@ -12,7 +12,13 @@
 namespace w3vr::modern_graphics_binding {
 using Microsoft::WRL::ComPtr;
 inline constexpr UINT max_buffers=16;
+using ResolveEndpoint=HRESULT(*)(IUnknown*,REFIID,void**) noexcept;
 struct Data {
+    // Forwarded interfaces retain the original argument lineage independently
+    // from native device/queue endpoints. Neither freezes pixels or allocators.
+    ComPtr<IUnknown> factory_queue_argument;
+    ComPtr<ID3D12Device> reported_chain_device;
+    std::array<ComPtr<IUnknown>,max_buffers> present_arguments;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGISwapChain3> chain;
@@ -37,6 +43,12 @@ inline ComPtr<IUnknown> identity(IUnknown* object){
 // This does not repair an unsafe pointer before entry, Native ownership, or
 // module/loader/all-call lifetime. No COM call occurs while mutex_ is held.
 class Registry {
+    ResolveEndpoint resolve_{};
+    template<class T> bool endpoint(IUnknown* input,ComPtr<T>& output)const{
+        if(!input || !resolve_)return false;void* owned{};
+        const auto hr=resolve_(input,__uuidof(T),&owned);output.Attach(static_cast<T*>(owned));
+        if(FAILED(hr)){output.Reset();return false;}return bool(output);
+    }
     mutable std::mutex mutex_;
     std::recursive_mutex resize_gate_;
     std::atomic<bool> accepting_{true};
@@ -53,6 +65,7 @@ class Registry {
         resizing_=true;return {active_,++epoch_};
     }
     struct QueueSet {
+        std::array<ComPtr<IUnknown>,max_buffers> arguments;
         std::array<ComPtr<ID3D12CommandQueue>,max_buffers> queues;
         std::array<ComPtr<IUnknown>,max_buffers> identities;
         std::array<UINT,max_buffers> masks{};
@@ -67,12 +80,12 @@ class Registry {
         if(!count || count>max_buffers)return result;
         for(UINT i=0;i<count;++i){
             ComPtr<ID3D12Device> device;
-            if(!queues[i] || FAILED(queues[i]->QueryInterface(IID_PPV_ARGS(&result.queues[i]))) ||
+            if(!queues[i] || !endpoint(queues[i],result.queues[i]) ||
                 result.queues[i]->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT ||
                 FAILED(result.queues[i]->GetDevice(IID_PPV_ARGS(&device))))return {};
             auto device_key=identity(device.Get());result.identities[i]=identity(result.queues[i].Get());
             if(!device_key || !result.identities[i] || device_key.Get()!=ticket.original->device_identity.Get())return {};
-            result.masks[i]=masks?masks[i]:0;
+            result.arguments[i]=queues[i];result.masks[i]=masks?masks[i]:0;
         }
         result.count=count;return result;
     }
@@ -89,19 +102,19 @@ class Registry {
             next->width=desc.Width;next->height=desc.Height;next->buffer_count=desc.BufferCount;
             if(explicit_queues){
                 next->explicit_present_queues=true;next->present_count=0;
-                next->present_queues={};next->present_identities={};next->creation_masks={};
+                next->present_arguments={};next->present_queues={};next->present_identities={};next->creation_masks={};
                 if(explicit_queues->count==desc.BufferCount && desc.BufferCount && desc.BufferCount<=max_buffers){
-                    next->present_count=desc.BufferCount;next->present_queues=explicit_queues->queues;
+                    next->present_count=desc.BufferCount;next->present_arguments=explicit_queues->arguments;next->present_queues=explicit_queues->queues;
                     next->present_identities=explicit_queues->identities;next->creation_masks=explicit_queues->masks;
                     next->queue=next->present_queues[0];next->queue_identity=next->present_identities[0];
                 }
             }else if(next->explicit_present_queues){
                 // Plain ResizeBuffers supplies no new queue array. After an
                 // explicit remap its queue association is not proven here.
-                next->present_count=0;next->present_queues={};next->present_identities={};
+                next->present_count=0;next->present_arguments={};next->present_queues={};next->present_identities={};
             }else{
                 next->present_count=desc.BufferCount<=max_buffers?desc.BufferCount:0;
-                for(UINT i=0;i<next->present_count;++i){next->present_queues[i]=next->queue;next->present_identities[i]=next->queue_identity;}
+                for(UINT i=0;i<next->present_count;++i){next->present_arguments[i]=next->factory_queue_argument;next->present_queues[i]=next->queue;next->present_identities[i]=next->queue_identity;}
             }
         }
         Snapshot previous;
@@ -112,6 +125,7 @@ class Registry {
         }
     }
 public:
+    explicit Registry(ResolveEndpoint resolver):resolve_(resolver){}
     // Pair the ORIGINAL factory input queue and its successful output chain.
     // Same device alone does not infer which queue created a foreign chain.
     bool publish_factory(HRESULT original_result,IUnknown* queue_argument,IDXGISwapChain* chain_argument){
@@ -119,11 +133,13 @@ public:
             !accepting_.load(std::memory_order_acquire))return false;
         auto next=std::make_shared<Data>();
         ComPtr<ID3D12Device> chain_device;
-        if(FAILED(queue_argument->QueryInterface(IID_PPV_ARGS(&next->queue))) || !next->queue ||
+        if(!endpoint(queue_argument,next->queue) || !next->queue ||
             next->queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT ||
             FAILED(next->queue->GetDevice(IID_PPV_ARGS(&next->device))) || !next->device ||
             FAILED(chain_argument->QueryInterface(IID_PPV_ARGS(&next->chain))) || !next->chain ||
-            FAILED(next->chain->GetDevice(IID_PPV_ARGS(&chain_device))) || !chain_device)return false;
+            FAILED(next->chain->GetDevice(IID_PPV_ARGS(&next->reported_chain_device))) ||
+            !next->reported_chain_device || !endpoint(next->reported_chain_device.Get(),chain_device))return false;
+        next->factory_queue_argument=queue_argument;
         next->device_identity=identity(next->device.Get());next->queue_identity=identity(next->queue.Get());
         next->chain_identity=identity(next->chain.Get());auto chain_device_key=identity(chain_device.Get());
         DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -133,12 +149,13 @@ public:
         if(!desc.BufferCount || desc.BufferCount>max_buffers)return false;
         next->width=desc.Width;next->height=desc.Height;next->buffer_count=desc.BufferCount;
         next->present_count=desc.BufferCount;
-        for(UINT i=0;i<desc.BufferCount;++i){next->present_queues[i]=next->queue;next->present_identities[i]=next->queue_identity;}
+        for(UINT i=0;i<desc.BufferCount;++i){next->present_arguments[i]=next->factory_queue_argument;next->present_queues[i]=next->queue;next->present_identities[i]=next->queue_identity;}
         {std::lock_guard lock{mutex_};
             if(!accepting_.load(std::memory_order_acquire) || resizing_)return false;
             // Replacing a different game chain needs a proven drain protocol.
             // Do not silently adopt an auxiliary chain or retarget live XR.
-            if(active_)return active_->chain_identity.Get()==next->chain_identity.Get() &&
+            if(active_)return active_->factory_queue_argument.Get()==next->factory_queue_argument.Get() &&
+                active_->chain_identity.Get()==next->chain_identity.Get() &&
                 active_->queue_identity.Get()==next->queue_identity.Get() &&
                 active_->device_identity.Get()==next->device_identity.Get();
             if(epoch_>=UINT64_MAX-1){accepting_.store(false,std::memory_order_release);return false;}
@@ -162,8 +179,8 @@ public:
     bool ready()const{return current(acquire());}
     bool owns_child(const Snapshot& snapshot,ID3D12DeviceChild* child)const{
         if(!snapshot || !child || !current(snapshot))return false;
-        ComPtr<ID3D12Device> device;
-        if(FAILED(child->GetDevice(IID_PPV_ARGS(&device))) || !device)return false;
+        ComPtr<ID3D12Device> reported,device;
+        if(FAILED(child->GetDevice(IID_PPV_ARGS(&reported))) || !endpoint(reported.Get(),device))return false;
         auto key=identity(device.Get());return key && key.Get()==snapshot->device_identity.Get() && current(snapshot);
     }
     Backbuffer acquire_backbuffer()const{
