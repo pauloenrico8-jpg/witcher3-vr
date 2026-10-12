@@ -1,10 +1,13 @@
 #include "modern_dlss_ownership.h"
 #include <cstdlib>
 #include <cstdio>
+#include <MinHook.h>
+#include <cstring>
 
 namespace m = w3vr::modern_dlss_ownership;
 using m::Owner;
-void require(bool value) { if (!value) std::abort(); }
+unsigned checks{};
+void require(bool value) { ++checks;if (!value) std::abort(); }
 
 // IUnknown doubles cover only ownership and the public SDK output contract.
 // They never stand in for an executing D3D12 list or a completed game image.
@@ -12,10 +15,11 @@ struct Node : IUnknown {
     Owner owner{Owner::Native};
     Node* inner{};
     Node* graphics_result{};
+    Node* identity_result{};
     ULONG refs{1};
     unsigned queries{}, sdk_calls{};
     int sdk_status{};
-    bool sdk_null{}, query_fail{}, query_null{}, resource{}, modern_base{}, query_fault{}, queue{};
+    bool sdk_null{}, query_fail{}, query_null{}, resource{}, modern_base{}, query_fault{}, queue{}, device{};
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
         ++queries; *output = nullptr;
         if (query_fault) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
@@ -24,8 +28,9 @@ struct Node : IUnknown {
         Node* target{};
         if (owner == Owner::ReShade && iid == w3vr::command_list_identity::kReShadeBase) target = inner;
         if (owner == Owner::Streamline && modern_base && iid == w3vr::command_list_identity::kStreamlineBase) target = inner;
-        if (owner == Owner::Native && iid == (queue ? __uuidof(ID3D12CommandQueue) : (resource
-            ? __uuidof(ID3D12Resource) : __uuidof(ID3D12GraphicsCommandList))))
+        if(owner==Owner::Native && device && iid==__uuidof(IUnknown))target=identity_result?identity_result:this;
+        if (owner == Owner::Native && iid == (queue ? __uuidof(ID3D12CommandQueue) : (device ? __uuidof(ID3D12Device) : (resource
+            ? __uuidof(ID3D12Resource) : __uuidof(ID3D12GraphicsCommandList)))))
             target = graphics_result ? graphics_result : this;
         if (!target) return E_NOINTERFACE;
         target->AddRef(); *output = target;
@@ -45,7 +50,42 @@ int sdk(void* input, void** output) {
     return node->sdk_status;
 }
 
-int main() {
+// These are table-only fixtures. Even the matching fixture is NOT a live SDK
+// Device. They only exercise the loaded-image profile guard; no QI is invoked.
+unsigned profile_qi_calls{};
+HRESULT STDMETHODCALLTYPE profile_qi_never_called(IUnknown*,REFIID,void**){++profile_qi_calls;return E_UNEXPECTED;}
+void loaded_device_profile(const wchar_t* path){
+    require(GetModuleHandleW(L"sl.interposer.dll")==nullptr);
+    const auto module=LoadLibraryExW(path,nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
+    require(module && GetModuleHandleW(L"sl.interposer.dll")==module);
+    const auto base=reinterpret_cast<std::uintptr_t>(module);
+    struct TableFixture{const std::uintptr_t* table;} fixture{reinterpret_cast<const std::uintptr_t*>(base+0x788C0)};
+    auto object=[&](){return reinterpret_cast<const IUnknown*>(&fixture);};
+    require(m::installed_streamline_device_base(object()));
+    require(!m::installed_streamline_command_base(object()) && !m::installed_streamline_queue_base(object()));
+    for(auto other:{0x782F0,0x78588,0x79348,0x794A8}){
+        fixture.table=reinterpret_cast<const std::uintptr_t*>(base+other);
+        require(!m::installed_streamline_device_base(object()));
+    }
+    fixture.table=reinterpret_cast<const std::uintptr_t*>(base+0x788C0);
+    std::array<std::uintptr_t,16> copied{};memcpy(copied.data(),fixture.table,sizeof(copied));
+    fixture.table=copied.data();require(!m::installed_streamline_device_base(object()));
+    fixture.table=reinterpret_cast<const std::uintptr_t*>(base+0x788C0);
+    require(MH_Initialize()==MH_OK);void* original{};auto* target=reinterpret_cast<void*>(base+0x252C0);
+    require(MH_CreateHook(target,reinterpret_cast<void*>(&profile_qi_never_called),&original)==MH_OK && original);
+    require(m::installed_streamline_device_base(object())); // Create alone did not alter entry bytes.
+    require(MH_EnableHook(target)==MH_OK);
+    require(!m::installed_streamline_device_base(object()) && profile_qi_calls==0);
+    require(MH_DisableHook(target)==MH_OK && MH_RemoveHook(target)==MH_OK);
+    require(MH_Uninitialize()==MH_OK && m::installed_streamline_device_base(object()));
+    // The probe has no threads executing SDK methods. Removal here is not an
+    // all-call/loader/unload barrier for the Witcher host.
+    require(profile_qi_calls==0 && FreeLibrary(module));
+    require(GetModuleHandleW(L"sl.interposer.dll")==nullptr && !m::installed_streamline_device_base(object()));
+    std::puts("PASS loaded installed device profile: matching table-only fixture, wrong classes, copied table, real MinHook byte change/restoration, sequential unload rejection; SDK Device object/QI/initialization NOT executed");
+}
+
+int wmain(int argc,wchar_t** argv) {
     const auto iid = __uuidof(ID3D12GraphicsCommandList);
     const m::StreamlineAccess enabled{sdk, 1, true};
     Node native, sl, reshade, unknown, renderdoc;
@@ -94,6 +134,10 @@ int main() {
     // A model's vtable is never accepted as the actual installed component.
     require(!m::installed_streamline_command_base(&sl));
     require(!m::installed_streamline_queue_base(&sl));
+    require(!m::installed_streamline_device_base(nullptr));
+    require(!m::installed_streamline_device_base(&sl));
+    require(!m::installed_streamline_device_base(&native));
+
     native.query_fault = true;
     require(m::resolve_native(&native, iid, classify).failure == m::Failure::Interface);
     native.query_fault = false;
@@ -152,6 +196,49 @@ int main() {
     require(m::acquire_command(&unknown, classify).failure == m::Failure::UnknownOwner &&
         unknown.queries == unknown_queries && unknown.refs == 1);
     require(!m::compatible_queue_device({}, {}));
+    // Device doubles model only QI/reference ownership, never D3D12 methods.
+    const auto device_sdk_before=sl.sdk_calls;
+    Node device;device.device=true;
+    require(m::acquire_device(nullptr,classify).failure==m::Failure::Input);
+    require(m::acquire_device(&device,nullptr).failure==m::Failure::Input);
+    require(m::acquire_device(&native,classify).failure==m::Failure::Interface && native.refs==1);
+    {
+        auto owned=m::acquire_device(&device,classify);
+        require(bool(owned) && owned.device.Get()==reinterpret_cast<ID3D12Device*>(&device) &&
+            owned.device_identity.Get()==&device && device.refs==3);
+        auto moved=std::move(owned.device);require(!owned.device && device.refs==3);
+    }
+    require(device.refs==1);
+    device.identity_result=&unknown;
+    require(m::acquire_device(&device,classify).failure==m::Failure::Interface && device.refs==1 && unknown.refs==1);
+    device.identity_result=nullptr;
+    sl.inner=&device;sl.modern_base=true;
+    {
+        auto owned=m::acquire_device(&sl,classify,modern_qi);
+        require(bool(owned) && device.refs==3 && sl.refs==1 && sl.sdk_calls==device_sdk_before);
+    }
+    require(device.refs==1);
+    // A closed nested ReShade policy rejects before touching its QI; neither
+    // same SDK name nor the model's class grants a production device proof.
+    sl.inner=&reshade;reshade.inner=&device;
+    const auto no_nested=m::StreamlineAccess{nullptr,0,false,verified,false};
+    const auto reshade_queries=reshade.queries;
+    require(m::acquire_device(&sl,classify,no_nested).failure==m::Failure::UnsupportedOwner &&
+        reshade.queries==reshade_queries && sl.refs==1 && reshade.refs==1 && device.refs==1);
+    void* output=reinterpret_cast<void*>(1);
+    require(m::resolve_binding_endpoint(&device,__uuidof(ID3D12Device),nullptr,classify)==E_POINTER);
+    require(m::resolve_binding_endpoint(nullptr,__uuidof(ID3D12Device),&output,classify)==E_INVALIDARG && !output);
+    require(m::resolve_binding_endpoint(&device,__uuidof(ID3D12Device),&output,classify)==S_OK && output==&device && device.refs==2);
+    static_cast<IUnknown*>(output)->Release();require(device.refs==1);
+    const auto device_queries=device.queries;
+    require(FAILED(m::resolve_binding_endpoint(&device,__uuidof(ID3D12Resource),&output,classify)) && !output && device.queries==device_queries);
+    for(Node* denied:{&unknown,&renderdoc,&reshade,&sl}){
+        const auto before=denied->queries;
+        require(FAILED(m::resolve_binding_endpoint(denied,__uuidof(ID3D12Device),&output,classify)) && !output && denied->queries==before && denied->refs==1);
+    }
+    require(sl.sdk_calls==device_sdk_before && device.refs==1);
+    sl.inner=&native;sl.modern_base=false;reshade.inner=&native;
+    std::puts("PASS typed device binding: modeled QI ownership/failure balance and class-policy rejection; no installed Streamline runtime or D3D12 device methods executed");
     // Empty/forged receipts never enter COM. Opaque tokens are not read.
     w3vr::engine_dlss_resources::CpuResourceReceipt receipt;
     require(m::acquire(receipt, classify).failure == m::Failure::Receipt);
@@ -161,4 +248,7 @@ int main() {
     require(!m::fence_reached(5, 0) && !m::fence_reached(UINT64_MAX, UINT64_MAX));
     require(native.refs == 1);
     std::puts("PASS modern native identity, strict SDK fallback rejection and COM reference balance");
+    if(argc==2)loaded_device_profile(argv[1]);
+    else require(argc==1);
+    std::printf("PASS CPU ownership checks=%u; device objects and verification capabilities above are modeled\n",checks);
 }
