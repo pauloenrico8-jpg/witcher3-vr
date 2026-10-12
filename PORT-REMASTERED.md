@@ -1,4 +1,55 @@
 # Adaptação para Remastered — estado da renderização
+## Relógio ligado à chamada normal da câmera — 12 de outubro
+
+O preparo das duas câmeras da atualização atual passa a conferir o relógio da
+mesma chamada que forneceu os dados de câmera. O relógio apenas identificado
+por seu endereço global não basta: ele precisa corresponder ao objeto que fez
+a chamada e continuar com os mesmos valores durante o preparo do par.
+
+O fluxo, passo a passo:
+
+1. Na entrada da função que cria os dados da cena, conserva o endereço do
+   chamador e o argumento original, antes de preparar cópias para os olhos.
+2. O Windows percorre a pilha, isto é, o registro das funções ainda em execução.
+   Seus próprios metadados restauram os registros do chamador correto; o código
+   não toma os registros atuais da função de observação como dados do jogo.
+3. Confere a versão, trechos de código, a cadeia de metadados, a chamada exata
+   e os limites do argumento na pilha. Um fragmento de função é conferido como
+   fragmento; não é confundido com o início principal da função.
+4. Só lê o relógio quando seu objeto coincide com o chamador recuperado e sua
+   classe corresponde ao perfil conhecido. Repete as leituras, conserva o
+   contador e a escala e calcula o tempo na mesma ordem de conversões do jogo.
+5. Antes de preparar o par e depois da primeira câmera, confere novamente o
+   objeto, contador, escala, versão e thread, a linha de execução do processador.
+   Uma mudança encerra a observação. Essa recusa não é reaberta pela volta aos
+   valores anteriores e impede admitir a duplicação nessa rota.
+6. Essa observação existe somente dentro da chamada atual. Conserva valores
+   simples de tempo e não concede posse do objeto, conclusão da placa de vídeo
+   nem permissão para construir os históricos nativos da câmera.
+
+`native_caller_context.h` recupera o contexto pelo Windows;
+`modern_factory_clock.h` confere a identidade e conserva o tempo;
+`modern_factory_clock_windows.h` faz as leituras protegidas;
+`dxgi_proxy.cpp` liga as conferências ao preparo do par. Escolhi essa divisão
+para testar a regra sem objetos do jogo e testar a recuperação pelo Windows
+com o mesmo código usado pela DLL. O perfil de chamador desta etapa cobre
+somente a atualização atual; outras versões não recebem esse perfil por cópia
+ou por um deslocamento de endereços.
+
+A DLL compilou e os **116 testes passaram**. O teste próprio de Windows fez
+**380 conferências, nove chamadas e três threads**, com cadeia de cinco partes e
+salvamento tardio de um registro. Outros **118 testes de condição** usaram dados
+fabricados para conferir recusas e mudanças do relógio. Nenhum deles executou
+essa leitura dentro do Witcher, o SDK, OpenXR ou o Quest. O bloqueio global das
+versões Remastered permanece; nada experimental foi instalado no jogo.
+**O VR ainda não funciona.**
+
+Próximo passo: comprovar a vida útil e a sincronização do relógio na chamada do
+jogo, depois reconstruir os dados anteriores de cada câmera com o tempo atual
+admitido. Continuam pendentes os recursos e históricos por olho, a ordem de
+produção e a entrega de duas imagens novas do jogo em cada quadro. As mãos,
+armas e o combate por contato físico vêm depois dessa comprovação.
+
 
 Estado em 06/10/2026: análise estática e início da adaptação do código de câmera,
 sem liberar o mod no jogo.

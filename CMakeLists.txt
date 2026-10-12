@@ -115,6 +115,19 @@ if(BUILD_TESTING)
     add_test(NAME modern_captured_native_command_queue COMMAND w3vr_modern_command_queue_tests)
 
     # Physical D3D12 probe; runs separately from the game and OpenXR.
+    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        enable_language(ASM_MASM)
+        add_executable(w3vr_native_caller_context_tests
+            tests/native_caller_context_tests.cpp tests/native_caller_context_fixture.asm)
+        target_include_directories(w3vr_native_caller_context_tests PRIVATE src)
+        target_compile_definitions(w3vr_native_caller_context_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0602)
+        add_test(NAME native_caller_context_chained_windows COMMAND w3vr_native_caller_context_tests)
+        add_executable(w3vr_modern_factory_clock_tests tests/modern_factory_clock_tests.cpp)
+        target_include_directories(w3vr_modern_factory_clock_tests PRIVATE src)
+        target_compile_definitions(w3vr_modern_factory_clock_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0602)
+        add_test(NAME modern_normal_factory_clock_scope COMMAND w3vr_modern_factory_clock_tests)
+    endif()
+
     add_executable(w3vr_modern_hook_original_tests tests/modern_hook_original_tests.cpp)
     target_include_directories(w3vr_modern_hook_original_tests PRIVATE src)
     add_test(NAME modern_hook_original_receiver_routing COMMAND w3vr_modern_hook_original_tests)
