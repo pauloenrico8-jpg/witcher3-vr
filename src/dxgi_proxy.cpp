@@ -42,6 +42,7 @@
 #include "modern_graphics_binding.h"
 #include "modern_backbuffer_source.h"
 #include "modern_backbuffer_hooks.h"
+#include "modern_hook_original.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
     D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
     D3D12_RESOURCE_STATE_PRESENT == 0 &&
@@ -2395,6 +2396,29 @@ DrawInstancedFn g_draw_instanced{};
 DispatchFn g_dispatch{};
 CopyBufferRegionFn g_copy_buffer_region{};
 ResourceBarrierFn g_resource_barrier{};
+// Legacy/intermediary callbacks and concrete native callbacks have separate
+// originals. Exact enabled native legacy owners may be reused explicitly.
+ResetCommandListFn g_modern_source_reset{};
+ExecuteCommandListsFn g_modern_source_execute{};
+CloseCommandListFn g_modern_source_close{};
+ResourceBarrierFn g_modern_source_barrier{};
+w3vr::modern_hook_original::Routes g_legacy_source_original_routes;
+w3vr::modern_hook_original::Routes g_native_source_original_routes;
+void* source_method_target(IUnknown* receiver,std::size_t slot) noexcept {
+    __try {return receiver?(*reinterpret_cast<void***>(receiver))[slot]:nullptr;}
+    __except(EXCEPTION_EXECUTE_HANDLER){return nullptr;}
+}
+ResourceBarrierFn barrier_original_for(ID3D12GraphicsCommandList* command) noexcept {
+    return reinterpret_cast<ResourceBarrierFn>(w3vr::modern_hook_original::select(
+        source_method_target(command,26),g_legacy_source_original_routes[3],g_native_source_original_routes[3]));
+}
+
+void publish_legacy_source_receipt(w3vr::modern_backbuffer_hooks::Site site,void* target,void* original,bool enabled) {
+    // Proxy hooks are legitimate forwarders, never native receipts. A proxy
+    // installation cannot poison the separate native bundle's readiness.
+    if(w3vr::modern_backbuffer_hooks::native_target(target))
+        g_modern_backbuffer_hook_receipts.publish(site,target,original,enabled);
+}
 OMSetRenderTargetsFn g_om_set_render_targets{};
 void* g_dispatch_hook_target{};
 void* g_compute_table_hook_target{};
@@ -14450,8 +14474,9 @@ struct WitcherSenseHistorySuppressionDrawScope {
     }
 
     ~WitcherSenseHistorySuppressionDrawScope() {
+        const auto original=barrier_original_for(command_list);
         if (command_list == nullptr || history == nullptr ||
-            rtv.ptr == 0 || g_resource_barrier == nullptr) {
+            rtv.ptr == 0 || original == nullptr) {
             return;
         }
         D3D12_RESOURCE_BARRIER barrier{};
@@ -14462,14 +14487,14 @@ struct WitcherSenseHistorySuppressionDrawScope {
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barrier.Transition.StateAfter =
             D3D12_RESOURCE_STATE_RENDER_TARGET;
-        g_resource_barrier(command_list, 1, &barrier);
+        original(command_list, 1, &barrier);
         const FLOAT transparent[4]{0.0f, 0.0f, 0.0f, 0.0f};
         command_list->ClearRenderTargetView(
             rtv, transparent, 0, nullptr);
         std::swap(
             barrier.Transition.StateBefore,
             barrier.Transition.StateAfter);
-        g_resource_barrier(command_list, 1, &barrier);
+        original(command_list, 1, &barrier);
         if (g_config.logging_enabled && take_bounded_log_slot(
                 g_witcher_sense_history_clear_logs, 8)) {
             log_line(
@@ -19628,6 +19653,15 @@ void scan_mapped_resources_periodically(uint64_t frame) {
     }
 }
 
+bool source_wrapper_passthrough(IUnknown* receiver) {
+    return w3vr::modern_hook_original::wrapper_passthrough(modern_noaa_output_requested(),
+        classify_command_list_owner(receiver)==w3vr::command_list_identity::Owner::Native);
+}
+
+void STDMETHODCALLTYPE hook_modern_source_execute(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*);
+HRESULT STDMETHODCALLTYPE hook_modern_source_reset(ID3D12GraphicsCommandList*,ID3D12CommandAllocator*,ID3D12PipelineState*);
+HRESULT STDMETHODCALLTYPE hook_modern_source_close(ID3D12GraphicsCommandList*);
+void STDMETHODCALLTYPE hook_modern_source_barrier(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*);
 void install_modern_source_bundle() {
     if(!modern_noaa_output_requested())return;
     std::scoped_lock mutation{g_modern_source_install_mutex};
@@ -19656,20 +19690,29 @@ void install_modern_source_bundle() {
         classify_command_list_owner(command.Get())!=Owner::Native || FAILED(command->Close()))return;
     const w3vr::modern_backbuffer_hooks::Targets targets{method<void*>(command.Get(),10),execute_target,
         method<void*>(command.Get(),9),method<void*>(command.Get(),26)};
-    const std::array<void*,4> detours{reinterpret_cast<void*>(&hook_reset_command_list),reinterpret_cast<void*>(&hook_execute_command_lists),
-        reinterpret_cast<void*>(&hook_close_command_list),reinterpret_cast<void*>(&hook_resource_barrier)};
-    const std::array<void**,4> originals{reinterpret_cast<void**>(&g_reset_command_list),reinterpret_cast<void**>(&g_execute_command_lists),
-        reinterpret_cast<void**>(&g_close_command_list),reinterpret_cast<void**>(&g_resource_barrier)};
+    const std::array<void*,4> detours{reinterpret_cast<void*>(&hook_modern_source_reset),reinterpret_cast<void*>(&hook_modern_source_execute),
+        reinterpret_cast<void*>(&hook_modern_source_close),reinterpret_cast<void*>(&hook_modern_source_barrier)};
+    const std::array<void**,4> originals{reinterpret_cast<void**>(&g_modern_source_reset),reinterpret_cast<void**>(&g_modern_source_execute),
+        reinterpret_cast<void**>(&g_modern_source_close),reinterpret_cast<void**>(&g_modern_source_barrier)};
+    const std::array<void*,4> legacy_originals{reinterpret_cast<void*>(g_reset_command_list),reinterpret_cast<void*>(g_execute_command_lists),
+        reinterpret_cast<void*>(g_close_command_list),reinterpret_cast<void*>(g_resource_barrier)};
+    for(std::size_t i=0;i<targets.size();++i){
+        if(!*originals[i] && g_modern_backbuffer_hook_receipts.matches(
+            static_cast<w3vr::modern_backbuffer_hooks::Site>(i),targets[i],legacy_originals[i])){
+            *originals[i]=legacy_originals[i]; // Adopt only our exact enabled native owner.
+            if(!g_native_source_original_routes[i].bind(targets[i],*originals[i])){
+                g_modern_source_installation.failed=true;g_modern_backbuffer_hook_receipts.revoke();return;
+            }
+        }
+    }
     auto admitted=[&]{return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) &&
         modern_noaa_output_requested() && modern_graphics_current(binding);};
     w3vr::modern_backbuffer_hooks::install_once(admitted(),g_modern_backbuffer_hook_receipts,g_modern_source_installation,targets,originals,
-        [&](std::size_t i,void* target,void** original){return admitted() && MH_CreateHook(target,detours[i],original)==MH_OK;},
+        [&](std::size_t i,void* target,void** original){return admitted() && MH_CreateHook(target,detours[i],original)==MH_OK &&
+            g_native_source_original_routes[i].bind(target,*original);},
         [&](std::size_t,void* target){return admitted() && MH_EnableHook(target)==MH_OK;});
     if(!admitted())g_modern_backbuffer_hook_receipts.revoke();
-    if(g_modern_backbuffer_hook_receipts.matches(w3vr::modern_backbuffer_hooks::Site::Reset,targets[0],reinterpret_cast<void*>(g_reset_command_list)) &&
-        !g_legacy_native_reset_forwarder)g_legacy_native_reset_forwarder=w3vr::modern_dlss_native_hooks::reset_forwarder(targets[0],g_reset_command_list);
-    if(g_modern_backbuffer_hook_receipts.matches(w3vr::modern_backbuffer_hooks::Site::Execute,targets[1],reinterpret_cast<void*>(g_execute_command_lists)) &&
-        !g_legacy_native_execute_forwarder)g_legacy_native_execute_forwarder=w3vr::modern_dlss_native_hooks::execute_forwarder(targets[1],g_execute_command_lists);
+
 }
 
 void install_reverse_hooks() {
@@ -19702,14 +19745,14 @@ void install_reverse_hooks() {
     const bool dlss_cache_execute_publication =
         dlss_submitted_cache_route_active();
 
-    if ((metadata_hooks ||
+    if (g_modern_source_execute==nullptr && (metadata_hooks ||
             puredark_afw_execute_publication ||
             dlss_cache_execute_publication) &&
         g_command_queue != nullptr && g_execute_command_lists == nullptr) {
         auto target = method<void*>(g_command_queue, 10);
         const bool enabled=MH_CreateHook(target, reinterpret_cast<void*>(&hook_execute_command_lists), reinterpret_cast<void**>(&g_execute_command_lists)) == MH_OK &&
-            MH_EnableHook(target) == MH_OK;
-        g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Execute,target,
+            g_legacy_source_original_routes[1].bind(target,reinterpret_cast<void*>(g_execute_command_lists)) && MH_EnableHook(target) == MH_OK;
+        publish_legacy_source_receipt(w3vr::modern_backbuffer_hooks::Site::Execute,target,
             reinterpret_cast<void*>(g_execute_command_lists),enabled);
         if (enabled) {
             g_legacy_native_execute_forwarder =
@@ -19956,13 +19999,13 @@ void install_command_list_hooks() {
     const bool compute_hooks = taau_compute_hooks_needed() ||
         rt_symmetric_dlss_per_eye_ao_history_active();
 
-    if (g_reset_command_list == nullptr) {
+    if (g_reset_command_list == nullptr && g_modern_source_reset == nullptr) {
         auto target = method<void*>(command_list, 10);
         const bool enabled=MH_CreateHook(target,
                 reinterpret_cast<void*>(&hook_reset_command_list),
                 reinterpret_cast<void**>(&g_reset_command_list)) == MH_OK &&
-            MH_EnableHook(target) == MH_OK;
-        g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Reset,target,
+            g_legacy_source_original_routes[0].bind(target,reinterpret_cast<void*>(g_reset_command_list)) && MH_EnableHook(target) == MH_OK;
+        publish_legacy_source_receipt(w3vr::modern_backbuffer_hooks::Site::Reset,target,
             reinterpret_cast<void*>(g_reset_command_list),enabled);
         if (enabled) {
             g_legacy_native_reset_forwarder =
@@ -19973,11 +20016,12 @@ void install_command_list_hooks() {
         }
     }
 
-    if(modern_noaa_output_requested() && g_close_command_list==nullptr){
+    if(modern_noaa_output_requested() && g_close_command_list==nullptr && g_modern_source_close==nullptr){
         auto target=method<void*>(command_list,9);
         const bool enabled=MH_CreateHook(target,reinterpret_cast<void*>(&hook_close_command_list),
-            reinterpret_cast<void**>(&g_close_command_list))==MH_OK && MH_EnableHook(target)==MH_OK;
-        g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Close,target,
+            reinterpret_cast<void**>(&g_close_command_list))==MH_OK &&
+            g_legacy_source_original_routes[2].bind(target,reinterpret_cast<void*>(g_close_command_list)) && MH_EnableHook(target)==MH_OK;
+        publish_legacy_source_receipt(w3vr::modern_backbuffer_hooks::Site::Close,target,
             reinterpret_cast<void*>(g_close_command_list),enabled);
     }
 
@@ -21024,10 +21068,10 @@ void publish_rt_private_history_submissions(
     }
 }
 
-void STDMETHODCALLTYPE hook_execute_command_lists(
+void execute_source_body(
     ID3D12CommandQueue* queue,
     UINT num_command_lists,
-    ID3D12CommandList* const* command_lists) {
+    ID3D12CommandList* const* command_lists, ExecuteCommandListsFn original, bool legacy_owner) {
     // [TRIAL:RESHADE-IMMEDIATE-LIST-ISOLATION V23001 4/4] The official
     // D3D12 queue wrapper flushes its named immediate list as a separate raw
     // ExecuteCommandLists call before the game's submission. Preserve that GPU
@@ -21051,8 +21095,10 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         // that owns the DLSS producer commands.
         // This opaque path intentionally has no modern observation. Stop
         // treating this owner as a complete delegate before forwarding it.
-        g_legacy_native_execute_forwarder.deactivate();
-        g_execute_command_lists(queue, num_command_lists, command_lists);
+        if(legacy_owner){
+            g_legacy_native_execute_forwarder.deactivate();
+            g_execute_command_lists(queue, num_command_lists, command_lists);
+        }else original(queue,num_command_lists,command_lists);
         return;
     }
     const bool puredark_afw_cross_queue_route =
@@ -21154,7 +21200,7 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
             w3vr::pipeline_flight::CpuScope flight_cpu{w3vr::pipeline_flight::Phase::QueueSubmit};
             source_batch=g_modern_backbuffer_sources.execute_from_callback(g_streamline_capture_mutex,
                 queue,num_command_lists,command_lists,[](auto* command){return load_command_list_recording_epoch(command);},
-                [&]{forward_legacy_execute(queue,num_command_lists,command_lists);});
+                [&]{if(legacy_owner)forward_legacy_execute(queue,num_command_lists,command_lists);else original(queue,num_command_lists,command_lists);});
         }
         w3vr::pipeline_flight::on_execute(
             queue, num_command_lists, command_lists);
@@ -21373,7 +21419,7 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         w3vr::pipeline_flight::CpuScope flight_cpu{w3vr::pipeline_flight::Phase::QueueSubmit};
         source_batch=g_modern_backbuffer_sources.execute_from_callback(g_streamline_capture_mutex,
             queue,num_command_lists,command_lists,[](auto* command){return load_command_list_recording_epoch(command);},
-            [&]{forward_legacy_execute(queue,num_command_lists,command_lists);});
+            [&]{if(legacy_owner)forward_legacy_execute(queue,num_command_lists,command_lists);else original(queue,num_command_lists,command_lists);});
     }
     w3vr::pipeline_flight::on_execute(
         queue, num_command_lists, command_lists);
@@ -21466,6 +21512,14 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         }
     }
 }
+void STDMETHODCALLTYPE hook_execute_command_lists(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists) {
+    if(source_wrapper_passthrough(queue)){g_execute_command_lists(queue,count,lists);return;}
+    execute_source_body(queue,count,lists,g_execute_command_lists,true);
+}
+void STDMETHODCALLTYPE hook_modern_source_execute(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists) {
+    execute_source_body(queue,count,lists,g_modern_source_execute,false);
+}
+
 
 void STDMETHODCALLTYPE hook_copy_buffer_region(
     ID3D12GraphicsCommandList* command_list,
@@ -22811,14 +22865,22 @@ void STDMETHODCALLTYPE hook_set_descriptor_heaps(
     g_set_descriptor_heaps(command_list, num_descriptor_heaps, descriptor_heaps);
 }
 
-HRESULT STDMETHODCALLTYPE hook_close_command_list(ID3D12GraphicsCommandList* command_list) {
-    if(is_reshade_immediate_command_list(command_list))return g_close_command_list(command_list);
+HRESULT close_source_body(ID3D12GraphicsCommandList* command_list,CloseCommandListFn original) {
+    if(is_reshade_immediate_command_list(command_list))return original(command_list);
     const auto epoch=load_command_list_recording_epoch(command_list);
-    const HRESULT result=g_close_command_list(command_list); // Original once; preserve HRESULT.
+    const HRESULT result=original(command_list); // Original once; preserve HRESULT.
     {std::scoped_lock lock{g_streamline_capture_mutex};
         g_modern_backbuffer_sources.after_close(command_list,epoch,result);}
     return result;
 }
+HRESULT STDMETHODCALLTYPE hook_close_command_list(ID3D12GraphicsCommandList* command) {
+    if(source_wrapper_passthrough(command))return g_close_command_list(command);
+    return close_source_body(command,g_close_command_list);
+}
+HRESULT STDMETHODCALLTYPE hook_modern_source_close(ID3D12GraphicsCommandList* command) {
+    return close_source_body(command,g_modern_source_close);
+}
+
 
 // [FIX:COMMAND-LIST-RESET-EPOCH V1120] D3D12 invalidates descriptor heaps,
 // root signatures and root arguments when a command list begins a new
@@ -22827,18 +22889,18 @@ HRESULT STDMETHODCALLTYPE hook_close_command_list(ID3D12GraphicsCommandList* com
 // graphics tables from the preceding recording into an undefined graphics-root
 // state. Commit the new epoch only after Reset succeeds; the optional initial
 // PSO is the sole state carried into the fresh recording by the D3D12 contract.
-HRESULT STDMETHODCALLTYPE hook_reset_command_list(
+HRESULT reset_source_body(
     ID3D12GraphicsCommandList* command_list,
     ID3D12CommandAllocator* allocator,
-    ID3D12PipelineState* initial_state) {
+    ID3D12PipelineState* initial_state,ResetCommandListFn original,bool legacy_owner) {
     if (is_reshade_immediate_command_list(command_list)) {
-        g_legacy_native_reset_forwarder.deactivate();
-        return g_reset_command_list(
-            command_list, allocator, initial_state);
+        if(legacy_owner)g_legacy_native_reset_forwarder.deactivate();
+        return original(command_list, allocator, initial_state);
     }
     const auto discarded_source_epoch=load_command_list_recording_epoch(command_list);
     const HRESULT result =
-        forward_legacy_reset(command_list, allocator, initial_state);
+        legacy_owner ? forward_legacy_reset(command_list, allocator, initial_state)
+                     : original(command_list, allocator, initial_state);
     if (FAILED(result)) {
         return result;
     }
@@ -23025,6 +23087,14 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
     }
     return result;
 }
+HRESULT STDMETHODCALLTYPE hook_reset_command_list(ID3D12GraphicsCommandList* command,ID3D12CommandAllocator* allocator,ID3D12PipelineState* state) {
+    if(source_wrapper_passthrough(command))return g_reset_command_list(command,allocator,state);
+    return reset_source_body(command,allocator,state,g_reset_command_list,true);
+}
+HRESULT STDMETHODCALLTYPE hook_modern_source_reset(ID3D12GraphicsCommandList* command,ID3D12CommandAllocator* allocator,ID3D12PipelineState* state) {
+    return reset_source_body(command,allocator,state,g_modern_source_reset,false);
+}
+
 
 void STDMETHODCALLTYPE hook_set_graphics_root_descriptor_table(
     ID3D12GraphicsCommandList* command_list,
@@ -24713,7 +24783,7 @@ bool ensure_mode3_early_hud_resources_locked(
             g_mode3_early_hud_desc, source_desc);
     }
     if (g_d3d12_device == nullptr ||
-        g_resource_barrier == nullptr ||
+        (g_resource_barrier == nullptr && g_modern_source_barrier == nullptr) ||
         source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         source_desc.DepthOrArraySize != 1 ||
         source_desc.SampleDesc.Count != 1 ||
@@ -24798,11 +24868,12 @@ bool capture_mode3_early_hud(
     ID3D12GraphicsCommandList* command_list,
     ID3D12Resource* source,
     D3D12_RESOURCE_STATES source_state) {
+    const auto original=barrier_original_for(command_list);
     if (!retained_hud_projection_route_active() ||
         g_engine_loading_screen_video_active.load(
             std::memory_order_acquire) ||
         command_list == nullptr || source == nullptr ||
-        g_resource_barrier == nullptr) {
+        original == nullptr) {
         w3vr::minimal_xr_log::hud("FAIL", "present=%llu function=capture_mode3_early_hud site=1", g_present_count.load(std::memory_order_relaxed)); return false;
     }
     const auto source_desc = source->GetDesc();
@@ -24855,7 +24926,7 @@ bool capture_mode3_early_hud(
             D3D12_RESOURCE_STATE_COPY_DEST;
         destination_to_copy.Transition.Subresource =
             D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g_resource_barrier(
+        original(
             command_list, 1, &destination_to_copy);
     }
 
@@ -24869,7 +24940,7 @@ bool capture_mode3_early_hud(
             D3D12_RESOURCE_STATE_COPY_SOURCE;
         source_to_copy.Transition.Subresource =
             D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g_resource_barrier(command_list, 1, &source_to_copy);
+        original(command_list, 1, &source_to_copy);
     }
     command_list->CopyResource(slot.resource, source);
 
@@ -24896,7 +24967,7 @@ bool capture_mode3_early_hud(
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     destination_to_shader.Transition.Subresource =
         D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    g_resource_barrier(command_list, completed_count, completed);
+    original(command_list, completed_count, completed);
 
     slot.shader_read_state = true;
     slot.initialized = false;
@@ -29109,10 +29180,10 @@ void STDMETHODCALLTYPE hook_dispatch(
     g_dispatch(command_list, thread_group_count_x, thread_group_count_y, thread_group_count_z);
 }
 
-void STDMETHODCALLTYPE hook_resource_barrier(
+void barrier_source_body(
     ID3D12GraphicsCommandList* command_list,
     UINT num_barriers,
-    const D3D12_RESOURCE_BARRIER* barriers) {
+    const D3D12_RESOURCE_BARRIER* barriers,ResourceBarrierFn original,void* caller) {
     // [FIX:RENDERDOC-INTERNAL-BARRIER-BYPASS V1545 1/1] RenderDoc records its
     // initial-state copies on private command lists implemented by renderdoc.dll.
     // Their restore barriers are capture bookkeeping, not REDengine/AFW frame
@@ -29121,14 +29192,14 @@ void STDMETHODCALLTYPE hook_resource_barrier(
     // Bypass only the direct RenderDoc -> RenderDoc-list edge; game, Streamline,
     // ReShade and PureDark calls targeting the same wrapper remain observable.
     if (g_renderdoc_module != nullptr &&
-        module_owning_address(_ReturnAddress()) == g_renderdoc_module &&
+        module_owning_address(caller) == g_renderdoc_module &&
         classify_command_list_owner(command_list) ==
             w3vr::command_list_identity::Owner::RenderDoc) {
-        g_resource_barrier(command_list, num_barriers, barriers);
+        original(command_list, num_barriers, barriers);
         return;
     }
     if (is_reshade_immediate_command_list(command_list)) {
-        g_resource_barrier(command_list, num_barriers, barriers);
+        original(command_list, num_barriers, barriers);
         return;
     }
     const bool clean_mode3_fast_path =
@@ -29436,7 +29507,7 @@ void STDMETHODCALLTYPE hook_resource_barrier(
         }
     }
 
-    g_resource_barrier(command_list, num_barriers, barriers);
+    original(command_list, num_barriers, barriers);
     // Modern No-AA uses the eye of this exact native recording operation. The
     // source is the CURRENT game swapchain texture, held until recording ends.
     // Copies use the concrete endpoint seen by ExecuteCommandLists, which
@@ -29504,9 +29575,17 @@ void STDMETHODCALLTYPE hook_resource_barrier(
         }
     }
 }
+void STDMETHODCALLTYPE hook_resource_barrier(ID3D12GraphicsCommandList* command,UINT count,const D3D12_RESOURCE_BARRIER* barriers) {
+    if(source_wrapper_passthrough(command)){g_resource_barrier(command,count,barriers);return;}
+    barrier_source_body(command,count,barriers,g_resource_barrier,_ReturnAddress());
+}
+void STDMETHODCALLTYPE hook_modern_source_barrier(ID3D12GraphicsCommandList* command,UINT count,const D3D12_RESOURCE_BARRIER* barriers) {
+    barrier_source_body(command,count,barriers,g_modern_source_barrier,_ReturnAddress());
+}
+
 
 void install_streamline_resource_barrier_probe() {
-    std::scoped_lock mutation{g_modern_source_install_mutex};    if (g_resource_barrier != nullptr || g_d3d12_device == nullptr) {
+    std::scoped_lock mutation{g_modern_source_install_mutex};    if (g_resource_barrier != nullptr || g_modern_source_barrier != nullptr || g_d3d12_device == nullptr) {
         return;
     }
 
@@ -29523,8 +29602,9 @@ void install_streamline_resource_barrier_probe() {
 
     auto target = method<void*>(command_list, 26);
     const bool enabled=MH_CreateHook(target, reinterpret_cast<void*>(&hook_resource_barrier),
-            reinterpret_cast<void**>(&g_resource_barrier)) == MH_OK && MH_EnableHook(target) == MH_OK;
-    g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Barrier,target,
+            reinterpret_cast<void**>(&g_resource_barrier)) == MH_OK &&
+        g_legacy_source_original_routes[3].bind(target,reinterpret_cast<void*>(g_resource_barrier)) && MH_EnableHook(target) == MH_OK;
+    publish_legacy_source_receipt(w3vr::modern_backbuffer_hooks::Site::Barrier,target,
         reinterpret_cast<void*>(g_resource_barrier),enabled);
     if (enabled) {
         log_line("Streamline output ResourceBarrier probe hooked at %p", target);
