@@ -38,6 +38,7 @@
 #include "modern_eye_capture.h"
 #include "modern_eye_pair.h"
 #include "modern_eye_source_use.h"
+#include "modern_eye_resource_set.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
     D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
     D3D12_RESOURCE_STATE_PRESENT == 0 &&
@@ -48711,6 +48712,7 @@ XrTime locate_openxr_mode3_pair_pose() {
 }
 
 bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
+    std::scoped_lock lock{g_streamline_capture_mutex};
     if (g_stereo_eye_cache[0] != nullptr && g_stereo_eye_cache[1] != nullptr &&
         g_packed_present_cache[0] != nullptr && g_packed_present_cache[1] != nullptr &&
         g_stereo_eye_cache_width == source_desc.Width &&
@@ -48719,18 +48721,24 @@ bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
         return true;
     }
 
-    for (auto& cache : g_stereo_eye_cache) {
-        if (cache != nullptr) {
-            cache->Release();
-            cache = nullptr;
-        }
-    }
-    for (auto& cache : g_packed_present_cache) {
-        if (cache != nullptr) {
-            cache->Release();
-            cache = nullptr;
-        }
-    }
+    const bool modern=modern_noaa_output_requested() || g_modern_noaa_source_store.head ||
+        g_modern_packed_outputs[0].identity.profile || g_modern_packed_outputs[1].identity.profile;
+    if(modern && g_modern_noaa_consumer_blocked.load(std::memory_order_acquire))return false;
+    if(!g_d3d12_device)return false;
+    auto cache_desc=source_desc;cache_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
+    D3D12_HEAP_PROPERTIES heap_props{};heap_props.Type=D3D12_HEAP_TYPE_DEFAULT;
+    heap_props.CreationNodeMask=1;heap_props.VisibleNodeMask=1;
+    std::array<w3vr::modern_eye_resource_set::Slot,4> slots{{
+        {&g_stereo_eye_cache[0],g_xr_fence,g_stereo_eye_cache[0]?g_xr_fence_value:0,false},
+        {&g_stereo_eye_cache[1],g_xr_fence,g_stereo_eye_cache[1]?g_xr_fence_value:0,false},
+        {&g_packed_present_cache[0],g_packed_present_cache_last_use_fence[0],g_packed_present_cache_last_use_fence_value[0],false},
+        {&g_packed_present_cache[1],g_packed_present_cache_last_use_fence[1],g_packed_present_cache_last_use_fence_value[1],false}
+    }};
+    if(!w3vr::modern_eye_resource_set::replace(slots,g_modern_noaa_source_store,modern,
+        [&](size_t,ID3D12Resource** resource){return g_d3d12_device->CreateCommittedResource(
+            &heap_props,D3D12_HEAP_FLAG_NONE,&cache_desc,D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,IID_PPV_ARGS(resource));}))return false;
+    g_modern_packed_outputs={}; // Old receipts cannot name newly created textures.
     g_packed_present_cache_last_use_fence[0] = nullptr;
     g_packed_present_cache_last_use_fence[1] = nullptr;
     g_packed_present_cache_last_use_fence_value[0] = 0;
@@ -48771,36 +48779,6 @@ bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
     g_packed_last_accepted_present = UINT64_MAX;
     g_openxr_last_projection_submit_present = UINT64_MAX;
     g_packed_runtime_ready.store(false, std::memory_order_relaxed);
-
-    auto cache_desc = source_desc;
-    cache_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-    D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    heap_props.CreationNodeMask = 1;
-    heap_props.VisibleNodeMask = 1;
-
-    for (auto& cache : g_stereo_eye_cache) {
-        if (FAILED(g_d3d12_device->CreateCommittedResource(
-                &heap_props,
-                D3D12_HEAP_FLAG_NONE,
-                &cache_desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr,
-                IID_PPV_ARGS(&cache)))) {
-            return false;
-        }
-    }
-    for (auto& cache : g_packed_present_cache) {
-        if (FAILED(g_d3d12_device->CreateCommittedResource(
-                &heap_props,
-                D3D12_HEAP_FLAG_NONE,
-                &cache_desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr,
-                IID_PPV_ARGS(&cache)))) {
-            return false;
-        }
-    }
 
     g_stereo_eye_cache_width = static_cast<UINT>(source_desc.Width);
     g_stereo_eye_cache_height = source_desc.Height;
@@ -50380,7 +50358,9 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
     std::scoped_lock lock{g_streamline_capture_mutex};
     const DXGI_FORMAT capture_format =
         canonical_streamline_capture_format(source_desc.Format);
-    if (g_streamline_capture_ring[0][0].resource != nullptr &&
+    const bool complete=std::all_of(g_streamline_capture_ring.begin(),g_streamline_capture_ring.end(),
+        [](const auto& eye){return std::all_of(eye.begin(),eye.end(),[](const auto& slot){return slot.resource!=nullptr;});});
+    if (complete &&
         g_streamline_capture_width == source_desc.Width &&
         g_streamline_capture_height == source_desc.Height &&
         g_streamline_capture_format == capture_format) {
@@ -50400,19 +50380,25 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
         return true;
     }
 
-    collect_modern_noaa_source_uses();
-    bool modern_ring=modern_noaa_output_requested() || g_modern_noaa_source_store.head!=nullptr;
+    bool modern=modern_noaa_output_requested() || g_modern_noaa_source_store.head;
     for(const auto& eye_ring:g_streamline_capture_ring)for(const auto& slot:eye_ring)
-        modern_ring=modern_ring || slot.modern_output.identity.profile!=nullptr;
-    if(modern_ring)for(const auto& eye_ring:g_streamline_capture_ring)for(const auto& slot:eye_ring)
-        if(slot.recording_pending || modern_noaa_source_held(slot.resource) ||
-            !private_resource_slot_retired(slot.last_use_fence,slot.last_use_fence_value))return false;
+        modern=modern || slot.modern_output.identity.profile;
+    if(modern && g_modern_noaa_consumer_blocked.load(std::memory_order_acquire))return false;
+    if(!g_d3d12_device)return false;
+    auto capture_desc=source_desc;capture_desc.Format = capture_format;
+    capture_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
+    D3D12_HEAP_PROPERTIES heap_props{};heap_props.Type=D3D12_HEAP_TYPE_DEFAULT;
+    heap_props.CreationNodeMask=1;heap_props.VisibleNodeMask=1;
+    std::array<w3vr::modern_eye_resource_set::Slot,2*kStreamlineCaptureRingSize> slots{};
+    size_t index{};
+    for(auto& eye_ring:g_streamline_capture_ring)for(auto& slot:eye_ring)
+        slots[index++]={&slot.resource,slot.last_use_fence,slot.last_use_fence_value,slot.recording_pending};
+    if(!w3vr::modern_eye_resource_set::replace(slots,g_modern_noaa_source_store,modern,
+        [&](size_t,ID3D12Resource** resource){return g_d3d12_device->CreateCommittedResource(
+            &heap_props,D3D12_HEAP_FLAG_NONE,&capture_desc,D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,IID_PPV_ARGS(resource));}))return false;
     for (auto& eye_ring : g_streamline_capture_ring) {
         for (auto& slot : eye_ring) {
-            if (slot.resource != nullptr) {
-                slot.resource->Release();
-                slot.resource = nullptr;
-            }
             slot.last_use_fence = nullptr;
             slot.last_use_fence_value = 0;
             slot.producer_queue = nullptr;
@@ -50426,34 +50412,14 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
             slot.source_eye = UINT32_MAX;
             slot.source_eye_valid = false;
             slot.native_asymmetric_projection = false;
+            slot.render_view_valid = false;
+            slot.modern_output={};
         }
     }
     g_streamline_capture_latest_slot[0].store(UINT32_MAX);
     g_streamline_capture_latest_slot[1].store(UINT32_MAX);
 
     g_streamline_capture_pending_publications.clear();
-    auto capture_desc = source_desc;
-    capture_desc.Format = capture_format;
-    capture_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-    D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    heap_props.CreationNodeMask = 1;
-    heap_props.VisibleNodeMask = 1;
-
-    for (auto& eye_ring : g_streamline_capture_ring) {
-        for (auto& slot : eye_ring) {
-            if (FAILED(g_d3d12_device->CreateCommittedResource(
-                    &heap_props,
-                    D3D12_HEAP_FLAG_NONE,
-                    &capture_desc,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    nullptr,
-                    IID_PPV_ARGS(&slot.resource)))) {
-                return false;
-            }
-        }
-    }
-
     g_streamline_capture_width = static_cast<UINT>(source_desc.Width);
     g_streamline_capture_height = source_desc.Height;
     g_streamline_capture_format = capture_format;
