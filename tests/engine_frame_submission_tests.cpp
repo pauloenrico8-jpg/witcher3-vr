@@ -6,7 +6,10 @@
 
 namespace submission = w3vr::frame_submission;
 
+int checks{};
+const submission::Profile* fixture_profile=&submission::remastered_500c;
 void require(bool condition, const char* message) {
+    ++checks;
     if (!condition) { std::cerr << message << '\n'; std::exit(1); }
 }
 
@@ -67,7 +70,7 @@ void __fastcall release_owned_frame(void* raw_frame) {
 
 submission::NativeCommandRoute route() {
     return {allocate_command, construct_command, dispatch_command,
-        &unavailable_command, true};
+        &unavailable_command, true,fixture_profile};
 }
 
 void reset() {
@@ -140,11 +143,38 @@ void test_invalid_owned_frame_contract() {
         "Invalid ownership contract caused native work");
 }
 
+void test_profile_selection_and_rejection() {
+    const auto* contract=fixture_profile==&submission::remastered_500c ?
+        &w3vr::engine_camera::remastered_500c : &w3vr::engine_camera::remastered_1048522;
+    auto copied_contract=*contract;
+    const auto copied_profile=*fixture_profile;
+    require(submission::selected(contract)==fixture_profile && submission::known(fixture_profile),
+        "Exact submission contract rejected");
+    require(!submission::known(&copied_profile) && !submission::known(nullptr) &&
+        submission::selected(&copied_contract)==nullptr && submission::selected(nullptr)==nullptr &&
+        submission::selected(&w3vr::engine_camera::legacy_404)==nullptr,
+        "Copied/unknown/legacy contract silently selected submission");
+    for(const auto* invalid:{static_cast<const submission::Profile*>(nullptr),&copied_profile}) {
+        reset();Frame frame;auto invalid_route=route();invalid_route.profile=invalid;
+        require(submission::submit_owned_frame(invalid_route,&frame,release_owned_frame)==submission::Result::unavailable,
+            "Unknown/copied route accepted");
+        require(events=="R" && owned_releases==1 && frame.destroyed && command_frame==nullptr,
+            "Rejected route allocated or mishandled its owned frame");
+    }
+}
 int main() {
-    test_deferred_and_immediate_command_lifetimes();
-    test_missing_native_dependencies();
-    test_allocation_rejection();
-    test_invalid_owned_frame_contract();
-    std::cout << "Frame command ownership, native sentinel and immediate/deferred "
-        "completion passed using simulated native functions only.\n";
+    int profile_checks{};
+    for(const auto* profile:{&submission::remastered_500c,&submission::remastered_1048522}) {
+        fixture_profile=profile;
+        test_deferred_and_immediate_command_lifetimes();
+        test_missing_native_dependencies();
+        test_allocation_rejection();
+        test_invalid_owned_frame_contract();
+        const auto before=checks;
+        test_profile_selection_and_rejection();
+        profile_checks+=checks-before;
+    }
+    std::cout << checks << " CPU checks; " << profile_checks << " new profile checks. "
+        "Both versions preserve native sentinel and immediate/deferred ownership. "
+        "Simulated functions did not execute Native code, the game, GPU or Quest.\n";
 }

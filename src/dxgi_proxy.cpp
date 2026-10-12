@@ -2372,6 +2372,7 @@ w3vr::frame_preparation::PrepareFrame g_remastered_effects_apply{};
 w3vr::frame_submission::ConstructCommand g_remastered_command_construct{};
 std::atomic<bool> g_remastered_preparation_hooks_ready{};
 std::atomic<bool> g_remastered_preparation_install_attempted{};
+std::atomic<const w3vr::frame_preparation::Profile*> g_remastered_preparation_installed_profile{};
 using EngineViewRebuildFn = void(__fastcall*)(float*);
 EngineViewRebuildFn g_engine_view_rebuild{};
 using EngineViewCopyRebuildFn = float*(__fastcall*)(float*, const float*);
@@ -41597,6 +41598,7 @@ bool install_remastered_queue_lifecycle_hooks() {
 }
 
 struct RemasteredPreparationContext {
+    const w3vr::frame_preparation::Profile* profile{};
     w3vr::modern_command_queue::Identity command_queue{};
     w3vr::modern_queue_lifecycle::Snapshot queue_observation{};
     void* world_handle{};
@@ -41660,75 +41662,68 @@ bool remastered_primary_command_matches(const w3vr::modern_command_queue::Identi
 // The optional world callback is accepted only when its actual vtable slot
 // points to the examined RET 0 leaf. Engine+40 callbacks may change shared
 // state; defer support for those cases until their role is established.
-bool read_remastered_preparation_context(uintptr_t module, void* game,
+bool remastered_preparation_ready_for(const w3vr::engine_camera::TemporalContract* contract) {
+    return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) &&
+        w3vr::frame_preparation::ready_for(contract,
+            g_remastered_preparation_installed_profile.load(std::memory_order_acquire),
+            g_remastered_queue_installed_profile.load(std::memory_order_acquire),
+            g_remastered_preparation_hooks_ready.load(std::memory_order_acquire),remastered_queue_ready_for(contract));
+}
+bool read_remastered_preparation_context(uintptr_t module,
+    const w3vr::engine_camera::TemporalContract* contract,void* game,
     RemasteredPreparationContext& context) {
-    context = {};
-    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
-    // This preparation context still uses the old independently examined engine
-    // and effects globals. A current queue profile must not admit those reads.
-    if (module==0 || game==nullptr || contract!=&w3vr::engine_camera::remastered_500c ||
-        !remastered_queue_ready_for(contract)) return false;
+    context={};
+    const auto* profile=w3vr::frame_preparation::selected(contract);
+    if(module==0 || game==nullptr || !profile || !remastered_preparation_ready_for(contract))return false;
+    RemasteredPreparationContext candidate{};candidate.profile=profile;
     __try {
-        memcpy(&context.world_handle, static_cast<const uint8_t*>(game) + 0x100,
-            sizeof(context.world_handle));
-        if (context.world_handle == nullptr) return false;
-        memcpy(&context.world_receiver,
-            static_cast<const uint8_t*>(context.world_handle) + 8,
-            sizeof(context.world_receiver));
-        if (context.world_receiver != nullptr) {
-            const auto* world_vtable = *reinterpret_cast<const uintptr_t* const*>(
-                context.world_receiver);
-            const auto callback = module +
-                w3vr::frame_preparation::empty_world_callback_rva;
-            if (world_vtable[10] != callback) return false;
-            const auto* code = reinterpret_cast<const uint8_t*>(callback);
-            if (code[0] != 0xC2 || code[1] != 0 || code[2] != 0) return false;
+        memcpy(&candidate.world_handle,static_cast<const uint8_t*>(game)+0x100,sizeof(candidate.world_handle));
+        if(!candidate.world_handle)return false;
+        memcpy(&candidate.world_receiver,static_cast<const uint8_t*>(candidate.world_handle)+8,sizeof(candidate.world_receiver));
+        if(candidate.world_receiver){
+            const auto* table=*reinterpret_cast<const uintptr_t* const*>(candidate.world_receiver);
+            const auto callback=table[10];
+            // Only the independently examined exact RET 0 leaf is accepted.
+            // Its code checks are not proof of receiver ownership or lifetime.
+            if(!w3vr::frame_preparation::empty_callback(profile,module,callback,
+                std::span<const uint8_t>{reinterpret_cast<const uint8_t*>(callback),3}))return false;
         }
-        memcpy(&context.engine, reinterpret_cast<const void*>(module +
-            w3vr::frame_preparation::engine_global_rva), sizeof(context.engine));
-        memcpy(&context.effects_state, reinterpret_cast<const void*>(module + 0x05A51E98),
-            sizeof(context.effects_state));
-        memcpy(&context.effects_world, reinterpret_cast<const void*>(module + 0x05A51930),
-            sizeof(context.effects_world));
-        if (context.engine == nullptr) return false;
-        const auto* engine_vtable = *reinterpret_cast<const uintptr_t* const*>(
-            context.engine);
-        if (reinterpret_cast<uintptr_t>(engine_vtable) != module +
-                w3vr::frame_preparation::engine_vtable_rva ||
-            engine_vtable[13] != module + w3vr::frame_preparation::engine_prepare_rva)
-            return false;
+        memcpy(&candidate.engine,reinterpret_cast<const void*>(module+profile->engine_global),sizeof(candidate.engine));
+        memcpy(&candidate.effects_state,reinterpret_cast<const void*>(module+profile->effects_state_global),sizeof(candidate.effects_state));
+        memcpy(&candidate.effects_world,reinterpret_cast<const void*>(module+profile->effects_world_global),sizeof(candidate.effects_world));
+        if(!candidate.engine)return false;
+        const auto* table=*reinterpret_cast<const uintptr_t* const*>(candidate.engine);
+        if(reinterpret_cast<uintptr_t>(table)!=module+profile->engine_vtable || table[13]!=module+profile->hooks[1].rva)return false;
         void* shared_callback{};
-        memcpy(&shared_callback, static_cast<const uint8_t*>(context.engine) + 0x40,
-            sizeof(shared_callback));
-        return shared_callback == nullptr &&
-            remastered_queue_ready_for(contract) &&
-            read_remastered_command_queue(module,contract,context.command_queue) &&
-            g_remastered_queue_observations.snapshot(context.command_queue,context.queue_observation);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        context = {};
-        return false;
-    }
+        memcpy(&shared_callback,static_cast<const uint8_t*>(candidate.engine)+0x40,sizeof(shared_callback));
+        if(shared_callback!=nullptr || !remastered_preparation_ready_for(contract) ||
+            !read_remastered_command_queue(module,contract,candidate.command_queue) ||
+            candidate.command_queue.profile!=profile->lifecycle->queue ||
+            !g_remastered_queue_observations.snapshot(candidate.command_queue,candidate.queue_observation) ||
+            !remastered_preparation_ready_for(contract))return false;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    context=candidate;return true;
 }
 
 struct RemasteredProducerScope;
 thread_local RemasteredProducerScope* g_remastered_producer_scope{};
-
 struct RemasteredProducerScope {
-    explicit RemasteredProducerScope(void* native_game) : game(native_game),
-        previous(g_remastered_producer_scope) { g_remastered_producer_scope = this; }
-    ~RemasteredProducerScope() {
-        // Keep this scope current during cancellation; nested producers restore
-        // their parent without sharing an owned duplicate across threads.
-        pair.cancel();
-        g_remastered_producer_scope = previous;
-    }
+    RemasteredProducerScope(void* native_game,const w3vr::engine_camera::TemporalContract* captured)
+        :game(native_game),contract(captured),
+        profile(g_remastered_preparation_installed_profile.load(std::memory_order_acquire)),
+        admitted(native_game && remastered_preparation_ready_for(captured) &&
+            w3vr::frame_preparation::selected(captured)==profile),
+        binding(g_remastered_producer_scope,this,admitted){}
+    ~RemasteredProducerScope(){pair.cancel();}
     void* game{};
+    const w3vr::engine_camera::TemporalContract* contract{};
+    const w3vr::frame_preparation::Profile* profile{};
+    bool admitted{};
     RemasteredPreparationContext context{};
-    uint64_t pair_id{};
-    uint64_t present{};
+    uint64_t pair_id{},present{};
     bool factory_reserved{};
     w3vr::frame_preparation::PendingPair pair{};
-    RemasteredProducerScope* previous{};
+    w3vr::frame_preparation::ScopedProducer<RemasteredProducerScope> binding;
 };
 
 void invalidate_remastered_prepared_pair(void* owner, void* primary, void* duplicate) {
@@ -41743,162 +41738,151 @@ void invalidate_remastered_prepared_pair(void* owner, void* primary, void* dupli
         static_cast<unsigned long long>(scope->pair_id));
 }
 
+bool remastered_scope_current(const RemasteredProducerScope* scope,
+    const w3vr::engine_camera::TemporalContract* contract) {
+    return scope && scope->admitted && scope->contract==contract &&
+        w3vr::frame_preparation::selected(contract)==scope->profile && remastered_preparation_ready_for(contract);
+}
 void* allocate_remastered_command_in_captured_queue() {
     namespace cq=w3vr::modern_command_queue;
     const auto* scope=g_remastered_producer_scope;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     RemasteredPreparationContext current{};
-    if(!scope || !g_remastered_preparation_hooks_ready.load(std::memory_order_acquire) ||
-        selected_scene_factory_version()!=w3vr::scene_factory::Version::remastered_500c ||
-        !read_remastered_preparation_context(module,scope->game,current) || current!=scope->context)return nullptr;
-    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if(!remastered_scope_current(scope,contract) ||
+        !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context)return nullptr;
     const auto* profile=cq::selected(contract);
-    if(!profile || profile!=scope->context.command_queue.profile || !remastered_queue_ready_for(contract))return nullptr;
+    if(!profile || profile!=scope->context.command_queue.profile || profile!=scope->profile->lifecycle->queue)return nullptr;
     uintptr_t entry{},end{};
     if(!cq::add(module,profile->payload_allocator,entry) || !cq::add(entry,profile->allocator_prefix.size(),end))return nullptr;
     __try {
         if(std::memcmp(reinterpret_cast<const void*>(entry),profile->allocator_prefix.data(),profile->allocator_prefix.size())!=0)return nullptr;
     } __except(EXCEPTION_EXECUTE_HANDLER) {return nullptr;}
-    if(!remastered_queue_ready_for(contract))return nullptr;
+    if(!remastered_scope_current(scope,contract))return nullptr;
     return cq::allocate_bound(cq::Allocator{profile,reinterpret_cast<cq::AllocatePayload>(entry)},
         scope->context.command_queue,current.command_queue);
 }
-
-w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(
-    uintptr_t module) {
+w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(uintptr_t module,
+    const w3vr::engine_camera::TemporalContract* contract,const w3vr::frame_preparation::Profile* profile) {
     w3vr::frame_submission::NativeCommandRoute route{};
-    if (module == 0) return route;
-    route.allocate = &allocate_remastered_command_in_captured_queue;
-    // Use the trampoline, never our command hook recursively.
-    route.construct = g_remastered_command_construct;
-    route.dispatch = reinterpret_cast<w3vr::frame_submission::DispatchCommand>(
-        module + w3vr::frame_submission::command_dispatch_rva);
-    route.unavailable_command = reinterpret_cast<void*>(
-        module + w3vr::frame_submission::unavailable_command_rva);
-    route.renderer_ready = remastered_command_renderer_ready(module) &&
-        g_remastered_preparation_hooks_ready.load(std::memory_order_acquire) &&
-        selected_scene_factory_version() == w3vr::scene_factory::Version::remastered_500c;
+    if(!module || !w3vr::frame_preparation::known(profile) ||
+        w3vr::frame_preparation::selected(contract)!=profile || !remastered_preparation_ready_for(contract))return route;
+    route.profile=profile->submission;
+    route.allocate=&allocate_remastered_command_in_captured_queue;
+    // Only the matching installed bundle may supply this original trampoline.
+    route.construct=g_remastered_command_construct;
+    route.dispatch=reinterpret_cast<w3vr::frame_submission::DispatchCommand>(module+profile->submission->dispatch);
+    route.unavailable_command=reinterpret_cast<void*>(module+profile->submission->unavailable);
+    route.renderer_ready=remastered_command_renderer_ready(module) && remastered_preparation_ready_for(contract);
     return route;
 }
-
-void __fastcall hook_remastered_producer(void* game, float delta) {
-    RemasteredProducerScope scope{game};
-    g_remastered_producer(game, delta);
+void __fastcall hook_remastered_producer(void* game,float delta) {
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    RemasteredProducerScope scope{game,contract};
+    g_remastered_producer(game,delta);
 }
-
-void __fastcall hook_remastered_engine_prepare(void* engine, void* frame) {
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
-    g_remastered_engine_prepare(engine, frame);
-    auto* scope = g_remastered_producer_scope;
-    if (scope != nullptr && caller ==
-            w3vr::frame_preparation::engine_prepare_return_rva &&
-        scope->pair.accepts(frame)) {
+void __fastcall hook_remastered_engine_prepare(void* engine,void* frame) {
+    namespace prep=w3vr::frame_preparation;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto* scope=g_remastered_producer_scope;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
+    const bool admitted=remastered_scope_current(scope,contract) &&
+        prep::allows(scope->profile,prep::Boundary::prepare,caller) && scope->pair.accepts(frame);
+    prep::ScopedProducer binding(g_remastered_producer_scope,scope,admitted);
+    g_remastered_engine_prepare(engine,frame);
+    if(binding.admitted()){
+        if(!remastered_scope_current(scope,contract)){scope->pair.cancel();return;}
         RemasteredPreparationContext current{};
-        const bool context_matches = read_remastered_preparation_context(
-            module, scope->game, current) && current == scope->context &&
-            engine == current.engine;
-        scope->pair.observe_engine(frame, engine, g_remastered_engine_prepare,
-            context_matches);
+        const bool matched=read_remastered_preparation_context(module,contract,scope->game,current) &&
+            current==scope->context && engine==current.engine;
+        scope->pair.observe_engine(scope->profile,frame,engine,g_remastered_engine_prepare,matched);
     }
 }
-
-void __fastcall hook_remastered_effects_tick(void* first_argument, float delta) {
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
-    g_remastered_effects_tick(first_argument, delta);
-    if (auto* scope = g_remastered_producer_scope;
-        scope != nullptr && caller == w3vr::frame_preparation::effects_tick_return_rva)
-        scope->pair.observe_effects_tick();
-}
-
-void __fastcall hook_remastered_effects_apply(void* first_argument, void* frame) {
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
-    g_remastered_effects_apply(first_argument, frame);
-    if (auto* scope = g_remastered_producer_scope;
-        scope != nullptr && caller == w3vr::frame_preparation::effects_apply_return_rva)
-        scope->pair.observe_effects(frame, first_argument, g_remastered_effects_apply);
-}
-
-void* __fastcall hook_remastered_command_construct(void* command, void* frame,
-    void* auxiliary) {
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
-    // Preserve the natural command and its independent reference first.
-    void* result = g_remastered_command_construct(command, frame, auxiliary);
-    if (auto* scope = g_remastered_producer_scope;
-        scope != nullptr && auxiliary == nullptr &&
-        caller == w3vr::frame_preparation::command_construct_return_rva &&
-        scope->pair.accepts(frame)) {
+void __fastcall hook_remastered_effects_tick(void* first_argument,float delta) {
+    namespace prep=w3vr::frame_preparation;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto* scope=g_remastered_producer_scope;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
+    const bool admitted=remastered_scope_current(scope,contract) && scope->pair.pending() &&
+        prep::allows(scope->profile,prep::Boundary::tick,caller);
+    prep::ScopedProducer binding(g_remastered_producer_scope,scope,admitted);
+    // Preserve RCX and the float argument without inventing a receiver meaning.
+    g_remastered_effects_tick(first_argument,delta);
+    if(binding.admitted()){
         RemasteredPreparationContext current{};
-        const bool context_matches = read_remastered_preparation_context(
-            module, scope->game, current) && current == scope->context && result==command &&
-            remastered_primary_command_matches(current.command_queue,command,frame);
-        const auto completion = scope->pair.at_native_command(frame,
-            remastered_prepared_command_route(module), context_matches);
-        if (completion == w3vr::frame_preparation::PendingPair::Completion::dispatched &&
-            g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1) < 2)
-            log_line("Remastered duplicate prepared and dispatched pair=%llu",
-                static_cast<unsigned long long>(scope->pair_id));
+        if(!remastered_scope_current(scope,contract) ||
+            !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context){scope->pair.cancel();return;}
+        scope->pair.observe_effects_tick(scope->profile);
+    }
+}
+void __fastcall hook_remastered_effects_apply(void* first_argument,void* frame) {
+    namespace prep=w3vr::frame_preparation;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto* scope=g_remastered_producer_scope;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
+    const bool admitted=remastered_scope_current(scope,contract) && scope->pair.accepts(frame) &&
+        prep::allows(scope->profile,prep::Boundary::apply,caller);
+    prep::ScopedProducer binding(g_remastered_producer_scope,scope,admitted);
+    g_remastered_effects_apply(first_argument,frame);
+    if(binding.admitted()){
+        RemasteredPreparationContext current{};
+        if(!remastered_scope_current(scope,contract) ||
+            !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context){scope->pair.cancel();return;}
+        scope->pair.observe_effects(scope->profile,frame,first_argument,g_remastered_effects_apply);
+    }
+}
+void* __fastcall hook_remastered_command_construct(void* command,void* frame,void* auxiliary) {
+    namespace prep=w3vr::frame_preparation;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto* scope=g_remastered_producer_scope;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
+    const bool admitted=remastered_scope_current(scope,contract) && auxiliary==nullptr &&
+        scope->pair.accepts(frame) && prep::allows(scope->profile,prep::Boundary::construct,caller);
+    prep::ScopedProducer binding(g_remastered_producer_scope,scope,admitted);
+    void* result=g_remastered_command_construct(command,frame,auxiliary);
+    if(binding.admitted()){
+        if(!remastered_scope_current(scope,contract)){scope->pair.cancel();return result;}
+        RemasteredPreparationContext current{};
+        const bool matched=read_remastered_preparation_context(module,contract,scope->game,current) &&
+            current==scope->context && result==command && remastered_primary_command_matches(current.command_queue,command,frame);
+        const auto completion=scope->pair.at_native_command(frame,remastered_prepared_command_route(module,contract,scope->profile),matched);
+        if(completion==prep::PendingPair::Completion::dispatched && g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1)<2)
+            log_line("Remastered duplicate prepared and dispatched pair=%llu",static_cast<unsigned long long>(scope->pair_id));
     }
     return result;
 }
-
 bool install_remastered_preparation_hooks() {
-    if (g_remastered_preparation_hooks_ready.load(std::memory_order_acquire)) return true;
-    // Keep any trampolines from a failed enable alive; do not retry against a
-    // partially installed set or remove code a suspended hook could still use.
-    // Retaining originals closes this failure race, not the DLL unload barrier.
-    if (selected_scene_factory_version() != w3vr::scene_factory::Version::remastered_500c)
-        return false;
-    if (g_remastered_preparation_install_attempted.exchange(true, std::memory_order_acq_rel))
-        return false;
-    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    if (module == nullptr) return false;
-    struct Hook { uint32_t rva; void* replacement; void** original; };
-    const std::array<Hook, 5> hooks{{
-        {w3vr::frame_preparation::producer_rva, reinterpret_cast<void*>(&hook_remastered_producer),
-            reinterpret_cast<void**>(&g_remastered_producer)},
-        {w3vr::frame_preparation::engine_prepare_rva, reinterpret_cast<void*>(&hook_remastered_engine_prepare),
-            reinterpret_cast<void**>(&g_remastered_engine_prepare)},
-        {w3vr::frame_preparation::effects_tick_rva, reinterpret_cast<void*>(&hook_remastered_effects_tick),
-            reinterpret_cast<void**>(&g_remastered_effects_tick)},
-        {w3vr::frame_preparation::effects_apply_rva, reinterpret_cast<void*>(&hook_remastered_effects_apply),
-            reinterpret_cast<void**>(&g_remastered_effects_apply)},
-        {w3vr::frame_submission::command_constructor_rva, reinterpret_cast<void*>(&hook_remastered_command_construct),
-            reinterpret_cast<void**>(&g_remastered_command_construct)},
-    }};
-    size_t created{};
-    for (const auto& hook : hooks) {
-        if (MH_CreateHook(module + hook.rva, hook.replacement, hook.original) != MH_OK) break;
-        ++created;
-    }
-    bool queued = created == hooks.size();
-    if (queued) for (const auto& hook : hooks) {
-        if (MH_QueueEnableHook(module + hook.rva) != MH_OK) { queued = false; break; }
-    }
-    if (!queued) {
-        for (size_t n = 0; n < created; ++n) {
-            // Cancel only our queued changes. A hook body may already be in
-            // flight after another batch activation; keep its original alive.
-            MH_QueueDisableHook(module + hooks[n].rva);
-            MH_DisableHook(module + hooks[n].rva);
-        }
-        log_line("Remastered preparation hook installation failed; factory not enabled");
-        return false;
-    }
-    if (MH_ApplyQueued() != MH_OK) {
-        for (const auto& hook : hooks) {
-            MH_QueueDisableHook(module + hook.rva);
-            MH_DisableHook(module + hook.rva);
-        }
-        log_line("Remastered preparation hook enable failed; duplicate production disabled");
-        return false;
-    }
-    g_remastered_preparation_hooks_ready.store(true, std::memory_order_release);
-    log_line("Remastered producer preparation hooks installed; full version gate still required");
-    return true;
+    namespace prep=w3vr::frame_preparation;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* profile=prep::selected(contract);
+    if(!profile || !remastered_queue_ready_for(contract))return false;
+    if(g_remastered_preparation_hooks_ready.load(std::memory_order_acquire))return remastered_preparation_ready_for(contract);
+    if(g_remastered_preparation_install_attempted.exchange(true,std::memory_order_acq_rel))return false;
+    auto* module=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if(!module)return false;
+    struct Hook {void* replacement;void** original;};
+    const std::array<Hook,5> hooks{{
+        {reinterpret_cast<void*>(&hook_remastered_producer),reinterpret_cast<void**>(&g_remastered_producer)},
+        {reinterpret_cast<void*>(&hook_remastered_engine_prepare),reinterpret_cast<void**>(&g_remastered_engine_prepare)},
+        {reinterpret_cast<void*>(&hook_remastered_effects_tick),reinterpret_cast<void**>(&g_remastered_effects_tick)},
+        {reinterpret_cast<void*>(&hook_remastered_effects_apply),reinterpret_cast<void**>(&g_remastered_effects_apply)},
+        {reinterpret_cast<void*>(&hook_remastered_command_construct),reinterpret_cast<void**>(&g_remastered_command_construct)}}};
+    for(const auto& target:profile->hooks)if(!remastered_render_entry_matches(module+target.rva,target.prefix))return false;
+    const auto current=[contract](){return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) && remastered_queue_ready_for(contract);};
+    if(!current())return false;
+    g_remastered_preparation_installed_profile.store(profile,std::memory_order_release);
+    const bool installed=prep::install_observers(contract,profile,
+        [&](size_t i){return MH_CreateHook(module+profile->hooks[i].rva,hooks[i].replacement,hooks[i].original)==MH_OK;},
+        [&](size_t i){return MH_EnableHook(module+profile->hooks[i].rva)==MH_OK;},
+        [&](size_t i){MH_DisableHook(module+profile->hooks[i].rva);},current);
+    if(!installed){log_line("Remastered preparation observers incomplete; admission closed, originals retained");return false;}
+    g_remastered_preparation_hooks_ready.store(true,std::memory_order_release);
+    log_line("Remastered preparation observers installed for selected profile; full version gate still required");
+    return remastered_preparation_ready_for(contract);
 }
 
 void* invoke_engine_frame_factory_with_camera_context(void* render_context,
@@ -42054,12 +42038,11 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     if (duplicate_render && remastered_factory) {
         auto* scope = g_remastered_producer_scope;
         RemasteredPreparationContext context{};
-        duplicate_render = remastered_camera_copy_ready_for(
-            g_engine_camera_temporal_contract.load(std::memory_order_acquire)) &&
-            g_remastered_preparation_hooks_ready.load(std::memory_order_acquire) &&
-            caller_rva == w3vr::frame_preparation::factory_return_rva &&
-            scope != nullptr && !scope->factory_reserved && scope->pair.available() &&
-            read_remastered_preparation_context(module, scope->game, context);
+        duplicate_render = remastered_camera_copy_ready_for(factory_contract) &&
+            remastered_scope_current(scope,factory_contract) &&
+            w3vr::frame_preparation::allows(scope->profile,w3vr::frame_preparation::Boundary::factory,caller_rva) &&
+            !scope->factory_reserved && scope->pair.available() &&
+            read_remastered_preparation_context(module,factory_contract,scope->game,context);
         if (duplicate_render) {
             scope->factory_reserved = true;
             scope->context = context;
@@ -42448,11 +42431,11 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 auto* scope = g_remastered_producer_scope;
                 const auto* vtable = *reinterpret_cast<void***>(right_frame_data);
                 const auto release = reinterpret_cast<w3vr::frame_submission::ReleaseFrame>(vtable[2]);
-                if (scope != nullptr && duplicate_camera_sequence && remastered_pair_pose_prepared &&
+                if (remastered_scope_current(scope,factory_contract) && duplicate_camera_sequence && remastered_pair_pose_prepared &&
                     g_streamline_capture_generation.load(std::memory_order_acquire) == remastered_pair_generation) {
                     scope->pair_id = pair_id;
                     scope->present = present;
-                    duplicate_deferred = scope->pair.arm(result, right_frame_data, release,
+                    duplicate_deferred = scope->pair.arm(scope->profile,result, right_frame_data, release,
                         invalidate_remastered_prepared_pair, scope);
                 }
                 if (!duplicate_deferred) release(right_frame_data);

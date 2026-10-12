@@ -6,6 +6,70 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Preparação e envio do quadro ligados à mesma versão — 11 de outubro
+
+Adaptei a preparação dos quadros e dos efeitos à atualização atual. Um quadro
+é o conjunto de dados que o jogo usa para desenhar uma imagem. A mudança
+acompanha a preparação normal antes de preparar e enviar a cópia extra;
+essa parte, isoladamente, ainda não produz imagens no headset.
+
+O fluxo, passo a passo:
+
+1. Escolhe a lista da versão já identificada e exige que a instalação da fila
+   pertença à mesma versão. A lista reúne cinco funções, os pontos de onde
+   devem ser chamadas e os dados usados por elas. Versões ausentes, copiadas,
+   desconhecidas ou misturadas não ganham uma lista por padrão.
+2. Confere o início completo das cinco funções, cria as cinco ligações e
+   depois ativa as cinco. Faz uma única tentativa. Só declara prontidão após
+   todas passarem e a seleção continuar igual. Uma falha desativa as ligações
+   já ativadas e conserva os caminhos para encaminhar chamadas originais.
+3. Ao entrar na preparação normal, guarda a versão e a permissão daquela
+   entrada. Uma entrada rejeitada esconde temporariamente o contexto anterior;
+   terminar a instalação durante a chamada não a transforma em entrada aceita.
+   Ao sair, restaura o contexto anterior, inclusive numa exceção comum de C++,
+   que é um erro tratado pela própria linguagem. Isso não testa falhas de memória.
+4. Confere os dados reais do responsável pelo desenho, da fila e dos efeitos.
+   Se houver uma chamada extra do mundo, só aceita o alvo conhecido da mesma
+   versão que comprovadamente não faz trabalho. Conserva a chamada original
+   do jogo. Não repete atualizações de objetos nem tenta manter objetos vivos
+   apenas porque duas leituras de seus endereços coincidem.
+5. Acompanha a preparação original do quadro principal, o avanço do tempo
+   dos efeitos e a aplicação desses efeitos. Encaminha os argumentos originais
+   e confere novamente versão, dados e ordem depois da chamada. O quadro
+   principal continua sob controle do jogo; apenas a cópia extra fica pendente.
+6. No ponto normal de construção do comando, prepara a cópia extra e aplica
+   os efeitos observados. Não avança seu tempo novamente. Reserva o comando
+   na mesma fila capturada, usa a construção e o envio da mesma versão e
+   preserva as referências originais, que são os registros de uso do objeto.
+7. Uma mudança de versão, dados, ordem ou rota descarta a cópia pendente sem
+   consumir o quadro principal. Retira a cópia do estado pendente antes de
+   chamar as funções originais, evitando que uma chamada feita por dentro
+   tente enviar ou liberar essa mesma cópia uma segunda vez.
+
+`engine_frame_preparation.h` reúne as listas, a instalação, os contextos e a
+cópia pendente; `engine_frame_submission.h` limita o envio à lista conhecida;
+`dxgi_proxy.cpp` liga essas regras às chamadas do jogo. Escolhi observar a
+preparação natural para conservar sua ordem e o único avanço do tempo dos
+efeitos. Não deduzi que argumentos temporários pertencem a um objeto específico.
+
+A DLL compilou e **112/112 testes passaram em 9,51 segundos**. Os testes de
+preparação fizeram **1.648 verificações na CPU**, incluindo 1.288 novos casos
+de versões, contextos e instalação; os de envio fizeram **114 verificações**,
+incluindo 16 novos casos de seleção. As rotinas de ordem e uso dos objetos
+foram executadas para ambas as versões. As falhas de cada criação e ativação,
+mudanças durante a instalação, misturas, chamadas internas, saída por erro
+e conclusão imediata ou adiada usam dados fabricados e funções substitutas.
+Não executaram funções do jogo, instalação real dos interceptadores, falhas
+reais de memória, GPU, Quest, mãos ou combate. As análises novas são privadas.
+
+**O VR ainda não funciona e nada experimental foi instalado.** O bloqueio geral
+de compatibilidade continua igual. Preparação e envio reconhecidos não provam
+que existam duas imagens novas do mesmo par, que os efeitos e seus históricos
+estejam separados corretamente, nem que os objetos permaneçam vivos durante
+execução, troca de tamanho ou retirada da DLL. Esses pontos continuam pendentes.
+Primeiro imagens reais no PC; depois Quest, cabeça, mãos, armas, dano e bloqueio
+físicos. A meta de 60 FPS permanece cancelada.
+
 ## Fila de quadros ligada à instalação da mesma versão — 11 de outubro
 
 Adaptei os pontos que acompanham a criação, a parada e a destruição da fila
