@@ -115,6 +115,10 @@ if(BUILD_TESTING)
     add_test(NAME modern_captured_native_command_queue COMMAND w3vr_modern_command_queue_tests)
 
     # Physical D3D12 probe; runs separately from the game and OpenXR.
+    add_executable(w3vr_modern_hook_original_tests tests/modern_hook_original_tests.cpp)
+    target_include_directories(w3vr_modern_hook_original_tests PRIVATE src)
+    add_test(NAME modern_hook_original_receiver_routing COMMAND w3vr_modern_hook_original_tests)
+
     add_executable(w3vr_modern_eye_source_use_gpu tests/modern_eye_source_use_gpu.cpp src/modern_dlss_ownership.cpp)
     target_include_directories(w3vr_modern_eye_source_use_gpu PRIVATE src)
     target_compile_definitions(w3vr_modern_eye_source_use_gpu PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

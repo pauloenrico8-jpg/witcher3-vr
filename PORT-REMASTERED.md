@@ -7,6 +7,57 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+
+## Funções originais separadas por rota — 12 de outubro
+
+A captura moderna agora guarda suas próprias funções originais do DirectX.
+Antes, a mesma variável podia conter uma função de um intermediário do SDK e
+ser usada por uma chamada nativa. Esses objetos precisam receber a função
+correspondente à interface que realmente fez a chamada.
+
+O fluxo, passo a passo:
+
+1. A instalação moderna usa quatro funções próprias: iniciar uma gravação,
+   enviar listas à placa de vídeo, fechar uma gravação e mudar o estado de uma
+   textura. Seus destinos e funções originais ficam separados dos intermediários.
+2. Se o projeto já instalou uma dessas funções nativas, só a reutiliza com a
+   comprovação do mesmo destino, mesma função original e ativação concluída.
+   Uma função apenas criada, um intermediário ou uma ligação parcial não basta.
+   Uma falha conserva os originais; não remove, troca ou tenta instalar de novo.
+3. Cada chamada encaminha os mesmos objetos, quantidade, array e retorno à
+   função original de sua rota. No modo moderno, o intermediário apenas encaminha;
+   a observação pertence ao ponto nativo mais profundo. Assim a identidade do
+   intermediário não recebe a época de gravação da lista nativa.
+4. Duas operações internas que chamavam diretamente uma função de mudança de
+   estado agora conferem o método da lista recebida. Usam a função conservada
+   para aquele destino exato; uma associação desconhecida ou ambígua não modifica
+   a textura. A chamada normal do jogo continua com seu original correspondente.
+5. Os corpos comuns recebem a função original como argumento explícito. O
+   endereço do chamador também é capturado na entrada real e passado adiante,
+   preservando a distinção existente dos comandos internos do RenderDoc.
+
+`modern_hook_original.h` conserva as associações de destino e original;
+`dxgi_proxy.cpp` separa instalação e encaminhamento; os testes conferem a seleção,
+publicação entre threads e a preservação das chamadas. Escolhi guardar as duas
+rotas porque obter uma interface nativa não transforma uma função do intermediário
+em uma função nativa. Essa associação não prova, sozinha, ativação da ligação,
+vida útil do motor, conclusão da placa de vídeo ou retirada segura da DLL.
+
+A DLL compilou; **114/114 testes passaram em 9,79 segundos**. O programa gráfico
+separado realizou **62 cópias reais com pixels conferidos**. Nele, as quatro
+funções do DirectX foram interceptadas de verdade; a seleção usou o método real
+recebido e o mesmo original conservado. Reutilizou três ligações nativas existentes
+e instalou a quarta. Quantidade e array de duas listas ficaram intactos. Os
+intermediários do teste CPU são simulados; esse teste não executa o SDK. Falhas de
+sinal, alocação e ativação dos cenários anteriores continuam artificiais.
+
+**O VR ainda não funciona.** Essa rodada não inicializou o SDK nem executou o
+Witcher, suas câmeras, OpenXR ou Quest. O teste real dos intermediários com os
+quatro observadores ainda falta. A seleção global continua limitada à versão
+antiga aceita; o caminho Remastered permanece fechado. Nada experimental foi
+instalado no jogo. Os próximos passos incluem as chamadas reais do motor, câmeras
+e históricos por olho, recursos e produção de duas imagens novas por quadro.
+
 ## Dispositivo e filas com aquisição própria — 12 de outubro
 
 O registro gráfico moderno agora conserva separadamente o objeto recebido na

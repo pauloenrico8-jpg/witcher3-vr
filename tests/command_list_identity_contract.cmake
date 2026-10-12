@@ -17,7 +17,9 @@ foreach(required IN ITEMS
         "[FIX:RENDERDOC-COMMAND-LIST-ENDPOINT V1544 3/3]"
         "[FIX:RENDERDOC-INTERNAL-BARRIER-BYPASS V1545 1/1]"
         "module_base_name_is(owner, L\"renderdoc.dll\")"
-        "module_owning_address(_ReturnAddress()) == g_renderdoc_module"
+        "module_owning_address(caller) == g_renderdoc_module"
+        "barrier_source_body(command,count,barriers,g_resource_barrier,_ReturnAddress());"
+        "barrier_source_body(command,count,barriers,g_modern_source_barrier,_ReturnAddress());"
         "return Owner::RenderDoc;"
         "owner == Owner::Native || owner == Owner::RenderDoc"
         "command_list_is_recording_endpoint(command_list)"
@@ -54,7 +56,7 @@ string(FIND "${source}" "if (reshade_internal_submission) {" branch_start)
 string(FIND "${source}"
     "// [FIX:NESTED-COMMAND-LIST-IDENTITY V1532 2/3]" marker)
 string(FIND "${source}"
-    "g_execute_command_lists(queue, num_command_lists, command_lists);\n        return;"
+    "}else original(queue,num_command_lists,command_lists);\n        return;"
     opaque_return)
 if(branch_start EQUAL -1 OR marker EQUAL -1 OR opaque_return EQUAL -1 OR
         NOT branch_start LESS marker OR NOT marker LESS opaque_return)
