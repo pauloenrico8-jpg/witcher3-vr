@@ -82,7 +82,7 @@ if(BUILD_TESTING)
         tests/modern_dlss_ownership_tests.cpp src/modern_dlss_ownership.cpp)
     target_include_directories(w3vr_modern_dlss_ownership_tests PRIVATE src)
     target_compile_definitions(w3vr_modern_dlss_ownership_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(w3vr_modern_dlss_ownership_tests PRIVATE bcrypt)
+    target_link_libraries(w3vr_modern_dlss_ownership_tests PRIVATE bcrypt minhook)
     add_test(NAME modern_dlss_owned_native_identity COMMAND w3vr_modern_dlss_ownership_tests)
     # Optional physical-GPU probe. Does not load the game, Streamline or ReShade.
     add_executable(w3vr_modern_dlss_ownership_gpu
@@ -115,10 +115,10 @@ if(BUILD_TESTING)
     add_test(NAME modern_captured_native_command_queue COMMAND w3vr_modern_command_queue_tests)
 
     # Physical D3D12 probe; runs separately from the game and OpenXR.
-    add_executable(w3vr_modern_eye_source_use_gpu tests/modern_eye_source_use_gpu.cpp)
+    add_executable(w3vr_modern_eye_source_use_gpu tests/modern_eye_source_use_gpu.cpp src/modern_dlss_ownership.cpp)
     target_include_directories(w3vr_modern_eye_source_use_gpu PRIVATE src)
     target_compile_definitions(w3vr_modern_eye_source_use_gpu PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(w3vr_modern_eye_source_use_gpu PRIVATE d3d12 dxgi dxguid minhook)
+    target_link_libraries(w3vr_modern_eye_source_use_gpu PRIVATE d3d12 dxgi dxguid minhook bcrypt)
 
     add_executable(w3vr_modern_eye_pair_tests tests/modern_eye_pair_tests.cpp)
     target_include_directories(w3vr_modern_eye_pair_tests PRIVATE src)

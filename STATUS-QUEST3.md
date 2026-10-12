@@ -6,6 +6,72 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Dispositivo e filas com aquisição própria — 12 de outubro
+
+O registro gráfico moderno agora conserva separadamente o objeto recebido na
+chamada e a interface nativa usada pela captura. Uma interface intermediária
+pode encaminhar chamadas para o DirectX, mas o seu nome ou a semelhança com uma
+lista de comandos não comprova que ela seja um dispositivo gráfico válido.
+
+O fluxo, passo a passo:
+
+1. A verificação nova reconhece especificamente a classe de dispositivo do SDK
+   instalado. Confere a tabela de métodos, as funções esperadas, os identificadores
+   da classe e da interface de base e a assinatura do corpo inteiro da função de
+   consulta. Não lê campos privados do objeto nem guarda uma aprovação permanente.
+   As verificações de dispositivo, fila e lista continuam independentes.
+2. A aquisição consulta somente o tipo pedido e conserva uma referência própria
+   da interface nativa e de sua identidade. Uma referência impede a liberação
+   normal daquela interface enquanto está conservada; não congela seus pixels,
+   não retém automaticamente o alocador do motor e não resolve todas as chamadas
+   concorrentes ou a retirada da DLL.
+3. O registro exige uma função explícita de aquisição. O host e o programa de
+   teste usam a mesma rotina para dispositivo e fila. Ela aceita DirectX nativo
+   e as classes específicas comprovadas do Streamline, sem chamar a API geral
+   `slGetNativeInterface`. Outros intermediários permanecem rejeitados nesta
+   rota, inclusive quando aparecem dentro de outro intermediário reconhecido.
+4. Na criação da cadeia de buffers, conserva o argumento original da fila, a
+   interface de dispositivo informada pela cadeia e os endpoints nativos em
+   campos separados. Compara as identidades dos dispositivos nativos. A captura
+   não troca o argumento enviado à função original nem escolhe outra fila apenas
+   porque pertence ao mesmo dispositivo. Não muda a cadeia principal por uma auxiliar.
+5. Na recriação com filas explícitas, conserva cada argumento de fila por buffer
+   junto de seu endpoint nativo e sua identidade. Quantidade zero continua sem
+   leitura dos arrays e fecha a aquisição em caso de sucesso, até uma associação
+   explícita válida. Consultas dos filhos do dispositivo usam a mesma política.
+
+`modern_dlss_ownership` faz a verificação por classe e a aquisição com referências;
+`modern_graphics_binding.h` conserva o registro e as associações por buffer;
+`dxgi_proxy.cpp` fornece essa política ao registro do host. Os dois testes exercitam
+as referências e a política utilizada pelo host. Escolhi separar os argumentos
+encaminhados dos endpoints porque eles cumprem papéis diferentes: o jogo recebe
+seu objeto original, enquanto a captura precisa identificar o DirectX concreto.
+
+A DLL compilou e **113/113 testes passaram em 7,49 segundos**. O programa gráfico
+separado passou com **62 cópias reais e pixels conferidos**, usando a nova aquisição
+com dispositivos e filas nativos reais. Conferiu também armazenamento dos
+argumentos originais, associações por buffer e rejeição sem política de aquisição.
+
+Um teste adicional carregou a DLL instalada do SDK em seu próprio processo e
+conferiu o perfil com objetos fabricados contendo somente uma tabela de métodos.
+Rejeitou outras classes e uma tabela copiada. Uma ligação real do MinHook alterou
+os bytes da função apenas na memória desse processo; a verificação rejeitou a
+alteração, voltou a aceitar após restaurar os bytes e rejeitou após descarregar
+a DLL. **Esse objeto fabricado não era um dispositivo real do Streamline**, e
+nenhuma consulta de dispositivo ou inicialização do SDK foi executada nesse caso.
+Os testes de equilíbrio de referências também usam objetos fabricados. As falhas
+artificiais de sinal e habilitação dos cenários anteriores continuam simuladas.
+
+**O VR ainda não funciona; nada experimental foi instalado no Witcher.** Não houve
+execução de câmera do motor, OpenXR ou Quest. A rota nova ainda precisa ser
+verificada com intermediários reais do SDK, com a ordem de instalação do host e
+com o ciclo completo de recursos e imagens por olho. A verificação de dispositivo
+não autoriza uma classe de recurso, fábrica ou cadeia sem prova própria. Não
+resolve concorrência de carregamento, troca de interface ou parada de todas as
+chamadas. O bloqueio de versões permanece igual. Primeiro duas imagens novas do
+jogo em cada quadro; depois cabeça, mãos, armas, dano e bloqueio físicos no Quest.
+DLSS/IntelFG permanecem opcionais; a meta de 60 FPS está cancelada.
+
 ## Instalação independente da captura moderna — 12 de outubro
 
 A captura moderna agora pode completar suas quatro ligações com o DirectX quando
