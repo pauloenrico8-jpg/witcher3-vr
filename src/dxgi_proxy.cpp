@@ -39,6 +39,7 @@
 #include "modern_eye_pair.h"
 #include "modern_eye_source_use.h"
 #include "modern_eye_resource_set.h"
+#include "modern_graphics_binding.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
     D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
     D3D12_RESOURCE_STATE_PRESENT == 0 &&
@@ -1513,6 +1514,30 @@ UINT g_xr_cinema_projection_srv_increment{};
 std::atomic<bool> g_mode3_hud_layer_available{};
 bool g_xr_resources_ready{};
 IDXGISwapChain* g_game_swapchain{};
+// Process-lifetime root: no automatic COM cleanup from DllMain. Owning
+// snapshots survive registry revocation; this is not an all-call/unload barrier.
+std::atomic<w3vr::modern_graphics_binding::Registry*> g_modern_graphics_registry{};
+w3vr::modern_graphics_binding::Registry* modern_graphics_registry(bool create=false){
+    auto* current=g_modern_graphics_registry.load(std::memory_order_acquire);
+    if(current || !create)return current;
+    auto* candidate=new(std::nothrow) w3vr::modern_graphics_binding::Registry;
+    if(!candidate)return nullptr;
+    if(!g_modern_graphics_registry.compare_exchange_strong(current,candidate,std::memory_order_acq_rel)){
+        delete candidate;return current;
+    }return candidate;
+}
+w3vr::modern_graphics_binding::Snapshot modern_graphics_snapshot(){
+    auto* registry=modern_graphics_registry();return registry ? registry->acquire():nullptr;
+}
+bool modern_graphics_current(const w3vr::modern_graphics_binding::Snapshot& snapshot){
+    auto* registry=modern_graphics_registry();return registry && registry->current(snapshot);
+}
+void publish_modern_graphics_binding(HRESULT original,IUnknown* factory_queue,IDXGISwapChain* factory_chain){
+    if(FAILED(original) || !factory_queue || !factory_chain)return;
+    try{if(auto* registry=modern_graphics_registry(true))registry->publish_factory(original,factory_queue,factory_chain);}
+    catch(...){if(auto* registry=modern_graphics_registry())registry->stop_no_release();}
+}
+
 UINT g_game_render_width{};
 UINT g_game_render_height{};
 ID3D12Resource* g_stereo_eye_cache[2]{};
@@ -1935,6 +1960,7 @@ std::atomic<bool> g_modern_noaa_consumer_blocked{};
 // Process-lifetime POD root. In-flight or failed-signal references are not
 // released by a static destructor in DllMain. This is not an unload barrier.
 struct ModernNoAASourceUse : w3vr::modern_eye_source_use::Use {
+    w3vr::modern_graphics_binding::Snapshot binding;
     w3vr::modern_eye_pair::Claim claim{};
     bool native_asymmetric{};
     std::array<XrView,2> views{{{XR_TYPE_VIEW},{XR_TYPE_VIEW}}};
@@ -2126,7 +2152,8 @@ bool capture_tagged_backbuffer_output(
     bool render_view_valid,
     uint32_t source_eye,
     bool source_eye_valid,
-    const w3vr::modern_eye_capture::Identity* modern_identity = nullptr);
+    const w3vr::modern_eye_capture::Identity* modern_identity = nullptr,
+    const w3vr::modern_graphics_binding::Snapshot& binding = {});
 bool modern_noaa_output_requested();
 bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract*);
 bool native_stereo_capture_ready();
@@ -13644,19 +13671,9 @@ bool game_swapchain_owns_resource(ID3D12Resource* resource) {
     return w3vr::swapchain_identity::owns_resource(g_game_swapchain, resource);
 }
 
-ID3D12Resource* acquire_current_game_backbuffer() {
-    if (!g_game_swapchain) return nullptr;
-    IDXGISwapChain3* chain{};
-    if (FAILED(g_game_swapchain->QueryInterface(IID_PPV_ARGS(&chain))) || !chain) {
-        if (chain) chain->Release();
-        return nullptr;
-    }
-    ID3D12Resource* resource{};
-    const auto index=chain->GetCurrentBackBufferIndex();
-    const auto result=chain->GetBuffer(index,IID_PPV_ARGS(&resource));
-    chain->Release();
-    if (FAILED(result)) { if(resource) resource->Release(); return nullptr; }
-    return resource; // Caller owns this reference; not an engine descriptor clone.
+w3vr::modern_graphics_binding::Backbuffer acquire_current_game_backbuffer() {
+    auto* registry=modern_graphics_registry();return registry ? registry->acquire_backbuffer():
+        w3vr::modern_graphics_binding::Backbuffer{};
 }
 
 void diagnose_final_present_resource_identity(
@@ -20541,15 +20558,17 @@ bool signal_private_resource_queue_timeline(
     uint64_t& producer_fence_value) {
     producer_fence = nullptr;
     producer_fence_value = 0;
-    if (producer_queue == nullptr || g_d3d12_device == nullptr) {
-        return false;
-    }
+    if (producer_queue == nullptr) return false;
+    // Valid callback queue owns its device relation. Do not acquire a device
+    // through an unrelated/unprotected process-global pointer.
+    Microsoft::WRL::ComPtr<ID3D12Device> producer_device;
+    if(FAILED(producer_queue->GetDevice(IID_PPV_ARGS(&producer_device))) || !producer_device)return false;
 
     std::scoped_lock lock{g_private_resource_queue_timeline_mutex};
     auto timeline = g_private_resource_queue_timelines.find(producer_queue);
     if (timeline == g_private_resource_queue_timelines.end()) {
         ID3D12Fence* fence{};
-        const HRESULT create_result = g_d3d12_device->CreateFence(
+        const HRESULT create_result = producer_device->CreateFence(
             0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
         if (FAILED(create_result) || fence == nullptr) {
             log_line(
@@ -20636,7 +20655,10 @@ void publish_streamline_capture_submissions(
         return;
     }
 
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> ordered_consumer=g_command_queue;
+    const bool modern_route=modern_noaa_output_requested();
+    auto binding=modern_route ? modern_graphics_snapshot():nullptr;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> ordered_consumer=modern_route
+        ? (binding ? binding->queue.Get():nullptr):g_command_queue;
     bool consumer_ordered = submission_ordered && ordered_consumer &&
         producer_queue != nullptr && producer_queue_fence != nullptr &&
         w3vr::modern_eye_pair::finite(producer_queue_fence_value);
@@ -20682,7 +20704,8 @@ void publish_streamline_capture_submissions(
             const bool modern_current=!modern || (modern_noaa_output_ready(contract) &&
                 slot.modern_output.identity.profile==w3vr::render_core::modern_selected(contract) &&
                 slot.modern_output.recording_epoch==publication.recording_epoch &&
-                slot.modern_output.submitted_epoch==publication.recording_epoch);
+                slot.modern_output.submitted_epoch==publication.recording_epoch &&
+                modern_graphics_current(binding) && slot.modern_output.binding_epoch==binding->epoch);
             const bool publication_ready=consumer_ordered && identity_current && modern_current;
             if(modern){
                 auto& output=slot.modern_output;
@@ -29321,8 +29344,9 @@ void STDMETHODCALLTYPE hook_resource_barrier(
         command_list_is_recording_endpoint(command_list) &&
         command_list->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT &&
         snapshot_modern_noaa_capture_tag(modern_copy_tag)) {
-        ID3D12Resource* source=acquire_current_game_backbuffer();
-        if (source) {
+        auto source_lease=acquire_current_game_backbuffer();
+        auto* source=source_lease.resource.Get();
+        if (source && modern_graphics_registry()->owns_child(source_lease.binding,command_list)) {
             const D3D12_RESOURCE_BARRIER* last{};
             for (UINT i=0;i<num_barriers;++i)
                 if (barriers[i].Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
@@ -29338,15 +29362,16 @@ void STDMETHODCALLTYPE hook_resource_barrier(
                     reinterpret_cast<uintptr_t>(source),true,
                     description.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                         description.MipLevels==1 && description.DepthOrArraySize==1 &&
-                        description.Width==g_game_render_width && description.Height==g_game_render_height,
+                        description.Width==source_lease.binding->width && description.Height==source_lease.binding->height,
                     {static_cast<uint32_t>(last->Flags),static_cast<uint32_t>(last->Transition.StateBefore),
                      static_cast<uint32_t>(last->Transition.StateAfter),last->Transition.Subresource},request)) {
                 capture_tagged_backbuffer_output(command_list,source,D3D12_RESOURCE_STATE_PRESENT,
                     static_cast<uint32_t>(request.eye),request.generation,request.pair,
                     modern_copy_tag.render_view,modern_copy_tag.render_view_valid,
-                    static_cast<uint32_t>(request.eye),true,&g_modern_capture_identity);
+                    static_cast<uint32_t>(request.eye),true,&g_modern_capture_identity,source_lease.binding);
             }
-            source->Release();
+            // Source/chain/device/queue references survive this recording scope.
+            // Their GPU use still needs the producer lease before resize/unload.
         }
     }
     if (early_hud_capture_source != nullptr) {
@@ -31921,6 +31946,7 @@ bool modern_noaa_output_requested() {
 }
 bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contract) {
     return modern_noaa_output_requested() && remastered_core_ready_for(contract) &&
+        modern_graphics_current(modern_graphics_snapshot()) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire) &&
         !mode3_aer_presentation_active() && !g_config.steady_icons;
@@ -31928,15 +31954,17 @@ bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contr
 ModernNoAASourceUse* acquire_modern_noaa_sources() {
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     if(!modern_noaa_output_ready(contract))return nullptr;
-    auto use=std::make_unique<ModernNoAASourceUse>();
+    auto binding=modern_graphics_snapshot();if(!binding)return nullptr;
+    auto use=std::make_unique<ModernNoAASourceUse>();use->binding=binding;
     std::scoped_lock lock{g_streamline_capture_mutex};
     collect_modern_noaa_source_uses();
     const auto* profile=g_remastered_core_installed_profile.load(std::memory_order_acquire);
     const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
-    if(!g_packed_present_cache_valid || !g_command_queue || !g_xr_fence ||
+    if(!g_packed_present_cache_valid || !modern_graphics_current(binding) || !g_xr_fence ||
+        !modern_graphics_registry()->owns_child(binding,g_xr_fence) ||
         !w3vr::modern_eye_pair::accepts(g_modern_packed_outputs,contract,profile,true,generation,
-            reinterpret_cast<uintptr_t>(g_command_queue),0))return nullptr;
-    use->queue=g_command_queue;use->fence=g_xr_fence;
+            reinterpret_cast<uintptr_t>(binding->queue.Get()),0,binding->epoch))return nullptr;
+    use->queue=binding->queue;use->fence=g_xr_fence;
     for(uint32_t eye=0;eye<2;++eye){
         if(g_modern_packed_outputs[eye].texture!=reinterpret_cast<uintptr_t>(g_packed_present_cache[eye]) ||
             !g_packed_present_cache_view_valid[eye])return nullptr;
@@ -31948,17 +31976,17 @@ ModernNoAASourceUse* acquire_modern_noaa_sources() {
     use->native_asymmetric=g_packed_present_cache_native_asymmetric;
     if(!modern_noaa_output_ready(contract) ||
         !g_modern_output_consumption.begin(g_modern_packed_outputs,contract,profile,true,generation,
-            reinterpret_cast<uintptr_t>(use->queue.Get()),{true,true,true,false,false,false},use->claim))return nullptr;
+            reinterpret_cast<uintptr_t>(use->queue.Get()),binding->epoch,{true,true,true,false,false,false},use->claim))return nullptr;
     return static_cast<ModernNoAASourceUse*>(g_modern_noaa_source_store.adopt(std::move(use)));
 }
 bool modern_noaa_sources_current(const ModernNoAASourceUse* use) {
     if(!use)return false;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     std::scoped_lock lock{g_streamline_capture_mutex};
-    return modern_noaa_output_ready(contract) && use->queue.Get()==g_command_queue && use->fence.Get()==g_xr_fence &&
+    return modern_noaa_output_ready(contract) && modern_graphics_current(use->binding) && use->fence.Get()==g_xr_fence &&
         g_modern_output_consumption.current(use->claim,contract,
             g_remastered_core_installed_profile.load(std::memory_order_acquire),true,
-            g_streamline_capture_generation.load(std::memory_order_acquire),reinterpret_cast<uintptr_t>(use->queue.Get()));
+            g_streamline_capture_generation.load(std::memory_order_acquire),reinterpret_cast<uintptr_t>(use->queue.Get()),use->binding->epoch);
 }
 void finish_modern_noaa_sources(ModernNoAASourceUse* use,bool submitted,bool xr_succeeded) {
     if(!use)return;
@@ -48724,7 +48752,9 @@ bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
     const bool modern=modern_noaa_output_requested() || g_modern_noaa_source_store.head ||
         g_modern_packed_outputs[0].identity.profile || g_modern_packed_outputs[1].identity.profile;
     if(modern && g_modern_noaa_consumer_blocked.load(std::memory_order_acquire))return false;
-    if(!g_d3d12_device)return false;
+    auto binding=modern ? modern_graphics_snapshot():nullptr;
+    auto* allocation_device=modern ? (binding ? binding->device.Get():nullptr):g_d3d12_device;
+    if(!allocation_device || (modern && !modern_graphics_current(binding)))return false;
     auto cache_desc=source_desc;cache_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
     D3D12_HEAP_PROPERTIES heap_props{};heap_props.Type=D3D12_HEAP_TYPE_DEFAULT;
     heap_props.CreationNodeMask=1;heap_props.VisibleNodeMask=1;
@@ -48735,7 +48765,7 @@ bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
         {&g_packed_present_cache[1],g_packed_present_cache_last_use_fence[1],g_packed_present_cache_last_use_fence_value[1],false}
     }};
     if(!w3vr::modern_eye_resource_set::replace(slots,g_modern_noaa_source_store,modern,
-        [&](size_t,ID3D12Resource** resource){return g_d3d12_device->CreateCommittedResource(
+        [&](size_t,ID3D12Resource** resource){return allocation_device->CreateCommittedResource(
             &heap_props,D3D12_HEAP_FLAG_NONE,&cache_desc,D3D12_RESOURCE_STATE_COPY_DEST,
             nullptr,IID_PPV_ARGS(resource));}))return false;
     g_modern_packed_outputs={}; // Old receipts cannot name newly created textures.
@@ -50064,6 +50094,7 @@ bool update_packed_eye_cache() {
     }
 
     const bool modern_noaa=modern_noaa_output_requested();
+    auto binding=modern_noaa ? modern_graphics_snapshot():nullptr;
     const auto* modern_contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     if(modern_noaa && !modern_noaa_output_ready(modern_contract))return false;
     if (!modern_noaa && mode3_aer_presentation_active() &&
@@ -50118,7 +50149,8 @@ bool update_packed_eye_cache() {
     w3vr::modern_eye_pair::Pair modern_outputs{{left.modern_output,right.modern_output}};
     if(modern_noaa && !w3vr::modern_eye_pair::accepts(modern_outputs,modern_contract,
         g_remastered_core_installed_profile.load(std::memory_order_acquire),modern_noaa_output_ready(modern_contract),
-        generation,reinterpret_cast<uintptr_t>(g_command_queue),g_packed_accepted_pair_id))return false;
+        generation,binding ? reinterpret_cast<uintptr_t>(binding->queue.Get()):0,g_packed_accepted_pair_id,
+        binding ? binding->epoch:0))return false;
     const bool had_accepted_pair = g_packed_present_cache_valid;
     uint64_t accepted_pair = left.pair_id;
     uint32_t accepted_slot_indices[2]{
@@ -50384,7 +50416,9 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
     for(const auto& eye_ring:g_streamline_capture_ring)for(const auto& slot:eye_ring)
         modern=modern || slot.modern_output.identity.profile;
     if(modern && g_modern_noaa_consumer_blocked.load(std::memory_order_acquire))return false;
-    if(!g_d3d12_device)return false;
+    auto binding=modern ? modern_graphics_snapshot():nullptr;
+    auto* allocation_device=modern ? (binding ? binding->device.Get():nullptr):g_d3d12_device;
+    if(!allocation_device || (modern && !modern_graphics_current(binding)))return false;
     auto capture_desc=source_desc;capture_desc.Format = capture_format;
     capture_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
     D3D12_HEAP_PROPERTIES heap_props{};heap_props.Type=D3D12_HEAP_TYPE_DEFAULT;
@@ -50394,7 +50428,7 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
     for(auto& eye_ring:g_streamline_capture_ring)for(auto& slot:eye_ring)
         slots[index++]={&slot.resource,slot.last_use_fence,slot.last_use_fence_value,slot.recording_pending};
     if(!w3vr::modern_eye_resource_set::replace(slots,g_modern_noaa_source_store,modern,
-        [&](size_t,ID3D12Resource** resource){return g_d3d12_device->CreateCommittedResource(
+        [&](size_t,ID3D12Resource** resource){return allocation_device->CreateCommittedResource(
             &heap_props,D3D12_HEAP_FLAG_NONE,&capture_desc,D3D12_RESOURCE_STATE_COPY_DEST,
             nullptr,IID_PPV_ARGS(resource));}))return false;
     for (auto& eye_ring : g_streamline_capture_ring) {
@@ -50564,10 +50598,11 @@ bool capture_tagged_backbuffer_output(
     bool render_view_valid,
     uint32_t source_eye,
     bool source_eye_valid,
-    const w3vr::modern_eye_capture::Identity* modern_identity) {
+    const w3vr::modern_eye_capture::Identity* modern_identity,
+    const w3vr::modern_graphics_binding::Snapshot& binding) {
     const auto epoch=modern_identity ? load_command_list_recording_epoch(command_list):0;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
-    if(modern_identity && (!modern_noaa_output_ready(contract) ||
+    if(modern_identity && (!modern_noaa_output_ready(contract) || !modern_graphics_current(binding) ||
         !w3vr::modern_eye_capture::admits(*modern_identity,contract,
             g_remastered_core_installed_profile.load(std::memory_order_acquire),true,generation) ||
         !w3vr::modern_eye_pair::finite(epoch) || modern_identity->frame.eye!=static_cast<int>(eye) ||
@@ -50636,7 +50671,7 @@ bool capture_tagged_backbuffer_output(
         if(modern_identity){
             slot.modern_output={*modern_identity,reinterpret_cast<uintptr_t>(slot.resource),
                 reinterpret_cast<uintptr_t>(command_list),0,0,0,epoch,0,capture_serial,0,
-                source_eye,true,render_view_valid,false,true,false};
+                source_eye,true,render_view_valid,false,true,false,binding->epoch};
         }
         g_streamline_capture_pending_publications[command_list].push_back({
             eye, slot_index, generation, pair_id, capture_serial,epoch});
@@ -54172,7 +54207,8 @@ void render_openxr_test_frame(
                 bool execute_admitted=true;
                 if(modern_sources){
                     std::scoped_lock lock{g_streamline_capture_mutex};
-                    execute_admitted=g_modern_noaa_source_store.before_execute(modern_sources,submit_queue,1,lists);
+                    execute_admitted=modern_graphics_current(modern_sources->binding) &&
+                        g_modern_noaa_source_store.before_execute(modern_sources,submit_queue,1,lists);
                 }
                 if(!execute_admitted){
                     g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
@@ -54600,13 +54636,19 @@ HRESULT STDMETHODCALLTYPE hook_resize_buffers(
     const UINT effective_height = g_custom_resolution_active.load() && g_config.render_height > 0
         ? static_cast<UINT>(g_config.render_height)
         : height;
-    g_game_render_width = effective_width;
-    g_game_render_height = effective_height;
     log_line("ResizeBuffers requested=%ux%u effective=%ux%u buffers=%u format=%u",
         width, height, effective_width, effective_height, buffer_count,
         static_cast<unsigned>(format));
-    return g_resize_buffers(
-        swapchain, buffer_count, effective_width, effective_height, format, flags);
+    auto original=[&]{return g_resize_buffers(
+        swapchain, buffer_count, effective_width, effective_height, format, flags);};
+    auto* registry=modern_graphics_registry();
+    const HRESULT result=registry ? registry->resize_from_callback(swapchain,original):original();
+    if(SUCCEEDED(result)){
+        DXGI_SWAP_CHAIN_DESC actual{};
+        if(SUCCEEDED(swapchain->GetDesc(&actual))){
+            g_game_render_width=actual.BufferDesc.Width;g_game_render_height=actual.BufferDesc.Height;
+        }
+    }return result;
 }
 
 void hook_present(IDXGISwapChain* swapchain) {
@@ -55767,6 +55809,7 @@ HRESULT STDMETHODCALLTYPE hook_create_swapchain_for_hwnd(
         factory, device, hwnd, effective_desc, fullscreen_desc, restrict_to_output, swapchain);
 
     if (SUCCEEDED(hr) && swapchain != nullptr && *swapchain != nullptr) {
+        publish_modern_graphics_binding(hr,device,*swapchain);
         hook_present(*swapchain);
         initialize_openxr_probe();
     }
@@ -55804,6 +55847,7 @@ HRESULT STDMETHODCALLTYPE hook_create_swapchain(
     const auto hr = g_create_swapchain(factory, device, effective_desc, swapchain);
 
     if (SUCCEEDED(hr) && swapchain != nullptr && *swapchain != nullptr) {
+        publish_modern_graphics_binding(hr,device,*swapchain);
         hook_present(*swapchain);
         initialize_openxr_probe();
     }
@@ -56121,6 +56165,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void* reserved) {
         g_proxy_module = module;
         DisableThreadLibraryCalls(module);
     } else if (reason == DLL_PROCESS_DETACH) {
+        if(auto* registry=g_modern_graphics_registry.load(std::memory_order_acquire))registry->stop_no_release();
         // At process termination dependency teardown order is unspecified and
         // the OS reclaims every object. In particular, RenderDoc may already
         // be unloaded while these COM pointers still reference its vtables.

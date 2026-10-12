@@ -6,6 +6,71 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Referências gráficas próprias e invalidação após recriação — 12 de outubro
+
+Liguei a captura moderna a um registro que possui referências ao dispositivo,
+à fila gráfica e à cadeia de apresentação. A cadeia de apresentação é o conjunto
+de buffers que o DirectX entrega para mostrar a imagem. A captura passa a obter
+um snapshot desse registro: um conjunto de referências conservadas, acompanhado
+de um número de época. Esse número muda quando os buffers são recriados.
+
+O fluxo, passo a passo:
+
+1. Depois da criação original bem-sucedida, recebe a fila que foi entregue à
+   criação e a cadeia que ela retornou. Confere o tipo da fila, as interfaces,
+   o dispositivo correspondente e as dimensões reais. Não deduz uma fila a
+   partir de outra que apenas usa o mesmo dispositivo.
+2. Guarda as referências em um registro protegido. A aquisição copia a posse
+   compartilhada do snapshot dentro da trava, sem chamadas COM nessa trava.
+   As chamadas COM são operações das interfaces gráficas do Windows.
+3. Obtém o buffer atual a partir da cadeia conservada e confere seu dispositivo.
+   A gravação guarda a época que originou a captura. Publicação e consumo dos
+   dois olhos exigem essa mesma época atual; uma época antiga não ganha validade
+   porque as texturas ainda existem.
+4. Durante uma recriação observada, fecha a aquisição, encaminha a chamada
+   original uma vez e preserva seu resultado. Depois cria uma nova época.
+   Uma falha conserva as dimensões anteriores; um sucesso consulta as dimensões
+   reais. O callback só atualiza as dimensões depois do sucesso original.
+5. Uma cadeia auxiliar não substitui silenciosamente a selecionada. Seus callbacks
+   de recriação continuam encaminhando a chamada original sem trocar a autoridade
+   da cadeia principal. Substituir a cadeia principal inteira ainda exige esvaziar
+   e encerrar seus usos corretamente.
+6. O consumo conserva seu snapshot junto das duas texturas enquanto estiver em
+   uso. Uma revogação impede novas aquisições e não destrói essas referências já
+   conservadas. Essa revogação, sozinha, não encerra todas as chamadas do mod.
+
+`modern_graphics_binding.h` guarda e confere essas referências;
+`modern_eye_pair.h` exige a época atual nos registros dos dois olhos;
+`dxgi_proxy.cpp` liga esses componentes aos callbacks reais de criação,
+captura, publicação, consumo e recriação. O helper de sinais também obtém o
+dispositivo diretamente da fila válida recebida pelo callback. Escolhi conservar
+os objetos e validar a época separadamente: o objeto pode continuar vivo e,
+ainda assim, sua captura já pertencer a uma configuração antiga.
+
+A DLL compilou e **113/113 testes passaram em 12,58 segundos**. O teste de pares
+conferiu **484 regras CPU**, com dados fabricados para ambas as versões. O teste
+gráfico separado passou com **14.556 verificações e 24 cópias reais de textura**.
+Também criou cadeias DirectX reais em seu próprio processo: uma janela oculta,
+uma falha real de recriação enquanto o buffer estava retido, nove recriações
+bem-sucedidas da cadeia principal e uma recriação de cadeia auxiliar. Três threads
+obtiveram snapshots durante as trocas. O teste não abriu o Witcher ou o Quest.
+
+As falhas de sinal e de alocação dos casos anteriores continuam explicitamente
+simuladas; a falha de recriação com buffer retido foi um resultado real do DirectX.
+As referências conservam objetos, não congelam pixels. A nova aquisição mantém
+buffer e snapshot durante a gravação, mas ainda falta conservá-los até o sinal
+real da submissão do produtor terminar. Não comprova todos os wrappers, trocas
+de cadeia principal, recursos internos do motor, MinHook, OpenXR ou encerramento
+da DLL. A revogação na entrada do encerramento apenas fecha a aquisição; as demais
+operações de encerramento e a barreira de todas as chamadas continuam pendentes.
+
+**Ainda não há VR jogável, o bloqueio de versão continua igual e nada experimental
+foi instalado no jogo.** O próximo passo é ligar a retenção da origem à gravação,
+ao envio e ao sinal reais do produtor, com descarte apenas após reinicialização
+original comprovada ou conclusão da GPU. Depois permanecem o port completo do
+motor, duas imagens novas do jogo por quadro e a integração física de cabeça,
+mãos, armas, dano e bloqueio. A meta de 60 FPS continua cancelada.
+
 ## Troca conjunta de texturas preservando o conjunto anterior — 12 de outubro
 
 Corrigi as duas rotinas que recriam as imagens próprias quando seu tamanho ou

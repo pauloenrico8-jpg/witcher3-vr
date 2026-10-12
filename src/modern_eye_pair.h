@@ -12,6 +12,7 @@ struct Output {
     std::uint64_t recording_epoch{}, submitted_epoch{}, serial{}, fence_value{};
     std::uint32_t source_eye{UINT32_MAX};
     bool source_eye_valid{}, view_valid{}, initialized{}, recording_pending{}, ordered{};
+    std::uint64_t binding_epoch{}; // Exact owned graphics snapshot used by capture.
 };
 using Pair=std::array<Output,2>;
 inline bool finite(std::uint64_t value){return value!=0 && value!=UINT64_MAX;}
@@ -24,21 +25,21 @@ inline bool same(const Output& a,const Output& b){
         o.identity.frame.pair,o.identity.frame.eye,o.identity.frame.view_valid,
         o.identity.frame.normal_factory_lineage,o.texture,o.command,o.producer,o.fence,o.consumer,
         o.recording_epoch,o.submitted_epoch,o.serial,o.fence_value,o.source_eye,o.source_eye_valid,
-        o.view_valid,o.initialized,o.recording_pending,o.ordered};};
+        o.view_valid,o.initialized,o.recording_pending,o.ordered,o.binding_epoch};};
     return fields(a)==fields(b);
 }
 inline bool same(const Pair& a,const Pair& b){return same(a[0],b[0]) && same(a[1],b[1]);}
 inline bool accepts(const Pair& outputs,const engine_camera::TemporalContract* contract,
     const render_core::Profile* installed,bool ready,std::uint32_t generation,
-    std::uintptr_t consumer,std::uint64_t last_pair){
-    if(!consumer || !render_core::ready_for(contract,installed,ready))return false;
+    std::uintptr_t consumer,std::uint64_t last_pair,std::uint64_t binding_epoch){
+    if(!consumer || !finite(binding_epoch) || !render_core::ready_for(contract,installed,ready))return false;
     for(std::uint32_t eye=0;eye<2;++eye){
         const auto& o=outputs[eye];
         if(!modern_eye_capture::admits(o.identity,contract,installed,ready,generation) ||
             o.identity.frame.eye!=static_cast<int>(eye) || o.source_eye!=eye || !o.source_eye_valid ||
             !o.view_valid || !o.texture || !o.command || !o.producer || !o.fence || o.consumer!=consumer ||
             !finite(o.recording_epoch) || o.recording_epoch!=o.submitted_epoch || !finite(o.serial) ||
-            !finite(o.fence_value) || !o.initialized || o.recording_pending || !o.ordered)return false;
+            o.binding_epoch!=binding_epoch || !finite(o.fence_value) || !o.initialized || o.recording_pending || !o.ordered)return false;
     }
     return outputs[0].identity.renderer==outputs[1].identity.renderer &&
         outputs[0].identity.frame.frame!=outputs[1].identity.frame.frame &&
@@ -67,8 +68,8 @@ public:
     // image through retries, rescue cadence or a readiness toggle.
     bool begin(const Pair& outputs,const engine_camera::TemporalContract* contract,
         const render_core::Profile* installed,bool ready,std::uint32_t generation,
-        std::uintptr_t consumer,const Route& route,Claim& claim){
-        if(!strict_scene(route) || !accepts(outputs,contract,installed,ready,generation,consumer,0) ||
+        std::uintptr_t consumer,std::uint64_t binding_epoch,const Route& route,Claim& claim){
+        if(!strict_scene(route) || !accepts(outputs,contract,installed,ready,generation,consumer,0,binding_epoch) ||
             active_.nonce || nonce_==UINT64_MAX)return false;
         const bool new_context=profile_!=installed || generation_!=generation;
         if((!new_context && outputs[0].identity.frame.pair<=last_attempt_) ||
@@ -78,10 +79,10 @@ public:
         active_={outputs,++nonce_};claim=active_;return true;
     }
     bool current(const Claim& claim,const engine_camera::TemporalContract* contract,
-        const render_core::Profile* installed,bool ready,std::uint32_t generation,std::uintptr_t consumer)const{
+        const render_core::Profile* installed,bool ready,std::uint32_t generation,std::uintptr_t consumer,std::uint64_t binding_epoch)const{
         return claim.nonce!=0 && claim.nonce==active_.nonce && same(claim.outputs,active_.outputs) &&
             installed==profile_ && generation==generation_ &&
-            accepts(claim.outputs,contract,installed,ready,generation,consumer,0);
+            accepts(claim.outputs,contract,installed,ready,generation,consumer,0,binding_epoch);
     }
     bool finish(const Claim& claim,bool submitted,bool xr_succeeded){
         if(!claim.nonce || claim.nonce!=active_.nonce || !same(claim.outputs,active_.outputs))return false;

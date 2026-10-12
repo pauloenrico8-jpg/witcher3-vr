@@ -12,7 +12,7 @@ pair::Pair fixture(const core::Profile* profile,std::uint32_t generation=9,std::
     for(int eye=0;eye<2;++eye){auto& o=p[eye];
         o.identity={profile,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),generation,id,eye,true,true}};
         o.texture=0x3000+eye*0x100;o.command=0x4000;o.producer=0x5000;o.fence=0x6000;o.consumer=0x7000;
-        o.recording_epoch=8;o.submitted_epoch=8;o.serial=serial+eye;o.fence_value=20;
+        o.recording_epoch=8;o.submitted_epoch=8;o.serial=serial+eye;o.fence_value=20;o.binding_epoch=7;
         o.source_eye=eye;o.source_eye_valid=true;o.view_valid=true;o.initialized=true;o.ordered=true;
     }return p;
 }
@@ -20,7 +20,7 @@ const cam::TemporalContract* contract(const core::Profile* profile){
     return profile==&core::remastered_500c ? &cam::remastered_500c:&cam::remastered_1048522;
 }
 bool accepts(const pair::Pair& p,const core::Profile* profile,std::uint64_t last=0){
-    return pair::accepts(p,contract(profile),profile,true,9,0x7000,last);
+    return pair::accepts(p,contract(profile),profile,true,9,0x7000,last,7);
 }
 const pair::Route strict{true,true,true,false,false,false};
 void profiles_and_receipts(const core::Profile* profile){
@@ -29,17 +29,20 @@ void profiles_and_receipts(const core::Profile* profile){
     require(accepts(good,profile),"Two copies on one real recording were rejected");
     auto separate=good;separate[1].command=0x4900;separate[1].producer=0x5900;separate[1].fence=0x6900;
     require(accepts(separate,profile),"Independently ordered producer queues rejected");
-    require(!pair::accepts(good,&copied_contract,profile,true,9,0x7000,0) &&
-        !pair::accepts(good,nullptr,profile,true,9,0x7000,0) &&
-        !pair::accepts(good,contract(profile),&copied,true,9,0x7000,0) &&
-        !pair::accepts(good,contract(profile),foreign,true,9,0x7000,0) &&
-        !pair::accepts(good,&cam::legacy_404,profile,true,9,0x7000,0),"Unknown/copied/mixed installation adopted output");
-    require(!pair::accepts(good,contract(profile),profile,false,9,0x7000,0) &&
-        !pair::accepts(good,contract(profile),profile,true,10,0x7000,0) &&
-        !pair::accepts(good,contract(profile),profile,true,9,0,0) &&
-        !pair::accepts(good,contract(profile),profile,true,9,0x7100,0),"Closed/current queue or generation mismatch accepted");
+    require(!pair::accepts(good,&copied_contract,profile,true,9,0x7000,0,7) &&
+        !pair::accepts(good,nullptr,profile,true,9,0x7000,0,7) &&
+        !pair::accepts(good,contract(profile),&copied,true,9,0x7000,0,7) &&
+        !pair::accepts(good,contract(profile),foreign,true,9,0x7000,0,7) &&
+        !pair::accepts(good,&cam::legacy_404,profile,true,9,0x7000,0,7),"Unknown/copied/mixed installation adopted output");
+    require(!pair::accepts(good,contract(profile),profile,false,9,0x7000,0,7) &&
+        !pair::accepts(good,contract(profile),profile,true,10,0x7000,0,7) &&
+        !pair::accepts(good,contract(profile),profile,true,9,0,0,7) &&
+        !pair::accepts(good,contract(profile),profile,true,9,0x7100,0,7),"Closed/current queue or generation mismatch accepted");
+    require(!pair::accepts(good,contract(profile),profile,true,9,0x7000,0,0) &&
+        !pair::accepts(good,contract(profile),profile,true,9,0x7000,0,UINT64_MAX) &&
+        !pair::accepts(good,contract(profile),profile,true,9,0x7000,0,8),"Changed/unknown owned binding accepted");
     require(!accepts(good,profile,100) && !accepts(good,profile,101),"Old/equal pair promoted");
-    for(int eye=0;eye<2;++eye)for(int fault=0;fault<31;++fault){
+    for(int eye=0;eye<2;++eye)for(int fault=0;fault<34;++fault){
         auto p=good;auto& o=p[eye];
         switch(fault){
         case 0:o.identity.profile=nullptr;break;case 1:o.identity.profile=foreign;break;
@@ -56,6 +59,7 @@ void profiles_and_receipts(const core::Profile* profile){
         case 25:o.fence_value=UINT64_MAX;break;case 26:o.source_eye=1-eye;break;
         case 27:o.source_eye_valid=false;break;case 28:o.view_valid=false;break;
         case 29:o.initialized=false;break;case 30:o.recording_pending=true;break;
+        case 31:o.binding_epoch=0;break;case 32:o.binding_epoch=UINT64_MAX;break;case 33:o.binding_epoch=8;break;
         }
         require(!accepts(p,profile),"Incomplete/foreign eye, recording or timeline accepted");
         require(!pair::same(p,good),"Immutable receipt mutation not detected");
@@ -69,39 +73,40 @@ void profiles_and_receipts(const core::Profile* profile){
 void consume_once_and_failure(const core::Profile* profile){
     auto p=fixture(profile);pair::Consumption consume;pair::Claim claim{},sentinel{p,777};
     auto out=sentinel;
-    require(!consume.begin(p,contract(profile),profile,false,9,0x7000,strict,out) && out.nonce==777,
+    require(!consume.begin(p,contract(profile),profile,false,9,0x7000,7,strict,out) && out.nonce==777,
         "Rejected call acquired claim or changed caller storage");
     for(int fault=0;fault<6;++fault){auto route=strict;
         if(fault==0)route.mode3=false;if(fault==1)route.noaa=false;if(fault==2)route.dual=false;
         if(fault==3)route.aer=true;if(fault==4)route.panel=true;if(fault==5)route.delayed_scene=true;
-        require(!consume.begin(p,contract(profile),profile,true,9,0x7000,route,out),"Alternative presenter adopted strict receipt");
+        require(!consume.begin(p,contract(profile),profile,true,9,0x7000,7,route,out),"Alternative presenter adopted strict receipt");
     }
-    require(consume.begin(p,contract(profile),profile,true,9,0x7000,strict,claim),"Fresh pair not claimed");
-    require(consume.current(claim,contract(profile),profile,true,9,0x7000),"Current claim rejected");
-    require(!consume.begin(fixture(profile,9,101,52),contract(profile),profile,true,9,0x7000,strict,out),
+    require(consume.begin(p,contract(profile),profile,true,9,0x7000,7,strict,claim),"Fresh pair not claimed");
+    require(consume.current(claim,contract(profile),profile,true,9,0x7000,7),"Current claim rejected");
+    require(!consume.begin(fixture(profile,9,101,52),contract(profile),profile,true,9,0x7000,7,strict,out),
         "Nested or concurrent consumer stole active pair");
     auto altered=claim;altered.outputs[0].serial++;
-    require(!consume.finish(altered,true,true) && !consume.current(altered,contract(profile),profile,true,9,0x7000),
+    require(!consume.finish(altered,true,true) && !consume.current(altered,contract(profile),profile,true,9,0x7000,7),
         "Changed claim completed or acquired current authority");
     auto stale=claim;stale.nonce++;
     require(!consume.finish(stale,true,true),"Foreign nonce completed active pair");
-    require(!consume.current(claim,contract(profile),profile,false,9,0x7000) &&
-        !consume.current(claim,contract(profile),profile,true,10,0x7000),"Readiness or generation change retained draw admission");
+    require(!consume.current(claim,contract(profile),profile,false,9,0x7000,7) &&
+        !consume.current(claim,contract(profile),profile,true,10,0x7000,7),"Readiness or generation change retained draw admission");
+    require(!consume.current(claim,contract(profile),profile,true,9,0x7000,8),"Resize epoch retained old presentation claim");
     require(!consume.finish(claim,true,false),"Failed xrEndFrame reported successful submission");
-    require(!consume.begin(p,contract(profile),profile,true,9,0x7000,strict,out),"Failed XR attempt replayed same pair as new");
+    require(!consume.begin(p,contract(profile),profile,true,9,0x7000,7,strict,out),"Failed XR attempt replayed same pair as new");
     auto next=fixture(profile,9,101,52);
-    require(consume.begin(next,contract(profile),profile,true,9,0x7000,strict,out),"Independent new pair rejected after failure");
+    require(consume.begin(next,contract(profile),profile,true,9,0x7000,7,strict,out),"Independent new pair rejected after failure");
     require(consume.finish(out,true,true) && !consume.finish(out,true,true),"Successful claim finished twice");
     auto relabelled=fixture(profile,9,102,52);
-    require(!consume.begin(relabelled,contract(profile),profile,true,9,0x7000,strict,out),
+    require(!consume.begin(relabelled,contract(profile),profile,true,9,0x7000,7,strict,out),
         "New pair label concealed repeated copy serials");
     auto new_generation=fixture(profile,10,1,54);
-    require(consume.begin(new_generation,contract(profile),profile,true,10,0x7000,strict,out),
+    require(consume.begin(new_generation,contract(profile),profile,true,10,0x7000,7,strict,out),
         "New generation could not start at its native pair counter");
     require(!consume.finish(out,false,true),"Unsubmitted draw reported success");
-    require(!consume.begin(new_generation,contract(profile),profile,true,10,0x7000,strict,claim),
+    require(!consume.begin(new_generation,contract(profile),profile,true,10,0x7000,7,strict,claim),
         "CPU-return or unsubmitted failure allowed replay");
-    require(!consume.current(claim,contract(profile),profile,true,10,0x7000),"Old claim adopted new context");
+    require(!consume.current(claim,contract(profile),profile,true,10,0x7000,7),"Old claim adopted new context");
 }
 void retirement(){
     for(const auto phase:{pair::UsePhase::Recording,pair::UsePhase::Executing,pair::UsePhase::Pending})
