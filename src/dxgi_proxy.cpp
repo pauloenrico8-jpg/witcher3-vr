@@ -30,6 +30,7 @@
 #include "engine_camera_layout.h"
 #include "engine_camera_copy_context.h"
 #include "modern_camera_pose.h"
+#include "modern_factory_clock_windows.h"
 #include "modern_vegetation_view.h"
 #include "modern_world_culling_view.h"
 #include "modern_command_queue.h"
@@ -42257,6 +42258,18 @@ void* invoke_engine_frame_factory_with_camera_context(void* render_context,
 }
 
 void* __fastcall hook_engine_frame_data_factory(void* render_context, void* render_settings, void* scene_descriptor) {
+    // Recover the normal caller BEFORE callbacks or replacing its stack argument.
+    // This local scope observes CPU time only; it never grants a history/GPU lease.
+    const auto factory_caller_pc = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const auto factory_module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* clock_entry_contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    w3vr::factory_clock::BorrowedScope normal_factory_clock;
+    if (w3vr::factory_clock::selected(clock_entry_contract) &&
+        remastered_camera_copy_ready_for(clock_entry_contract) &&
+        remastered_preparation_ready_for(clock_entry_contract)) {
+        w3vr::factory_clock::windows::observe(clock_entry_contract,factory_module,
+            factory_caller_pc,reinterpret_cast<uintptr_t>(scene_descriptor),normal_factory_clock);
+    }
     w3vr::pipeline_flight::CpuScope flight_cpu{
         w3vr::pipeline_flight::Phase::FrameFactory};
     // [FIX:OPENXR-PAIR-BOUND-LIFECYCLE 1/3] Mode 3 binds one OpenXR frame to
@@ -42281,8 +42294,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const auto factory_version = w3vr::scene_factory::selected_version(factory_contract);
     const bool factory_inputs_ready = engine_scene_factory_inputs_ready(
         factory_contract, render_context, render_settings, scene_descriptor);
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const auto module = factory_module;
+    const auto caller_rva = factory_caller_pc - module;
     // [FIX:ASYMMETRIC-TAAU-SCENE-DESCRIPTOR-HARDENING V1207 1/1]
     // The REDengine scene descriptor is stack-backed. Its readable range to
     // the next VM boundary varies with address placement, so the old clone
@@ -42387,6 +42400,10 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         RemasteredPreparationContext context{};
         duplicate_render = remastered_camera_copy_ready_for(factory_contract) &&
             remastered_scope_current(scope,factory_contract) &&
+            (factory_contract != &w3vr::engine_camera::remastered_1048522 ||
+                (clock_entry_contract == factory_contract &&
+                 normal_factory_clock.borrowed_caller().rdi == reinterpret_cast<uintptr_t>(scope->game) &&
+                 w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock))) &&
             w3vr::frame_preparation::allows(scope->profile,w3vr::frame_preparation::Boundary::factory,caller_rva) &&
             !scope->factory_reserved && scope->pair.available() &&
             read_remastered_preparation_context(module,factory_contract,scope->game,context);
@@ -42556,6 +42573,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             pair_pose_display_time > 0 &&
             remastered_pair_pose.tracking.display_time == pair_pose_display_time &&
             right_scene_descriptor != nullptr &&
+            (factory_contract != &w3vr::engine_camera::remastered_1048522 ||
+                w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock)) &&
             w3vr::modern_camera_pose::prepare_pair(factory_contract,*right_scene_descriptor,
                 remastered_pair_pose.tracking,
                 {g_config.hmd_position_scale, g_config.hmd_lock_game_pitch}, remastered_pose_pair) &&
@@ -42599,6 +42618,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     }
     g_engine_factory_eye = previous_eye;
     if (remastered_factory && duplicate_render && (!primary_camera_sequence ||
+        (factory_contract == &w3vr::engine_camera::remastered_1048522 &&
+            !w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock)) ||
         g_engine_camera_temporal_contract.load(std::memory_order_acquire)!=factory_contract ||
         !w3vr::modern_camera_pose::prepared_for(remastered_pose_pair,factory_contract,pair_pose_display_time) ||
         g_streamline_capture_generation.load(std::memory_order_acquire) != remastered_pair_generation)) {
