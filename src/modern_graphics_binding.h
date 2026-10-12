@@ -3,6 +3,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -10,16 +11,22 @@
 
 namespace w3vr::modern_graphics_binding {
 using Microsoft::WRL::ComPtr;
+inline constexpr UINT max_buffers=16;
 struct Data {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGISwapChain3> chain;
     ComPtr<IUnknown> device_identity,queue_identity,chain_identity;
     std::uint64_t epoch{};
-    UINT width{},height{};
+    UINT width{},height{},buffer_count{},present_count{};
+    std::array<ComPtr<ID3D12CommandQueue>,max_buffers> present_queues;
+    std::array<ComPtr<IUnknown>,max_buffers> present_identities;
+    std::array<UINT,max_buffers> creation_masks{};
+    bool explicit_present_queues{};
+
 };
 using Snapshot=std::shared_ptr<const Data>;
-struct Backbuffer {Snapshot binding;ComPtr<ID3D12Resource> resource;};
+struct Backbuffer {Snapshot binding;ComPtr<ID3D12Resource> resource;ComPtr<ID3D12CommandQueue> present_queue;UINT index{UINT_MAX};};
 inline bool finite(std::uint64_t value){return value && value!=UINT64_MAX;}
 inline ComPtr<IUnknown> identity(IUnknown* object){
     ComPtr<IUnknown> result;
@@ -45,7 +52,33 @@ class Registry {
         if(epoch_>=UINT64_MAX-1){accepting_.store(false,std::memory_order_release);return {};}
         resizing_=true;return {active_,++epoch_};
     }
-    void finish_resize(const Resize& ticket,HRESULT original_result){
+    struct QueueSet {
+        std::array<ComPtr<ID3D12CommandQueue>,max_buffers> queues;
+        std::array<ComPtr<IUnknown>,max_buffers> identities;
+        std::array<UINT,max_buffers> masks{};
+        UINT count{};
+    };
+    QueueSet stage_queues(const Resize& ticket,UINT requested_count,const UINT* masks,IUnknown* const* queues){
+        QueueSet result;
+        if(!ticket.original || !queues)return result;
+        const UINT count=requested_count?requested_count:ticket.original->buffer_count;
+        if(!count || count>max_buffers)return result;
+        for(UINT i=0;i<count;++i){
+            ComPtr<ID3D12Device> device;
+            if(!queues[i] || FAILED(queues[i]->QueryInterface(IID_PPV_ARGS(&result.queues[i]))) ||
+                result.queues[i]->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                FAILED(result.queues[i]->GetDevice(IID_PPV_ARGS(&device))))return {};
+            auto device_key=identity(device.Get());result.identities[i]=identity(result.queues[i].Get());
+            if(!device_key || !result.identities[i] || device_key.Get()!=ticket.original->device_identity.Get())return {};
+            // Zero BufferCount preserves the extent. Do not infer a queue
+            // change from a nominal zero-length input array.
+            if(!requested_count && (i>=ticket.original->present_count ||
+                result.identities[i].Get()!=ticket.original->present_identities[i].Get()))return {};
+            result.masks[i]=masks?masks[i]:0;
+        }
+        result.count=count;return result;
+    }
+    void finish_resize(const Resize& ticket,HRESULT original_result,const QueueSet* explicit_queues=nullptr){
         if(!ticket.original)return;
         // These added COM references and descriptor calls happen outside the
         // registry mutex. Existing snapshots keep the old Data alive.
@@ -55,7 +88,23 @@ class Registry {
             if(FAILED(next->chain->GetDesc1(&desc)) || !desc.Width || !desc.Height){
                 stop_no_release();return;
             }
-            next->width=desc.Width;next->height=desc.Height;
+            next->width=desc.Width;next->height=desc.Height;next->buffer_count=desc.BufferCount;
+            if(explicit_queues){
+                next->explicit_present_queues=true;next->present_count=0;
+                next->present_queues={};next->present_identities={};next->creation_masks={};
+                if(explicit_queues->count==desc.BufferCount && desc.BufferCount && desc.BufferCount<=max_buffers){
+                    next->present_count=desc.BufferCount;next->present_queues=explicit_queues->queues;
+                    next->present_identities=explicit_queues->identities;next->creation_masks=explicit_queues->masks;
+                    next->queue=next->present_queues[0];next->queue_identity=next->present_identities[0];
+                }
+            }else if(next->explicit_present_queues){
+                // Plain ResizeBuffers supplies no new queue array. After an
+                // explicit remap its queue association is not proven here.
+                next->present_count=0;next->present_queues={};next->present_identities={};
+            }else{
+                next->present_count=desc.BufferCount<=max_buffers?desc.BufferCount:0;
+                for(UINT i=0;i<next->present_count;++i){next->present_queues[i]=next->queue;next->present_identities[i]=next->queue_identity;}
+            }
         }
         Snapshot previous;
         {std::lock_guard lock{mutex_};
@@ -83,7 +132,10 @@ public:
         if(!next->device_identity || !next->queue_identity || !next->chain_identity ||
             !chain_device_key || chain_device_key.Get()!=next->device_identity.Get() ||
             FAILED(next->chain->GetDesc1(&desc)) || !desc.Width || !desc.Height)return false;
-        next->width=desc.Width;next->height=desc.Height;
+        if(!desc.BufferCount || desc.BufferCount>max_buffers)return false;
+        next->width=desc.Width;next->height=desc.Height;next->buffer_count=desc.BufferCount;
+        next->present_count=desc.BufferCount;
+        for(UINT i=0;i<desc.BufferCount;++i){next->present_queues[i]=next->queue;next->present_identities[i]=next->queue_identity;}
         {std::lock_guard lock{mutex_};
             if(!accepting_.load(std::memory_order_acquire) || resizing_)return false;
             // Replacing a different game chain needs a proven drain protocol.
@@ -98,14 +150,16 @@ public:
     Snapshot acquire()const{
         Snapshot result;
         {std::lock_guard lock{mutex_};
-            if(accepting_.load(std::memory_order_acquire) && !resizing_)result=active_;
+            if(accepting_.load(std::memory_order_acquire) && !resizing_ && active_ && active_->present_count &&
+                active_->present_count==active_->buffer_count)result=active_;
         }
         if(!accepting_.load(std::memory_order_acquire))result.reset();return result;
     }
     bool current(const Snapshot& snapshot)const{
         std::lock_guard lock{mutex_};
         return accepting_.load(std::memory_order_acquire) && !resizing_ && snapshot && active_ &&
-            snapshot.get()==active_.get() && finite(snapshot->epoch) && snapshot->epoch==epoch_;
+            snapshot.get()==active_.get() && snapshot->present_count && snapshot->present_count==snapshot->buffer_count &&
+            finite(snapshot->epoch) && snapshot->epoch==epoch_;
     }
     bool ready()const{return current(acquire());}
     bool owns_child(const Snapshot& snapshot,ID3D12DeviceChild* child)const{
@@ -117,6 +171,8 @@ public:
     Backbuffer acquire_backbuffer()const{
         Backbuffer result;result.binding=acquire();if(!result.binding)return {};
         const auto index=result.binding->chain->GetCurrentBackBufferIndex();
+        if(index>=result.binding->present_count || !result.binding->present_queues[index])return {};
+        result.index=index;result.present_queue=result.binding->present_queues[index];
         if(FAILED(result.binding->chain->GetBuffer(index,IID_PPV_ARGS(&result.resource))) ||
             !result.resource || !owns_child(result.binding,result.resource.Get()))return {};
         return result;
@@ -128,6 +184,16 @@ public:
         std::lock_guard resize_lock{resize_gate_};auto ticket=begin_resize(chain);
         const HRESULT result=original();
         try{finish_resize(ticket,result);}catch(...){stop_no_release();}
+        return result;
+    }
+    template<class Original>
+    HRESULT resize1_from_callback(IDXGISwapChain3* chain,UINT requested_count,
+        const UINT* creation_masks,IUnknown* const* present_queues,Original&& original){
+        std::lock_guard resize_lock{resize_gate_};auto ticket=begin_resize(chain);
+        QueueSet staged;
+        try{staged=stage_queues(ticket,requested_count,creation_masks,present_queues);}catch(...){staged={};}
+        const HRESULT result=original(); // Preserve actual arrays/arguments exactly once.
+        try{finish_resize(ticket,result,&staged);}catch(...){stop_no_release();}
         return result;
     }
     // Atomic revocation only: safe to request without COM/locks from DllMain.

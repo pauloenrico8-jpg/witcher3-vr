@@ -2198,6 +2198,7 @@ using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using ResizeBuffers1Fn=HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*,UINT,UINT,UINT,DXGI_FORMAT,UINT,const UINT*,IUnknown* const*);
 using GetDisplayModeListFn = HRESULT(STDMETHODCALLTYPE*)(
     IDXGIOutput*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC*);
 using GetDisplayModeList1Fn = HRESULT(STDMETHODCALLTYPE*)(
@@ -2334,6 +2335,9 @@ CreateSwapChainFn g_create_swapchain{};
 PresentFn g_present{};
 Present1Fn g_present1{};
 ResizeBuffersFn g_resize_buffers{};
+ResizeBuffers1Fn g_resize_buffers1{};
+std::atomic<void*> g_resize_buffers1_target{};
+std::atomic<bool> g_resize_buffers1_ready{};
 EngineViewportResolutionFn g_engine_viewport_resolution{};
 ExecuteCommandListsFn g_execute_command_lists{};
 w3vr::modern_dlss_native_hooks::Forwarder g_legacy_native_execute_forwarder;
@@ -6272,6 +6276,7 @@ HRESULT STDMETHODCALLTYPE hook_resize_buffers(
     UINT height,
     DXGI_FORMAT format,
     UINT flags);
+HRESULT STDMETHODCALLTYPE hook_resize_buffers1(IDXGISwapChain3*,UINT,UINT,UINT,DXGI_FORMAT,UINT,const UINT*,IUnknown* const*);
 void STDMETHODCALLTYPE hook_execute_command_lists(
     ID3D12CommandQueue* queue,
     UINT num_command_lists,
@@ -31992,8 +31997,13 @@ bool modern_backbuffer_hooks_accept(const w3vr::modern_graphics_binding::Snapsho
         classify_command_list_owner(binding->queue.Get())!=Owner::Native ||
         command->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT ||
         !modern_graphics_registry()->owns_child(binding,command))return false;
-    return g_modern_backbuffer_hook_receipts.accepts({method<void*>(command,10),
-        method<void*>(binding->queue.Get(),10),method<void*>(command,9),method<void*>(command,26)});
+    if(!binding->present_count || binding->present_count!=binding->buffer_count)return false;
+    for(UINT i=0;i<binding->present_count;++i){auto* queue=binding->present_queues[i].Get();
+        if(!queue || classify_command_list_owner(queue)!=Owner::Native ||
+            !g_modern_backbuffer_hook_receipts.accepts({method<void*>(command,10),method<void*>(queue,10),
+                method<void*>(command,9),method<void*>(command,26)}))return false;
+    }
+    return true;
 }
 bool modern_noaa_output_requested() {
     return g_config.openxr_mode==3 && g_config.temporal_backend==TemporalBackend::None &&
@@ -32001,9 +32011,11 @@ bool modern_noaa_output_requested() {
             g_remastered_core_installed_profile.load(std::memory_order_acquire));
 }
 bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contract) {
+    auto binding=modern_graphics_snapshot();
     return modern_noaa_output_requested() && remastered_core_ready_for(contract) &&
-        g_modern_backbuffer_hook_receipts.ready() &&
-        modern_graphics_current(modern_graphics_snapshot()) &&
+        g_modern_backbuffer_hook_receipts.ready() && g_resize_buffers1_ready.load(std::memory_order_acquire) &&
+        binding && method<void*>(binding->chain.Get(),39)==g_resize_buffers1_target.load(std::memory_order_acquire) &&
+        modern_graphics_current(binding) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire) &&
         !mode3_aer_presentation_active() && !g_config.steady_icons;
@@ -54735,6 +54747,25 @@ HRESULT STDMETHODCALLTYPE hook_resize_buffers(
     }return result;
 }
 
+HRESULT STDMETHODCALLTYPE hook_resize_buffers1(IDXGISwapChain3* swapchain,UINT buffer_count,
+    UINT width,UINT height,DXGI_FORMAT format,UINT flags,const UINT* creation_masks,IUnknown* const* present_queues){
+    const UINT effective_width=g_custom_resolution_active.load() && g_config.render_width>0?
+        static_cast<UINT>(g_config.render_width):width;
+    const UINT effective_height=g_custom_resolution_active.load() && g_config.render_height>0?
+        static_cast<UINT>(g_config.render_height):height;
+    auto original=[&]{
+        {std::scoped_lock lock{g_streamline_capture_mutex};g_modern_backbuffer_sources.collect();}
+        return g_resize_buffers1(swapchain,buffer_count,effective_width,effective_height,format,flags,creation_masks,present_queues);
+    };
+    auto* registry=modern_graphics_registry();
+    const HRESULT result=registry?registry->resize1_from_callback(swapchain,buffer_count,creation_masks,present_queues,original):original();
+    if(SUCCEEDED(result)){
+        DXGI_SWAP_CHAIN_DESC1 actual{};
+        if(SUCCEEDED(swapchain->GetDesc1(&actual))){g_game_render_width=actual.Width;g_game_render_height=actual.Height;}
+    }
+    return result;
+}
+
 void hook_present(IDXGISwapChain* swapchain) {
     if (swapchain == nullptr) {
         return;
@@ -54755,6 +54786,19 @@ void hook_present(IDXGISwapChain* swapchain) {
             MH_EnableHook(target) == MH_OK) {
             log_line("Hooked IDXGISwapChain::ResizeBuffers at %p", target);
         }
+    }
+
+    IDXGISwapChain3* swapchain3{};
+    if(SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3))) && swapchain3){
+        if(g_resize_buffers1==nullptr){
+            auto target=method<void*>(swapchain3,39);
+            g_resize_buffers1_target.store(target,std::memory_order_release);
+            const bool enabled=MH_CreateHook(target,reinterpret_cast<void*>(&hook_resize_buffers1),reinterpret_cast<void**>(&g_resize_buffers1))==MH_OK &&
+                MH_EnableHook(target)==MH_OK;
+            g_resize_buffers1_ready.store(enabled,std::memory_order_release);
+            if(enabled)log_line("Hooked IDXGISwapChain3::ResizeBuffers1 at %p",target);
+        }
+        swapchain3->Release();
     }
 
     IDXGISwapChain1* swapchain1{};
