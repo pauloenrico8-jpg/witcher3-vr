@@ -6,6 +6,70 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Origem conservada até reinicialização e conclusão de todos os envios — 12 de outubro
+
+Liguei a retenção da imagem de origem à gravação e ao envio real dos comandos.
+A referência temporária da captura, sozinha, acabava quando a função retornava;
+agora o registro próprio continua conservando a origem depois desse retorno.
+
+O fluxo, passo a passo:
+
+1. Antes do primeiro comando de cópia, guarda referências à origem, ao destino,
+   à lista de comandos e ao snapshot gráfico. Guarda também os identificadores
+   de captura, olho, par, geração e gravação. Não presume posse do alocador ou
+   dos objetos internos do motor do jogo.
+2. Em cada envio observado, encontra a lista no array que a chamada original
+   realmente recebe e confere a gravação. Conserva cada uso com sua fila.
+   Encaminha a chamada original uma vez, mesmo se rejeitar a observação.
+3. Depois do retorno original, associa o sinal retornado do produtor e seu
+   valor. Sinal ausente, desconhecido ou com falha conserva as referências.
+   Uma época desconhecida não é convertida em permissão de descarte.
+4. Uma gravação pode ser enviada novamente. Por isso a primeira conclusão da
+   GPU não libera automaticamente a origem: a lista continua podendo repetir
+   aquele uso até uma reinicialização original bem-sucedida encerrar a gravação.
+5. Só coleta um registro quando a CPU encerrou o uso, a gravação foi descartada
+   por reinicialização comprovada e todos os envios conhecidos concluíram seus
+   sinais exatos. Gravações sem envio também precisam desse descarte comprovado.
+6. A recriação dos buffers consulta a coleta antes da chamada original.
+   Destinos ainda retidos também não são reutilizados ou recriados pela captura.
+   A submissão interna opaca do ReShade continua isolada e não ganha essa captura.
+
+`modern_backbuffer_source.h` acompanha a retenção da origem e seus envios;
+`dxgi_proxy.cpp` usa esse contrato nas cópias, nos dois caminhos nativos de envio,
+na reinicialização e na recriação. Ele é separado da retenção do consumidor XR,
+que tem sua própria lista e seu próprio alocador. Escolhi separar os contratos
+para não fingir que o mod possui o alocador interno do jogo.
+
+A DLL compilou e **113/113 testes passaram em 8,40 segundos**. O teste gráfico
+separado passou com **24.878 verificações e 53 cópias reais**, incluindo leitura
+dos pixels. Usou buffers DirectX reais de janelas próprias ocultas, listas com
+dois elementos, sinais deliberadamente pendentes, reinicialização real com
+sucesso e falha, reinicialização de outra lista e reenvio da gravação. O reenvio
+exigiu padrões de pixels novos; os resultados da primeira cópia não serviam
+como prova da segunda. Testou leitura em outra fila com espera GPU real.
+
+O diagnóstico corrigiu um cenário do próprio teste que tentava escrever no
+buffer por uma fila diferente da associada à cadeia. Os testes finais executam
+as escritas na fila válida e a leitura separada com a dependência correta.
+A falha de sinal continua explicitamente simulada; criações, cópias, sinais de
+conclusão e falhas por buffers ainda retidos foram reais. A recuperação após
+sinal falho foi um sinal novo real de esvaziamento usado somente pelo teste;
+o host ainda conserva os usos sem prova e não chama essa recuperação.
+
+A execução original e as listas foram preservadas, mas o teste não instalou
+MinHook nem executou os callbacks dentro do Witcher. O contrato depende de
+observar todos os envios relevantes e não prova a posse dos objetos internos,
+do alocador nativo, todos os wrappers ou o encerramento da DLL. Referências
+conservam os objetos; a ordem correta dos comandos ainda precisa assegurar que
+seus pixels correspondam ao olho certo e ao quadro novo do jogo.
+
+**O VR ainda não é jogável e nada experimental foi instalado. O bloqueio de
+versão continua igual.** Ainda faltam a cobertura real dos callbacks e de
+recriação, o port completo de câmeras, recursos e históricos por olho, o ciclo
+de produção e cancelamento do par, a barreira de encerramento e a prova de duas
+imagens novas do jogo por quadro. Depois vêm Quest, cabeça, mãos, armas, dano,
+bloqueio e parry físicos. A meta de 60 FPS permanece cancelada.
+
 ## Referências gráficas próprias e invalidação após recriação — 12 de outubro
 
 Liguei a captura moderna a um registro que possui referências ao dispositivo,

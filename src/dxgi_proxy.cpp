@@ -40,6 +40,7 @@
 #include "modern_eye_source_use.h"
 #include "modern_eye_resource_set.h"
 #include "modern_graphics_binding.h"
+#include "modern_backbuffer_source.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
     D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
     D3D12_RESOURCE_STATE_PRESENT == 0 &&
@@ -1966,6 +1967,7 @@ struct ModernNoAASourceUse : w3vr::modern_eye_source_use::Use {
     std::array<XrView,2> views{{{XR_TYPE_VIEW},{XR_TYPE_VIEW}}};
 };
 w3vr::modern_eye_source_use::Store g_modern_noaa_source_store{};
+w3vr::modern_backbuffer_source::Store g_modern_backbuffer_sources{};
 void collect_modern_noaa_source_uses() {g_modern_noaa_source_store.collect();}
 bool modern_noaa_source_held(ID3D12Resource* resource) {return g_modern_noaa_source_store.held(resource);}
 void discard_modern_noaa_xr_recordings(ID3D12GraphicsCommandList* command) {
@@ -21069,10 +21071,12 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         !foliage_slot_retirement_needed) {
         // Keep the gaming path narrower than the temporal detour: no TAAU
         // tracking, readback scan, slot fence or diagnostic atomics.
+        w3vr::modern_backbuffer_source::Batch source_batch;
         {
-            w3vr::pipeline_flight::CpuScope flight_cpu{
-                w3vr::pipeline_flight::Phase::QueueSubmit};
-            forward_legacy_execute(queue, num_command_lists, command_lists);
+            w3vr::pipeline_flight::CpuScope flight_cpu{w3vr::pipeline_flight::Phase::QueueSubmit};
+            source_batch=g_modern_backbuffer_sources.execute_from_callback(g_streamline_capture_mutex,
+                queue,num_command_lists,command_lists,[](auto* command){return load_command_list_recording_epoch(command);},
+                [&]{forward_legacy_execute(queue,num_command_lists,command_lists);});
         }
         w3vr::pipeline_flight::on_execute(
             queue, num_command_lists, command_lists);
@@ -21084,10 +21088,13 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         ID3D12Fence* capture_fence{};
         uint64_t capture_fence_value{};
         const bool capture_ordered =
-            (streamline_capture_pending.empty() &&
+            (source_batch.empty() && streamline_capture_pending.empty() &&
                 rt_private_history_uses.empty()) ||
             signal_private_resource_queue_timeline(
                 queue, capture_fence, capture_fence_value);
+        {std::scoped_lock lock{g_streamline_capture_mutex};
+            g_modern_backbuffer_sources.after_signal(source_batch,capture_ordered,capture_fence,capture_fence_value);
+            g_modern_backbuffer_sources.collect();}
         publish_streamline_capture_submissions(
             queue, streamline_capture_pending, capture_ordered,
             capture_fence, capture_fence_value);
@@ -21283,10 +21290,12 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         }
     }
 
+    w3vr::modern_backbuffer_source::Batch source_batch;
     {
-        w3vr::pipeline_flight::CpuScope flight_cpu{
-            w3vr::pipeline_flight::Phase::QueueSubmit};
-        forward_legacy_execute(queue, num_command_lists, command_lists);
+        w3vr::pipeline_flight::CpuScope flight_cpu{w3vr::pipeline_flight::Phase::QueueSubmit};
+        source_batch=g_modern_backbuffer_sources.execute_from_callback(g_streamline_capture_mutex,
+            queue,num_command_lists,command_lists,[](auto* command){return load_command_list_recording_epoch(command);},
+            [&]{forward_legacy_execute(queue,num_command_lists,command_lists);});
     }
     w3vr::pipeline_flight::on_execute(
         queue, num_command_lists, command_lists);
@@ -21298,11 +21307,14 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
     ID3D12Fence* private_resource_fence{};
     uint64_t private_resource_fence_value{};
     const bool private_resource_ordered =
-        (taau_slot_uses.empty() && streamline_capture_pending.empty() &&
+        (source_batch.empty() && taau_slot_uses.empty() && streamline_capture_pending.empty() &&
             rt_private_history_uses.empty()) ||
         signal_private_resource_queue_timeline(
             queue, private_resource_fence,
             private_resource_fence_value);
+    {std::scoped_lock lock{g_streamline_capture_mutex};
+        g_modern_backbuffer_sources.after_signal(source_batch,private_resource_ordered,private_resource_fence,private_resource_fence_value);
+        g_modern_backbuffer_sources.collect();}
     publish_streamline_capture_submissions(
         queue, streamline_capture_pending, private_resource_ordered,
         private_resource_fence, private_resource_fence_value);
@@ -22737,6 +22749,7 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
         return g_reset_command_list(
             command_list, allocator, initial_state);
     }
+    const auto discarded_source_epoch=load_command_list_recording_epoch(command_list);
     const HRESULT result =
         forward_legacy_reset(command_list, allocator, initial_state);
     if (FAILED(result)) {
@@ -22779,6 +22792,8 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
 
     store_command_list_pipeline(command_list, initial_state);
     advance_command_list_recording_epoch(command_list);
+    {std::scoped_lock lock{g_streamline_capture_mutex};
+        g_modern_backbuffer_sources.after_reset(command_list,discarded_source_epoch,result);}
     if (auto* local = access_dlss_graphics_state(command_list, false)) {
         *local = {};
         local->pipeline_state = initial_state;
@@ -48755,6 +48770,9 @@ bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
     auto binding=modern ? modern_graphics_snapshot():nullptr;
     auto* allocation_device=modern ? (binding ? binding->device.Get():nullptr):g_d3d12_device;
     if(!allocation_device || (modern && !modern_graphics_current(binding)))return false;
+    g_modern_backbuffer_sources.collect();
+    for(auto* resource:g_stereo_eye_cache)if(g_modern_backbuffer_sources.held(resource))return false;
+    for(auto* resource:g_packed_present_cache)if(g_modern_backbuffer_sources.held(resource))return false;
     auto cache_desc=source_desc;cache_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
     D3D12_HEAP_PROPERTIES heap_props{};heap_props.Type=D3D12_HEAP_TYPE_DEFAULT;
     heap_props.CreationNodeMask=1;heap_props.VisibleNodeMask=1;
@@ -50419,6 +50437,9 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
     auto binding=modern ? modern_graphics_snapshot():nullptr;
     auto* allocation_device=modern ? (binding ? binding->device.Get():nullptr):g_d3d12_device;
     if(!allocation_device || (modern && !modern_graphics_current(binding)))return false;
+    g_modern_backbuffer_sources.collect();
+    for(const auto& eye:g_streamline_capture_ring)for(const auto& slot:eye)
+        if(g_modern_backbuffer_sources.held(slot.resource))return false;
     auto capture_desc=source_desc;capture_desc.Format = capture_format;
     capture_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
     D3D12_HEAP_PROPERTIES heap_props{};heap_props.Type=D3D12_HEAP_TYPE_DEFAULT;
@@ -50478,6 +50499,7 @@ bool reserve_streamline_capture_slot(
     }
     std::scoped_lock lock{g_streamline_capture_mutex};
     collect_modern_noaa_source_uses();
+    g_modern_backbuffer_sources.collect();
     const uint64_t start = g_streamline_capture_write_count[eye].fetch_add(
         1, std::memory_order_relaxed);
     for (uint32_t offset = 0;
@@ -50486,7 +50508,7 @@ bool reserve_streamline_capture_slot(
             (start + offset) % kStreamlineCaptureRingSize);
         auto& candidate = g_streamline_capture_ring[eye][candidate_index];
         if (candidate.recording_pending || candidate.resource == nullptr ||
-            modern_noaa_source_held(candidate.resource) || !private_resource_slot_retired(
+            modern_noaa_source_held(candidate.resource) || g_modern_backbuffer_sources.held(candidate.resource) || !private_resource_slot_retired(
                 candidate.last_use_fence,
                 candidate.last_use_fence_value)) {
             continue;
@@ -50602,7 +50624,8 @@ bool capture_tagged_backbuffer_output(
     const w3vr::modern_graphics_binding::Snapshot& binding) {
     const auto epoch=modern_identity ? load_command_list_recording_epoch(command_list):0;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
-    if(modern_identity && (!modern_noaa_output_ready(contract) || !modern_graphics_current(binding) ||
+    if(modern_identity && (is_reshade_immediate_command_list(command_list) ||
+        !modern_noaa_output_ready(contract) || !modern_graphics_current(binding) ||
         !w3vr::modern_eye_capture::admits(*modern_identity,contract,
             g_remastered_core_installed_profile.load(std::memory_order_acquire),true,generation) ||
         !w3vr::modern_eye_pair::finite(epoch) || modern_identity->frame.eye!=static_cast<int>(eye) ||
@@ -50623,6 +50646,21 @@ bool capture_tagged_backbuffer_output(
         return false;
     }
     auto& slot = g_streamline_capture_ring[eye][slot_index];
+    w3vr::modern_backbuffer_source::Record* source_record{};
+    if(modern_identity){
+        std::scoped_lock lock{g_streamline_capture_mutex};
+        try{
+            auto retained=std::make_unique<w3vr::modern_backbuffer_source::Record>();
+            retained->binding=binding;retained->source=source;retained->destination=slot.resource;
+            retained->command=command_list;retained->key={*modern_identity,epoch,capture_serial,slot_index};
+            source_record=g_modern_backbuffer_sources.adopt(std::move(retained));
+        }catch(...){}
+        if(!source_record){
+            if(slot.recording_pending && slot.capture_serial==capture_serial)slot.recording_pending=false;
+            return false; // No new resource command has been recorded yet.
+        }
+        g_modern_backbuffer_sources.mark_recorded(source_record);
+    }
     g_packed_capture_internal = true;
     if (destination_was_copy_source) {
         D3D12_RESOURCE_BARRIER to_copy_dest{};
@@ -50675,6 +50713,7 @@ bool capture_tagged_backbuffer_output(
         }
         g_streamline_capture_pending_publications[command_list].push_back({
             eye, slot_index, generation, pair_id, capture_serial,epoch});
+        if(source_record)g_modern_backbuffer_sources.finish_cpu(source_record);
     }
 
     if (g_config.runtime_diagnostics &&
@@ -54639,7 +54678,9 @@ HRESULT STDMETHODCALLTYPE hook_resize_buffers(
     log_line("ResizeBuffers requested=%ux%u effective=%ux%u buffers=%u format=%u",
         width, height, effective_width, effective_height, buffer_count,
         static_cast<unsigned>(format));
-    auto original=[&]{return g_resize_buffers(
+    auto original=[&]{
+        {std::scoped_lock lock{g_streamline_capture_mutex};g_modern_backbuffer_sources.collect();}
+        return g_resize_buffers(
         swapchain, buffer_count, effective_width, effective_height, format, flags);};
     auto* registry=modern_graphics_registry();
     const HRESULT result=registry ? registry->resize_from_callback(swapchain,original):original();

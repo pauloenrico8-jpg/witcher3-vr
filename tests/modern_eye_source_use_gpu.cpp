@@ -1,9 +1,11 @@
 #include "modern_eye_source_use.h"
 #include "modern_eye_resource_set.h"
 #include "modern_graphics_binding.h"
+#include "modern_backbuffer_source.h"
 #include <barrier>
 #include <thread>
 #include <dxgi1_6.h>
+#include <d3d12sdklayers.h>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -50,7 +52,23 @@ void wait(ID3D12Fence* finished,UINT64 value){
     if(FAILED(result)){CloseHandle(event);check(result,"completion event");}
     const DWORD waited=WaitForSingleObject(event,10000);CloseHandle(event);
     require(waited==WAIT_OBJECT_0,"GPU completion timeout");
-    require(finished->GetCompletedValue()!=UINT64_MAX && finished->GetCompletedValue()>=value,"device loss/unfinished fence");
+    const auto completed=finished->GetCompletedValue();
+    if(completed==UINT64_MAX){
+        ComPtr<ID3D12Device> lost_device;
+        if(SUCCEEDED(finished->GetDevice(IID_PPV_ARGS(&lost_device)))){
+            std::printf("REMOVAL_REASON %08lx\n",static_cast<unsigned long>(lost_device->GetDeviceRemovedReason()));
+            ComPtr<ID3D12InfoQueue> info;
+            if(SUCCEEDED(lost_device.As(&info))){
+                const auto count=info->GetNumStoredMessagesAllowedByRetrievalFilter();
+                for(UINT64 i=0;i<count;++i){SIZE_T bytes{};info->GetMessage(i,nullptr,&bytes);
+                    std::vector<unsigned char> storage(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                    if(SUCCEEDED(info->GetMessage(i,message,&bytes)) && message->Severity<=D3D12_MESSAGE_SEVERITY_WARNING)
+                        std::printf("D3D12_MESSAGE %u %s\n",message->ID,message->pDescription);
+                }
+            }
+        }
+    }
+    require(completed!=UINT64_MAX && completed>=value,"device loss/unfinished fence");
 }
 constexpr UINT64 stride=4096;
 D3D12_TEXTURE_COPY_LOCATION placed(ID3D12Resource* resource,UINT64 offset){
@@ -85,10 +103,10 @@ void readback(Recording& recording,ID3D12Resource* destination,const std::array<
         recording.command->CopyTextureRegion(&dst,0,0,0,&src,nullptr);++copies;
     }
 }
-void verify_pixels(ID3D12Resource* result){
+void verify_pixels(ID3D12Resource* result,unsigned char left=0x31,unsigned char right=0xC9){
     void* bytes{};D3D12_RANGE range{0,stride*2};check(result->Map(0,&range,&bytes),"readback map");
     for(unsigned eye=0;eye<2;++eye)for(unsigned y=0;y<16;++y)for(unsigned x=0;x<64;++x)
-        require(static_cast<unsigned char*>(bytes)[eye*stride+y*256+x]==(eye?0xC9:0x31),"distinct eye pixel copy mismatch");
+        require(static_cast<unsigned char*>(bytes)[eye*stride+y*256+x]==(eye?right:left),"distinct eye pixel copy mismatch");
     D3D12_RANGE no_write{0,0};result->Unmap(0,&no_write);
 }
 void copy_case(ID3D12Device* device,bool cross_queue){
@@ -369,15 +387,202 @@ void binding_case(ID3D12Device* device,IDXGIFactory6* factory){
     require(DestroyWindow(window)!=0,"destroy own hidden window");
     require(UnregisterClassW(wc.lpszClassName,instance)!=0,"unregister own hidden class");
 }
-int main()try{
+struct TrackedSource:w3vr::modern_backbuffer_source::Record {
+    unsigned* destroyed{};
+    ~TrackedSource(){++*destroyed;}
+};
+void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned mode){
+    namespace source=w3vr::modern_backbuffer_source;
+    namespace graphics=w3vr::modern_graphics_binding;
+    const auto instance=GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"W3VRSourceProbeHidden";
+    require(RegisterClassW(&wc)!=0,"source hidden class");
+    HWND window=CreateWindowExW(0,wc.lpszClassName,L"W3VR source probe",WS_POPUP,0,0,32,32,nullptr,nullptr,instance,nullptr);
+    require(window && !IsWindowVisible(window),"source hidden window");
+    {
+        auto producer=queue(device);auto completed=fence(device),gate=fence(device);
+        DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=16;desc.Height=16;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;
+        desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;ComPtr<IDXGISwapChain1> chain;
+        const HRESULT created=factory->CreateSwapChainForHwnd(producer.Get(),window,&desc,nullptr,nullptr,&chain);
+        check(created,"source real factory");graphics::Registry binding;
+        require(binding.publish_factory(created,producer.Get(),chain.Get()),"source binding publish");
+        auto acquired=binding.acquire_backbuffer();require(acquired.resource!=nullptr,"source real GetBuffer");
+        auto snapshot=acquired.binding;auto* native_source=acquired.resource.Get();
+        std::array<ComPtr<ID3D12Resource>,2> destinations{texture(device),texture(device)};
+        auto upload=upload_pixels(device),result=buffer(device,D3D12_HEAP_TYPE_READBACK,stride*2,D3D12_RESOURCE_STATE_COPY_DEST);
+        Recording recording(device),empty(device);empty.close();
+        source::Store retained{};std::mutex metadata_mutex;unsigned destroyed{};
+        for(unsigned eye=0;eye<2;++eye){
+            auto r=std::make_unique<TrackedSource>();r->destroyed=&destroyed;r->binding=snapshot;
+            r->source=acquired.resource;r->destination=destinations[eye];r->command=recording.command;
+            r->key={{&w3vr::render_core::remastered_1048522,0x1000,
+                {static_cast<std::uintptr_t>(0x2000+eye*0x100),9,100,static_cast<int>(eye),true,true}},8,50+eye,eye};
+            auto* registered=retained.adopt(std::move(r));require(registered!=nullptr,"source-only adoption");
+            retained.mark_recorded(registered);
+            D3D12_RESOURCE_BARRIER to_write{};to_write.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_write.Transition.pResource=native_source;
+            to_write.Transition.StateBefore=eye?D3D12_RESOURCE_STATE_COPY_SOURCE:D3D12_RESOURCE_STATE_PRESENT;
+            to_write.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;
+            to_write.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            recording.command->ResourceBarrier(1,&to_write);
+            auto pixels=placed(upload.Get(),eye*stride),target=subresource(native_source);
+            recording.command->CopyTextureRegion(&target,0,0,0,&pixels,nullptr);++copies;
+            std::swap(to_write.Transition.StateBefore,to_write.Transition.StateAfter);recording.command->ResourceBarrier(1,&to_write);
+            // After each write restore COPY_SOURCE for the corresponding copy.
+            if(eye==0){to_write.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;
+                to_write.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;recording.command->ResourceBarrier(1,&to_write);}
+            recording.command->CopyResource(destinations[eye].Get(),native_source);++copies;
+            retained.finish_cpu(registered);
+        }
+        D3D12_RESOURCE_BARRIER present{};present.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        present.Transition.pResource=native_source;present.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        present.Transition.StateAfter=D3D12_RESOURCE_STATE_PRESENT;present.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        recording.command->ResourceBarrier(1,&present);
+        for(const auto& dst:destinations){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource=dst.Get();b.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            recording.command->ResourceBarrier(1,&b);}
+        readback(recording,result.Get(),destinations);
+        for(const auto& dst:destinations){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource=dst.Get();b.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            recording.command->ResourceBarrier(1,&b);}
+        const HRESULT failed_reset=recording.command->Reset(recording.allocator.Get(),nullptr);
+        require(FAILED(failed_reset),"actual open source list Reset unexpectedly succeeded");
+        retained.after_reset(recording.command.Get(),8,failed_reset);
+        require(retained.size()==2 && retained.collect()==0,"failed Reset discarded source recording");
+        const HRESULT foreign_reset=empty.command->Reset(empty.allocator.Get(),nullptr);check(foreign_reset,"actual unrelated Reset");
+        retained.after_reset(empty.command.Get(),8,foreign_reset);
+        require(retained.size()==2 && retained.collect()==0,"unrelated Reset discarded source recording");empty.close();
+        recording.close();acquired.resource.Reset();destinations={};
+        require(retained.size()==2 && destroyed==0 && retained.held(native_source),"CPU return released recorded native buffer");
+        unsigned resize_calls{};
+        auto resize=[&]{return binding.resize_from_callback(chain.Get(),[&]()->HRESULT{
+            ++resize_calls;return chain->ResizeBuffers(2,32,32,DXGI_FORMAT_R8G8B8A8_UNORM,0);});};
+        require(FAILED(resize()),"recorded source was not retained across real resize");
+        unsigned original_calls{};
+        auto epoch=[&](auto* command){return command==recording.command.Get()?8ULL:0ULL;};
+        ID3D12CommandList* lists[]{empty.command.Get(),recording.command.Get()};
+        check(producer->Wait(gate.Get(),1),"block real source producer");
+        auto batch=retained.execute_from_callback(metadata_mutex,producer.Get(),2,lists,epoch,[&]{
+            ++original_calls;producer->ExecuteCommandLists(2,lists);});
+        require(batch.size()==2 && original_calls==1,"two-list Original array was suppressed or source missing");
+        if(mode==2){
+            retained.after_signal(batch,false,nullptr,0); // Explicit simulated signal failure.
+            check(producer->Signal(completed.Get(),1),"independent physical source completion");
+        }else{const HRESULT h=producer->Signal(completed.Get(),1);check(h,"source exact signal");
+            retained.after_signal(batch,SUCCEEDED(h),completed.Get(),1);}
+        require(retained.collect()==0 && FAILED(resize()),"pending source completed or resized prematurely");
+        check(gate->Signal(1),"release real source producer gate");wait(completed.Get(),1);verify_pixels(result.Get());
+        require(retained.collect()==0,"replayable recording released after only first completion");
+        if(mode==1){
+            auto second_queue=producer;auto second_done=fence(device),second_gate=fence(device);
+            check(second_queue->Wait(completed.Get(),1),"explicit prior producer GPU dependency");
+            check(second_queue->Wait(second_gate.Get(),1),"block second real producer");
+            void* fresh_pixels{};D3D12_RANGE no_read{0,0};check(upload->Map(0,&no_read,&fresh_pixels),"fresh replay upload map");
+            for(unsigned eye=0;eye<2;++eye)for(unsigned y=0;y<16;++y)
+                std::memset(static_cast<unsigned char*>(fresh_pixels)+eye*stride+y*256,eye?0xB3:0x5A,64);
+            upload->Unmap(0,nullptr);
+            ID3D12CommandList* replay_lists[]{recording.command.Get(),empty.command.Get()};
+            auto replay=retained.execute_from_callback(metadata_mutex,second_queue.Get(),2,replay_lists,epoch,[&]{
+                ++original_calls;second_queue->ExecuteCommandLists(2,replay_lists);copies+=6;});
+            require(replay.size()==2,"repeated recording lost second physical queue use");
+            const HRESULT h=second_queue->Signal(second_done.Get(),9);check(h,"second real source signal");
+            retained.after_signal(replay,SUCCEEDED(h),second_done.Get(),9);
+            Recording next_allocator(device);next_allocator.close();
+            const HRESULT reset=recording.command->Reset(next_allocator.allocator.Get(),nullptr);check(reset,"actual source Reset while submitted");
+            retained.after_reset(recording.command.Get(),8,reset);
+            require(retained.collect()==0 && FAILED(resize()),"first completion retired second pending producer");
+            check(second_gate->Signal(1),"release second source gate");wait(second_done.Get(),9);verify_pixels(result.Get(),0x5A,0xB3);
+        }else{
+            const HRESULT reset=recording.command->Reset(recording.allocator.Get(),nullptr);check(reset,"actual source successful Reset");
+            retained.after_reset(recording.command.Get(),8,reset);
+            if(mode==2){
+                require(retained.collect()==0 && FAILED(resize()),"failed signal retired from unrelated completion");
+                const HRESULT drain=producer->Signal(completed.Get(),2);check(drain,"probe-only actual source drain signal");
+                retained.after_drain(producer.Get(),drain,completed.Get(),2);wait(completed.Get(),2);
+            }
+        }
+        retained.collect();require(retained.size()==0 && destroyed==2,"source did not retire after seal and ALL exact signals");
+        check(resize(),"real resize after source retirement");
+        require(binding.acquire()->width==32,"source retirement resize dimensions");
+        std::printf("PASS native backbuffer source mode=%u: 2-list Original calls=%u, actual ResizeBuffers calls=%u, recorded/replay/submitted ownership, exact successful Reset and GPU readback\n",
+            mode,original_calls,resize_calls);
+    }
+    require(DestroyWindow(window)!=0 && UnregisterClassW(wc.lpszClassName,instance)!=0,"close own source hidden window");
+}
+void read_only_source_case(ID3D12Device* device,IDXGIFactory6* factory){
+    namespace source=w3vr::modern_backbuffer_source;
+    const auto instance=GetModuleHandleW(nullptr);WNDCLASSW wc{};wc.hInstance=instance;
+    wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"W3VRReadSourceHidden";
+    require(RegisterClassW(&wc)!=0,"read source class");
+    HWND window=CreateWindowExW(0,wc.lpszClassName,L"W3VR read source",WS_POPUP,0,0,32,32,nullptr,nullptr,instance,nullptr);
+    require(window && !IsWindowVisible(window),"read source hidden window");
+    {
+        auto renderer=queue(device),reader=queue(device);auto rendered=fence(device),completed=fence(device),gate=fence(device);
+        DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=16;desc.Height=16;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        ComPtr<IDXGISwapChain1> chain;const HRESULT created=factory->CreateSwapChainForHwnd(renderer.Get(),window,&desc,nullptr,nullptr,&chain);
+        check(created,"read source actual factory");w3vr::modern_graphics_binding::Registry binding;
+        require(binding.publish_factory(created,renderer.Get(),chain.Get()),"read source binding");auto snapshot=binding.acquire();
+        std::array<ComPtr<ID3D12Resource>,2> inputs,destinations{texture(device),texture(device)};
+        auto acquired=binding.acquire_backbuffer();require(acquired.resource!=nullptr,"current real read source");
+        inputs={acquired.resource,acquired.resource};acquired.resource.Reset();
+        Recording writer(device),recording(device),empty(device);empty.close();auto upload=upload_pixels(device);
+        auto result=buffer(device,D3D12_HEAP_TYPE_READBACK,stride*2,D3D12_RESOURCE_STATE_COPY_DEST);
+        for(UINT eye=0;eye<1;++eye){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource=inputs[eye].Get();b.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;
+            b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            writer.command->ResourceBarrier(1,&b);auto pixels=placed(upload.Get(),eye*stride),target=subresource(inputs[eye].Get());
+            writer.command->CopyTextureRegion(&target,0,0,0,&pixels,nullptr);++copies;
+            std::swap(b.Transition.StateBefore,b.Transition.StateAfter);writer.command->ResourceBarrier(1,&b);
+        }
+        writer.close();ID3D12CommandList* writer_lists[]{writer.command.Get()};renderer->ExecuteCommandLists(1,writer_lists);
+        check(renderer->Signal(rendered.Get(),1),"real renderer signal");check(reader->Wait(rendered.Get(),1),"real cross-queue read dependency");
+        source::Store retained{};std::mutex mutex;unsigned destroyed{};
+        for(UINT eye=0;eye<2;++eye){auto r=std::make_unique<TrackedSource>();r->destroyed=&destroyed;
+            r->binding=snapshot;r->source=inputs[eye];r->destination=destinations[eye];r->command=recording.command;
+            r->key={{&w3vr::render_core::remastered_1048522,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),9,101,static_cast<int>(eye),true,true}},8,60+eye,eye};
+            auto* owned=retained.adopt(std::move(r));require(owned!=nullptr,"read-only source registration");retained.mark_recorded(owned);
+            D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=inputs[eye].Get();
+            b.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;recording.command->ResourceBarrier(1,&b);
+            recording.command->CopyResource(destinations[eye].Get(),inputs[eye].Get());++copies;
+            std::swap(b.Transition.StateBefore,b.Transition.StateAfter);recording.command->ResourceBarrier(1,&b);
+            b.Transition.pResource=destinations[eye].Get();b.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;recording.command->ResourceBarrier(1,&b);
+            retained.finish_cpu(owned);
+        }
+        readback(recording,result.Get(),destinations);recording.close();inputs={};destinations={};
+        check(reader->Wait(gate.Get(),1),"block actual read-only source use");ID3D12CommandList* lists[]{empty.command.Get(),recording.command.Get()};unsigned originals{};
+        auto batch=retained.execute_from_callback(mutex,reader.Get(),2,lists,[](auto*){return 8ULL;},[&]{++originals;reader->ExecuteCommandLists(2,lists);});
+        const HRESULT signalled=reader->Signal(completed.Get(),1);check(signalled,"real reader signal");
+        retained.after_signal(batch,SUCCEEDED(signalled),completed.Get(),1);
+        Recording next_allocator(device);next_allocator.close();const HRESULT reset=recording.command->Reset(next_allocator.allocator.Get(),nullptr);
+        check(reset,"read-only actual Reset");retained.after_reset(recording.command.Get(),8,reset);
+        require(retained.size()==2 && destroyed==0,"read-only pending sources released");
+        require(FAILED(chain->ResizeBuffers(2,32,32,DXGI_FORMAT_R8G8B8A8_UNORM,0)),"read-only pending native buffers resized");
+        check(gate->Signal(1),"release read-only source gate");wait(completed.Get(),1);verify_pixels(result.Get(),0x31,0x31);retained.collect();
+        require(retained.size()==0 && destroyed==2 && originals==1,"cross-queue source retirement or Original count wrong");
+        check(chain->ResizeBuffers(2,32,32,DXGI_FORMAT_R8G8B8A8_UNORM,0),"resize after read-only exact completion");
+        std::puts("PASS read-only native backbuffers on different DIRECT queue: actual writer queue preserved, real Wait, 2-list Original, exact signal/Reset and current-buffer pixels");
+    }
+    require(DestroyWindow(window)!=0 && UnregisterClassW(wc.lpszClassName,instance)!=0,"close read source hidden window");
+}
+int main(int argc,char** argv)try{
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     ComPtr<IDXGIFactory6> factory;check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"factory");
     ComPtr<IDXGIAdapter1> adapter;check(factory->EnumAdapterByGpuPreference(0,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,IID_PPV_ARGS(&adapter)),"hardware adapter");
     DXGI_ADAPTER_DESC1 description{};check(adapter->GetDesc1(&description),"adapter description");
     require((description.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)==0,"physical GPU required");
     std::printf("GPU %ls dedicated_bytes=%llu\n",description.Description,static_cast<unsigned long long>(description.DedicatedVideoMemory));
+    ComPtr<ID3D12Debug> debug;
+    if(argc>1 && std::strcmp(argv[1],"--debug")==0 && SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))){debug->EnableDebugLayer();std::puts("PROBE_DEBUG_LAYER=true");}
     ComPtr<ID3D12Device> device;check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"device");
     copy_case(device.Get(),false);copy_case(device.Get(),true);reset_cases(device.Get());failure_case(device.Get());replacement_case<4>(device.Get());replacement_case<6>(device.Get());binding_case(device.Get(),factory.Get());
+    for(unsigned mode=0;mode<3;++mode)source_lifetime_case(device.Get(),factory.Get(),mode);
+    read_only_source_case(device.Get(),factory.Get());
     std::printf("PASS shared host source-use store: %u checks, %u real texture copies, physical readback\n",checks,copies);
     std::puts("Signal/partial-allocation HRESULTs are simulated; real device removal not induced.");
     std::puts("GAME=false HEADSET=false OPENXR=false NATIVE_CAMERA=false VR_FUNCTIONAL=false");return 0;
