@@ -61,7 +61,9 @@ class Registry {
     QueueSet stage_queues(const Resize& ticket,UINT requested_count,const UINT* masks,IUnknown* const* queues){
         QueueSet result;
         if(!ticket.original || !queues)return result;
-        const UINT count=requested_count?requested_count:ticket.original->buffer_count;
+        // The public arrays are sized by requested_count. A zero count gives
+        // no readable extent here; GetDesc cannot enlarge that borrowed array.
+        const UINT count=requested_count;
         if(!count || count>max_buffers)return result;
         for(UINT i=0;i<count;++i){
             ComPtr<ID3D12Device> device;
@@ -70,10 +72,6 @@ class Registry {
                 FAILED(result.queues[i]->GetDevice(IID_PPV_ARGS(&device))))return {};
             auto device_key=identity(device.Get());result.identities[i]=identity(result.queues[i].Get());
             if(!device_key || !result.identities[i] || device_key.Get()!=ticket.original->device_identity.Get())return {};
-            // Zero BufferCount preserves the extent. Do not infer a queue
-            // change from a nominal zero-length input array.
-            if(!requested_count && (i>=ticket.original->present_count ||
-                result.identities[i].Get()!=ticket.original->present_identities[i].Get()))return {};
             result.masks[i]=masks?masks[i]:0;
         }
         result.count=count;return result;

@@ -7,6 +7,68 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Instalação independente da captura moderna — 12 de outubro
+
+A captura moderna agora pode completar suas quatro ligações com o DirectX quando
+for solicitada depois da instalação inicial. Antes, os indicadores gerais de
+“já instalado” podiam encerrar essa etapa sem instalar o fechamento da lista de
+comandos. Uma lista é o conjunto de instruções enviado à placa de vídeo.
+
+O fluxo, passo a passo:
+
+1. O host confere o modo solicitado, a versão selecionada e o registro gráfico
+   atual. Exige interfaces nativas conhecidas e a mesma função concreta de envio
+   em todas as filas declaradas. Uma interface intermediária sem prova permanece
+   rejeitada; compartilhar um dispositivo não basta.
+2. Na primeira tentativa, cria uma lista própria e vazia para localizar os
+   métodos concretos. Ela não executa trabalho gráfico e não representa a lista
+   ou o alocador do motor do jogo. Tentativas já concluídas não criam outra lista.
+3. O helper de instalação reaproveita somente ligações habilitadas com alvo e
+   função original exatos. Cria todas as ligações ausentes antes de habilitar
+   qualquer uma delas. Um ponteiro preenchido sozinho não vale como instalação.
+4. Se a tentativa falhar parcialmente, fecha a admissão e conserva as funções
+   originais para encaminhar chamadas já possíveis. Não remove essas ligações,
+   não apaga seus ponteiros nem tenta reinstalá-las automaticamente. Isso ainda
+   não resolve a parada completa ou a retirada segura da DLL do processo.
+5. Os instaladores antigos e o novo compartilham um mecanismo que impede duas
+   alterações simultâneas. O host reconfere modo, contrato e registro durante a
+   instalação. A apresentação também solicita essa etapa, independentemente dos
+   indicadores antigos. Não presume que um resultado do programa de teste
+   comprova a instalação dentro do Witcher.
+
+Corrigi também o tratamento da quantidade zero em `ResizeBuffers1`, a chamada
+que recria os buffers. Agora não lê os arrays de filas ou máscaras quando o
+chamador declarou zero elementos. A descrição anterior do buffer não aumenta o
+espaço legível desses arrays. Se a chamada original tiver sucesso nesse caso,
+fecha a captura até receber uma associação explícita com quantidade válida;
+em falha, conserva os dados anteriores. O resultado original é preservado.
+Esta regra **substitui a regra de quantidade zero da etapa anterior**.
+
+`modern_backbuffer_hooks.h` contém o helper usado pelo host e pelo teste;
+`dxgi_proxy.cpp` seleciona os alvos e coordena os instaladores;
+`modern_graphics_binding.h` conserva associações de buffers e filas;
+`modern_eye_source_use_gpu.cpp` exercita essas partes com interfaces reais.
+Escolhi reutilizar a mesma rotina de instalação no teste para verificar o
+comportamento do código que o host efetivamente chama.
+
+A DLL compilou e **113/113 testes passaram em 10,51 segundos**. O programa separado
+conferiu **62 cópias reais com leitura dos pixels**. No caso novo, três ligações
+nativas já habilitadas foram reutilizadas; a quarta foi criada e habilitada uma
+vez. Repetir o pedido não reinstalou as ligações. O teste também usou a recriação
+real dos buffers e recuperou a associação com uma quantidade explícita válida.
+A falha parcial de habilitação foi provocada artificialmente. O caso de array
+inacessível com quantidade zero usou uma função original simulada; não passou
+esse ponteiro inválido ao DirectX. A falha de sinal dos cenários anteriores
+continua simulada.
+
+**O VR ainda não funciona e nada experimental foi instalado no jogo.** O teste
+não executou os callbacks do host no Witcher, câmeras do motor, OpenXR ou Quest.
+O bloqueio de versões continua igual. Os próximos passos são comprovar as
+interfaces intermediárias e seus endpoints nativos, fechar o ciclo de vida e
+portar câmeras, recursos e históricos por olho. Primeiro duas imagens novas do
+jogo em cada quadro; depois cabeça, mãos, armas, dano e bloqueio físicos no Quest.
+DLSS e IntelFG permanecem opcionais; a meta de 60 FPS foi cancelada.
+
 ## Recriação com filas explícitas por buffer — 12 de outubro
 
 Liguei `ResizeBuffers1` ao registro gráfico moderno. Essa chamada do DirectX
@@ -26,9 +88,10 @@ O fluxo, passo a passo:
 3. Em falha, conserva as filas e dimensões anteriores, com uma época nova que
    invalida capturas antigas. Em sucesso, publica a associação explícita válida
    por buffer. A aquisição conserva também a fila correspondente ao índice atual.
-4. Quando a quantidade informada é zero, aceita como prova somente uma associação
-   igual à anterior, com a quantidade real preservada. Não deduz uma troca de
-   filas de um array de extensão nominal zero. Uma recriação simples posterior
+4. A regra de quantidade zero desta etapa foi substituída pela correção descrita
+   em “Instalação independente da captura moderna”, acima: os arrays não são
+   lidos e o sucesso fecha a aquisição até uma associação explícita válida.
+   Uma recriação simples posterior
    a um remapeamento explícito fecha a aquisição até uma associação explícita
    nova: aquele caminho não informa suas filas ao registro.
 5. A prontidão moderna exige `ResizeBuffers1` realmente habilitado na mesma
