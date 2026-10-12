@@ -42,6 +42,13 @@ public:
         }
         installed.enabled.store(true,std::memory_order_release);return !failed_.load(std::memory_order_acquire);
     }
+    bool failed()const{return failed_.load(std::memory_order_acquire);}
+    bool has_site(Site site)const{const auto i=static_cast<std::size_t>(site);
+        return i<sites_.size() && (sites_[i].target.load(std::memory_order_acquire) || sites_[i].original.load(std::memory_order_acquire));}
+    bool matches(Site site,void* actual,void* original)const{const auto i=static_cast<std::size_t>(site);
+        return !failed() && i<sites_.size() && native_target(actual) && original &&
+            sites_[i].enabled.load(std::memory_order_acquire) && sites_[i].target.load(std::memory_order_acquire)==actual &&
+            sites_[i].original.load(std::memory_order_acquire)==original;}
     bool accepts(const Targets& actual)const {
         if(failed_.load(std::memory_order_acquire))return false;
         for(std::size_t i=0;i<sites_.size();++i) {
@@ -53,4 +60,30 @@ public:
     bool ready()const{Targets actual{};for(std::size_t i=0;i<sites_.size();++i)actual[i]=sites_[i].target.load(std::memory_order_acquire);return accepts(actual);}
     void revoke(){failed_.store(true,std::memory_order_release);}
 };
+// Caller serializes this POD state with its hook mutations. Reuse requires an
+// exact enabled receipt from our existing owner, never a bare trampoline.
+struct Installation {Targets targets{};bool attempted{},failed{};};
+template<class Create,class Enable>
+bool install_once(bool requested,Receipts& receipts,Installation& state,const Targets& targets,
+    const std::array<void**,4>& originals,Create&& create,Enable&& enable){
+    if(!requested || state.failed || receipts.failed())return false;
+    auto fail=[&]{state.failed=true;receipts.revoke();return false;};
+    if(state.attempted)return targets==state.targets && receipts.accepts(targets)?true:fail();
+    for(std::size_t i=0;i<targets.size();++i)if(!originals[i] || !native_target(targets[i]))return false;
+    std::array<bool,4> reused{};
+    for(std::size_t i=0;i<targets.size();++i){
+        reused[i]=receipts.matches(static_cast<Site>(i),targets[i],*originals[i]);
+        if(!reused[i] && (*originals[i] || receipts.has_site(static_cast<Site>(i))))return fail();
+    }
+    state.attempted=true;state.targets=targets;
+    try{
+        // Construct every missing trampoline before enabling any new site.
+        // A partial failure retains them. No Remove/null/implicit retry.
+        for(std::size_t i=0;i<targets.size();++i)if(!reused[i] && (!create(i,targets[i],originals[i]) || !*originals[i]))return fail();
+        for(std::size_t i=0;i<targets.size();++i)if(!reused[i]){
+            if(!enable(i,targets[i]) || !receipts.publish(static_cast<Site>(i),targets[i],*originals[i],true))return fail();
+        }
+        return receipts.accepts(targets)?true:fail();
+    }catch(...){return fail();}
+}
 } // namespace w3vr::modern_backbuffer_hooks

@@ -1970,6 +1970,8 @@ struct ModernNoAASourceUse : w3vr::modern_eye_source_use::Use {
 w3vr::modern_eye_source_use::Store g_modern_noaa_source_store{};
 w3vr::modern_backbuffer_source::Store g_modern_backbuffer_sources{};
 w3vr::modern_backbuffer_hooks::Receipts g_modern_backbuffer_hook_receipts;
+w3vr::modern_backbuffer_hooks::Installation g_modern_source_installation;
+std::recursive_mutex g_modern_source_install_mutex;
 void collect_modern_noaa_source_uses() {g_modern_noaa_source_store.collect();}
 bool modern_noaa_source_held(ID3D12Resource* resource) {return g_modern_noaa_source_store.held(resource);}
 void discard_modern_noaa_xr_recordings(ID3D12GraphicsCommandList* command) {
@@ -19621,7 +19623,53 @@ void scan_mapped_resources_periodically(uint64_t frame) {
     }
 }
 
+void install_modern_source_bundle() {
+    if(!modern_noaa_output_requested())return;
+    std::scoped_lock mutation{g_modern_source_install_mutex};
+    if(g_modern_source_installation.failed || g_modern_backbuffer_hook_receipts.failed())return;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto binding=modern_graphics_snapshot();
+    using w3vr::command_list_identity::Owner;
+    if(!binding || !modern_graphics_current(binding) || classify_command_list_owner(binding->device.Get())!=Owner::Native ||
+        !binding->present_count || binding->present_count!=binding->buffer_count)return;
+    void* execute_target{};
+    for(UINT i=0;i<binding->present_count;++i){auto* queue=binding->present_queues[i].Get();
+        if(!queue || classify_command_list_owner(queue)!=Owner::Native)return;
+        auto* target=method<void*>(queue,10);if(!execute_target)execute_target=target;
+        else if(target!=execute_target)return;
+    }
+    if(g_modern_source_installation.attempted){
+        if(execute_target!=g_modern_source_installation.targets[1] || !g_modern_backbuffer_hook_receipts.ready()){
+            g_modern_source_installation.failed=true;g_modern_backbuffer_hook_receipts.revoke();
+        }
+        return; // Do not allocate a discovery command list every Present.
+    }
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command;
+    if(FAILED(binding->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator))) ||
+        FAILED(binding->device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&command))) ||
+        classify_command_list_owner(command.Get())!=Owner::Native || FAILED(command->Close()))return;
+    const w3vr::modern_backbuffer_hooks::Targets targets{method<void*>(command.Get(),10),execute_target,
+        method<void*>(command.Get(),9),method<void*>(command.Get(),26)};
+    const std::array<void*,4> detours{reinterpret_cast<void*>(&hook_reset_command_list),reinterpret_cast<void*>(&hook_execute_command_lists),
+        reinterpret_cast<void*>(&hook_close_command_list),reinterpret_cast<void*>(&hook_resource_barrier)};
+    const std::array<void**,4> originals{reinterpret_cast<void**>(&g_reset_command_list),reinterpret_cast<void**>(&g_execute_command_lists),
+        reinterpret_cast<void**>(&g_close_command_list),reinterpret_cast<void**>(&g_resource_barrier)};
+    auto admitted=[&]{return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) &&
+        modern_noaa_output_requested() && modern_graphics_current(binding);};
+    w3vr::modern_backbuffer_hooks::install_once(admitted(),g_modern_backbuffer_hook_receipts,g_modern_source_installation,targets,originals,
+        [&](std::size_t i,void* target,void** original){return admitted() && MH_CreateHook(target,detours[i],original)==MH_OK;},
+        [&](std::size_t,void* target){return admitted() && MH_EnableHook(target)==MH_OK;});
+    if(!admitted())g_modern_backbuffer_hook_receipts.revoke();
+    if(g_modern_backbuffer_hook_receipts.matches(w3vr::modern_backbuffer_hooks::Site::Reset,targets[0],reinterpret_cast<void*>(g_reset_command_list)) &&
+        !g_legacy_native_reset_forwarder)g_legacy_native_reset_forwarder=w3vr::modern_dlss_native_hooks::reset_forwarder(targets[0],g_reset_command_list);
+    if(g_modern_backbuffer_hook_receipts.matches(w3vr::modern_backbuffer_hooks::Site::Execute,targets[1],reinterpret_cast<void*>(g_execute_command_lists)) &&
+        !g_legacy_native_execute_forwarder)g_legacy_native_execute_forwarder=w3vr::modern_dlss_native_hooks::execute_forwarder(targets[1],g_execute_command_lists);
+}
+
 void install_reverse_hooks() {
+    install_modern_source_bundle();
+    std::scoped_lock mutation{g_modern_source_install_mutex};
     if (!renderer_hook_installation_needed() || g_reverse_hooks_installed ||
         g_d3d12_device == nullptr) {
         return;
@@ -19878,7 +19926,7 @@ void install_resource_hooks(ID3D12Resource* resource) {
 }
 
 void install_command_list_hooks() {
-    if (!renderer_hook_installation_needed() || g_command_list_hooks_installed ||
+    std::scoped_lock mutation{g_modern_source_install_mutex};    if (!renderer_hook_installation_needed() || g_command_list_hooks_installed ||
         g_d3d12_device == nullptr) {
         return;
     }
@@ -29453,7 +29501,7 @@ void STDMETHODCALLTYPE hook_resource_barrier(
 }
 
 void install_streamline_resource_barrier_probe() {
-    if (g_resource_barrier != nullptr || g_d3d12_device == nullptr) {
+    std::scoped_lock mutation{g_modern_source_install_mutex};    if (g_resource_barrier != nullptr || g_d3d12_device == nullptr) {
         return;
     }
 
@@ -55103,6 +55151,7 @@ void record_route_flight_present_end(HRESULT result) {
 }
 
 HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
+    install_modern_source_bundle();
     if (w3vr::pipeline_flight::enabled()) {
         w3vr::pipeline_flight::process_gpu();
     }
