@@ -440,7 +440,15 @@ void resize1_case(ID3D12Device* device,IDXGIFactory6* factory){
         auto finished=fence(device);check(current.present_queue->Signal(finished.Get(),1),"remapped actual signal");wait(finished.Get(),1);verify_pixels(result.Get(),0x31,0x31);
         current.resource.Reset();
         check(resize(0,16,masks,explicit_queues),"zero-count actual Resize1 same queue map");
-        auto zero=registry.acquire();require(zero && zero->buffer_count==2 && zero->present_queues[0].Get()==second_queue.Get(),"zero-count resize lost unchanged map");
+        require(!registry.acquire() && !registry.acquire_backbuffer().resource,"zero-count resize invented readable array extent");
+        void* no_access=VirtualAlloc(nullptr,4096,MEM_RESERVE|MEM_COMMIT,PAGE_NOACCESS);
+        require(no_access!=nullptr,"allocate unreadable zero-extent input page");unsigned guard_originals{};
+        const HRESULT guarded=registry.resize1_from_callback(chain.Get(),0,reinterpret_cast<const UINT*>(no_access),
+            reinterpret_cast<IUnknown* const*>(no_access),[&]{++guard_originals;return E_FAIL;}); // SIMULATED Original result, no Native API call with guard input.
+        require(guarded==E_FAIL && guard_originals==1 && !registry.acquire(),"zero-count helper inspected unreadable arrays or changed Original result");
+        require(VirtualFree(no_access,0,MEM_RELEASE)!=0,"release guard page");
+        check(resize(2,16,masks,explicit_queues),"explicit map after zero-count resize");
+        auto zero=registry.acquire();require(zero && zero->buffer_count==2,"explicit map did not recover zero-count rejection");
         ComPtr<IDXGISwapChain1> auxiliary1;check(factory->CreateSwapChainForComposition(first_queue.Get(),&desc,nullptr,&auxiliary1),"resize1 auxiliary factory");
         ComPtr<IDXGISwapChain3> auxiliary;check(auxiliary1.As(&auxiliary),"resize1 auxiliary interface");unsigned foreign_calls{};
         IUnknown* auxiliary_queues[]{first_queue.Get(),first_queue.Get()};
@@ -453,7 +461,7 @@ void resize1_case(ID3D12Device* device,IDXGIFactory6* factory){
         require(registry.ready() && registry.acquire()->epoch>zero->epoch,"explicit actual remap did not recover acquisition");
         first_queue.Reset();second_queue.Reset();
         require(mapped->present_queues[0]->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT,"old snapshot lost remapped queue reference");
-        std::printf("PASS actual ResizeBuffers1: per-buffer queue remap, native pixels, retained-source failure, zero-count same map, auxiliary isolation, plain-map rejection/recovery; Original calls=%u plus auxiliary=%u\n",originals,foreign_calls);
+        std::printf("PASS actual ResizeBuffers1: per-buffer queue remap, native pixels, retained-source failure, zero-count unreadable extent rejected, explicit recovery, auxiliary isolation, plain-map rejection/recovery; Original calls=%u plus auxiliary=%u\n",originals,foreign_calls);
     }
     require(DestroyWindow(window)!=0 && UnregisterClassW(wc.lpszClassName,instance)!=0,"resize1 window cleanup");
 }
@@ -714,14 +722,22 @@ void native_source_hooks_case(ID3D12Device* device,IDXGIFactory6* factory){
         reinterpret_cast<void*>(&probe::close_hook),reinterpret_cast<void*>(&probe::barrier_hook)};
     const std::array<void**,4> originals{reinterpret_cast<void**>(&probe::reset_original),reinterpret_cast<void**>(&probe::execute_original),
         reinterpret_cast<void**>(&probe::close_original),reinterpret_cast<void**>(&probe::barrier_original)};
-    for(std::size_t i=0;i<targets.size();++i){
+    for(std::size_t i=0;i<targets.size();++i)if(i!=2){
         require(hooks::native_target(targets[i]),"probe target was not concrete Native DirectX");
-        require(MH_CreateHook(targets[i],detours[i],originals[i])==MH_OK,"probe CreateHook");
-        require(!receipts.accepts(targets),"unenabled/partial hooks admitted capture");
-        require(MH_EnableHook(targets[i])==MH_OK,"probe EnableHook");
-        require(receipts.publish(static_cast<hooks::Site>(i),targets[i],*originals[i],true),"real enabled hook receipt");
-        if(i+1<targets.size())require(!receipts.accepts(targets),"partial Native bundle admitted capture");
+        require(MH_CreateHook(targets[i],detours[i],originals[i])==MH_OK,"probe old CreateHook");
+        require(MH_EnableHook(targets[i])==MH_OK,"probe old EnableHook");
+        require(receipts.publish(static_cast<hooks::Site>(i),targets[i],*originals[i],true),"old exact enabled receipt");
     }
+    require(!receipts.ready(),"three old sites admitted a bundle without Close");
+    *originals[2]=nullptr;hooks::Installation installation;unsigned created{},enabled{};
+    auto create=[&](std::size_t i,void* target,void** original){++created;return MH_CreateHook(target,detours[i],original)==MH_OK;};
+    auto enable=[&](std::size_t,void* target){++enabled;return MH_EnableHook(target)==MH_OK;};
+    require(!hooks::install_once(false,receipts,installation,targets,originals,create,enable) && !installation.attempted && !created && !enabled,
+        "unrequested bundle mutated the old hooks");
+    require(hooks::install_once(true,receipts,installation,targets,originals,create,enable) && created==1 && enabled==1,
+        "late modern bundle did not reuse exactly three old sites and create Close once");
+    require(hooks::install_once(true,receipts,installation,targets,originals,create,enable) && created==1 && enabled==1,
+        "same late request recreated or reenabled existing hooks");
     require(receipts.ready() && receipts.accepts(targets),"complete exact Native bundle was rejected");
     auto mixed=targets;std::swap(mixed[0],mixed[2]);require(!receipts.accepts(mixed),"mixed Native methods admitted capture");
     mixed=targets;mixed[1]=nullptr;require(!receipts.accepts(mixed),"unknown Execute target admitted capture");
@@ -730,12 +746,32 @@ void native_source_hooks_case(ID3D12Device* device,IDXGIFactory6* factory){
     for(std::size_t i=0;i<targets.size();++i)failure.publish(static_cast<hooks::Site>(i),targets[i],*originals[i],true);
     require(!failure.accepts(targets),"failed receipt silently recovered through later enables");
     source_lifetime_case(device,factory,0,true);
+    auto changed_targets=targets;std::swap(changed_targets[0],changed_targets[2]);
+    require(!hooks::install_once(true,receipts,installation,changed_targets,originals,create,enable) &&
+        installation.failed && created==1 && enabled==1,"changed target group silently reinstalled or retained authority");
     receipts.revoke();require(!receipts.ready() && !receipts.accepts(targets),"revoked receipt admitted capture");
     // Standalone probe has one calling thread and has drained all its actual
     // work. This does not claim the game's external all-call unload barrier.
     for(auto* target:targets){require(MH_DisableHook(target)==MH_OK,"probe disable after actual drain");
         require(MH_RemoveHook(target)==MH_OK,"probe remove with single probe thread stopped");}
+    for(auto** original:originals)*original=nullptr;
+    hooks::Receipts partial;hooks::Installation partial_state;unsigned partial_created{},partial_enabled{};
+    auto partial_create=[&](std::size_t i,void* target,void** original){++partial_created;return MH_CreateHook(target,detours[i],original)==MH_OK;};
+    auto partial_enable=[&](std::size_t i,void* target){++partial_enabled;
+        if(i==2)return false; // SIMULATED Enable failure; all Create and other Enable operations are real.
+        return MH_EnableHook(target)==MH_OK;};
+    require(!hooks::install_once(true,partial,partial_state,targets,originals,partial_create,partial_enable) &&
+        partial_created==4 && partial_enabled==3 && partial_state.failed && !partial.ready(),"partial activation admitted or did not preserve the attempt");
+    for(auto** original:originals)require(*original!=nullptr,"partial attempt lost a real created trampoline");
+    require(!hooks::install_once(true,partial,partial_state,targets,originals,partial_create,partial_enable) &&
+        partial_created==4 && partial_enabled==3,"partial activation silently retried");
+    // Probe has no calling threads now. Cleanup here is not the host helper's
+    // failure behavior and does not prove a game unload barrier.
+    for(auto* target:targets){const auto status=MH_DisableHook(target);
+        require(status==MH_OK || status==MH_ERROR_DISABLED,"partial probe disable");
+        require(MH_RemoveHook(target)==MH_OK,"partial probe removal after stopped probe");}
     require(MH_Uninitialize()==MH_OK,"probe uninitialize");
+    std::puts("PASS native bundle late request: 3 exact old sites reused, Close create/enable once, real GPU source lifecycle; simulated partial Enable failure retains all real trampolines/no retry");
     std::puts("PASS actual Native 4-hook receipts, partial/mixed/revoked rejection and GPU source lifecycle; game callbacks not tested");
 }
 int main(int argc,char** argv)try{
