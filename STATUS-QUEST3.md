@@ -6,6 +6,72 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Consumidor dos dois olhos novos e retenção das texturas — 11 de outubro
+
+Liguei a seleção dos dois olhos aos registros reais de captura e envio dos
+comandos. Esta etapa usa NoAA, o modo sem filtro de suavização da imagem.
+Os registros ajudam a impedir misturas; ainda não demonstram que o jogo tenha
+desenhado corretamente os dois olhos, pois esse caminho não foi executado nele.
+
+O fluxo, passo a passo:
+
+1. Cada cópia guarda sua versão, geração, par, olho físico, textura própria,
+   número da cópia e gravação de comandos. Uma geração identifica o conjunto
+   atual de recursos; a gravação muda quando a lista de comandos é reiniciada.
+   Não inventa esse número quando a reinicialização ainda não foi observada.
+2. Confere esses dados na lista realmente entregue à placa de vídeo. Depois
+   da chamada original de envio, associa o sinal do produtor e a espera da
+   fila consumidora. Agendar uma espera não significa que o trabalho terminou.
+   Um registro rejeitado permanece reservado até uma reinicialização observada
+   poder descartar sua gravação; não desaparece só porque a validação falhou.
+3. Aceita o conjunto apenas quando ambos pertencem à mesma versão, geração,
+   responsável pelo desenho e par. Exige olhos físicos distintos, duas texturas,
+   duas cópias novas e gravações compatíveis com o envio observado. Uma mesma
+   lista pode conter as duas cópias; duas listas, sozinhas, não provam dois olhos.
+4. Guarda as texturas e suas posições e lentes como um único conjunto. Mantém
+   referências às interfaces dos produtores, sinais, fila consumidora, alocador
+   de comandos e destino XR. Uma referência conserva o objeto; não congela
+   automaticamente seus pixels nem comprova toda a vida útil do motor do jogo.
+5. Reserva cada conjunto para uma única tentativa de apresentação. Uma falha
+   não transforma esse conjunto em uma imagem nova por repetição. Nessa rota
+   moderna de jogo, não usa olhos alternados, uma cópia mono ou um par antigo
+   como substitutos. Sem um conjunto válido, o ciclo iniciado do headset pode
+   terminar sem imagem de jogo, preservando a leitura da cabeça. Um ciclo já
+   preparado para o par continua esperando os dois olhos; menus têm rota própria.
+6. O desenho usa as texturas e as posições guardadas, incluindo o tamanho da
+   textura retida. Não precisa alterar o estado do buffer de apresentação do
+   jogo nessa cópia. Confere novamente a admissão antes de entregar a imagem.
+7. Conserva referências enquanto a CPU ainda usa o conjunto e enquanto sua
+   submissão pode estar em execução. Só coleta usos enviados após o sinal exato
+   terminar; um erro de sinal ou remoção do dispositivo não libera os objetos.
+   Falha de sinal fecha o consumidor. Uma gravação própria abandonada só perde
+   suas referências depois de sua reinicialização original ter tido sucesso.
+8. Impede reutilizar ou recriar o conjunto de texturas enquanto existirem
+   gravações pendentes, sinais não concluídos ou usos retidos pelo consumidor.
+   Isso é uma proteção desse caminho; não resolve todos os caminhos de troca
+   de tamanho, encerramento, chamadas simultâneas ou retirada da DLL.
+
+`modern_eye_pair.h` reúne a comparação dos registros, a tentativa única e as
+regras de coleta; `dxgi_proxy.cpp` fornece as observações reais e mantém as
+referências. Escolhi guardar o conjunto inteiro para que uma atualização do
+cache durante a apresentação não troque apenas um olho ou sua posição.
+
+A DLL compilou e **113/113 testes passaram em 9,49 segundos**. O novo teste
+fez **456 verificações na CPU**: ambas as versões, dados misturados, olhos e
+texturas repetidos, reinicialização de listas, cópias antigas, alternativas de
+apresentação, tentativas concorrentes, falhas, troca de geração e condições
+de coleta. Usou dados fabricados. Não executou as chamadas do jogo, a instalação
+dos interceptadores, DirectX na GPU, OpenXR, Quest ou as operações reais de
+retenção das interfaces. Compilar essas operações não valida sua execução.
+
+**O VR continua sem uma versão jogável e nada experimental foi instalado.**
+O bloqueio geral permanece igual. Ainda é necessário verificar o caminho real
+de desenho, gravação e envio, a vida útil dos objetos de origem, todos os
+reinícios e destruidores, os históricos e efeitos por olho e a retirada segura
+da DLL. A proteção deste consumidor não é uma barreira para todas as chamadas.
+Primeiro comprovar duas imagens reais no PC; depois Quest, cabeça, mãos, armas,
+dano e bloqueio físicos. A meta de 60 FPS continua cancelada.
+
 ## Preparação e envio do quadro ligados à mesma versão — 11 de outubro
 
 Adaptei a preparação dos quadros e dos efeitos à atualização atual. Um quadro
