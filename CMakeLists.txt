@@ -118,7 +118,7 @@ if(BUILD_TESTING)
     add_executable(w3vr_modern_eye_source_use_gpu tests/modern_eye_source_use_gpu.cpp)
     target_include_directories(w3vr_modern_eye_source_use_gpu PRIVATE src)
     target_compile_definitions(w3vr_modern_eye_source_use_gpu PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(w3vr_modern_eye_source_use_gpu PRIVATE d3d12 dxgi dxguid)
+    target_link_libraries(w3vr_modern_eye_source_use_gpu PRIVATE d3d12 dxgi dxguid minhook)
 
     add_executable(w3vr_modern_eye_pair_tests tests/modern_eye_pair_tests.cpp)
     target_include_directories(w3vr_modern_eye_pair_tests PRIVATE src)
