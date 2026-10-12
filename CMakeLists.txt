@@ -114,6 +114,12 @@ if(BUILD_TESTING)
     target_include_directories(w3vr_modern_command_queue_tests PRIVATE src)
     add_test(NAME modern_captured_native_command_queue COMMAND w3vr_modern_command_queue_tests)
 
+    # Physical D3D12 probe; runs separately from the game and OpenXR.
+    add_executable(w3vr_modern_eye_source_use_gpu tests/modern_eye_source_use_gpu.cpp)
+    target_include_directories(w3vr_modern_eye_source_use_gpu PRIVATE src)
+    target_compile_definitions(w3vr_modern_eye_source_use_gpu PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(w3vr_modern_eye_source_use_gpu PRIVATE d3d12 dxgi dxguid)
+
     add_executable(w3vr_modern_eye_pair_tests tests/modern_eye_pair_tests.cpp)
     target_include_directories(w3vr_modern_eye_pair_tests PRIVATE src)
     add_test(NAME modern_noaa_fresh_pair_consumer COMMAND w3vr_modern_eye_pair_tests)

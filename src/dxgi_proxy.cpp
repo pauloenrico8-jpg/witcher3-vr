@@ -37,6 +37,7 @@
 #include "engine_render_core.h"
 #include "modern_eye_capture.h"
 #include "modern_eye_pair.h"
+#include "modern_eye_source_use.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
     D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
     D3D12_RESOURCE_STATE_PRESENT == 0 &&
@@ -1932,58 +1933,19 @@ w3vr::modern_eye_pair::Consumption g_modern_output_consumption{};
 std::atomic<bool> g_modern_noaa_consumer_blocked{};
 // Process-lifetime POD root. In-flight or failed-signal references are not
 // released by a static destructor in DllMain. This is not an unload barrier.
-struct ModernNoAASourceUse {
+struct ModernNoAASourceUse : w3vr::modern_eye_source_use::Use {
     w3vr::modern_eye_pair::Claim claim{};
-    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,2> textures;
-    std::array<Microsoft::WRL::ComPtr<ID3D12Fence>,2> producer_fences;
-    std::array<Microsoft::WRL::ComPtr<ID3D12CommandQueue>,2> producers;
     bool native_asymmetric{};
     std::array<XrView,2> views{{{XR_TYPE_VIEW},{XR_TYPE_VIEW}}};
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> recording;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
-    Microsoft::WRL::ComPtr<ID3D12Resource> xr_destination;
-    w3vr::modern_eye_pair::UsePhase phase{w3vr::modern_eye_pair::UsePhase::Recording};
-    uint64_t fence_value{UINT64_MAX};
-    bool recorded{}, cpu_active{true};
-    ModernNoAASourceUse* next{};
 };
-ModernNoAASourceUse* g_modern_noaa_source_uses{};
-// All these ownership operations use the capture mutex. Numeric receipts are
-// kept separate from the added COM references and the actual fence result.
-void erase_modern_noaa_source_use(ModernNoAASourceUse* target) {
-    auto** link=&g_modern_noaa_source_uses;
-    while(*link && *link!=target)link=&(*link)->next;
-    if(*link){*link=target->next;delete target;}
-}
-void collect_modern_noaa_source_uses() {
-    auto** link=&g_modern_noaa_source_uses;
-    while(*link){
-        auto* use=*link;
-        const auto completed=use->phase==w3vr::modern_eye_pair::UsePhase::Pending && use->fence
-            ? use->fence->GetCompletedValue():UINT64_MAX;
-        if(w3vr::modern_eye_pair::retired(use->phase,use->fence_value,completed,use->cpu_active)){
-            *link=use->next;delete use;
-        }else link=&use->next;
-    }
-}
-bool modern_noaa_source_held(ID3D12Resource* resource) {
-    for(auto* use=g_modern_noaa_source_uses;use;use=use->next)
-        for(const auto& texture:use->textures)if(texture.Get()==resource)return true;
-    return false;
-}
+w3vr::modern_eye_source_use::Store g_modern_noaa_source_store{};
+void collect_modern_noaa_source_uses() {g_modern_noaa_source_store.collect();}
+bool modern_noaa_source_held(ID3D12Resource* resource) {return g_modern_noaa_source_store.held(resource);}
 void discard_modern_noaa_xr_recordings(ID3D12GraphicsCommandList* command) {
     std::scoped_lock lock{g_streamline_capture_mutex};
-    auto** link=&g_modern_noaa_source_uses;
-    while(*link){
-        auto* use=*link;
-        if(!use->cpu_active && use->recorded && use->recording.Get()==command &&
-            use->phase==w3vr::modern_eye_pair::UsePhase::Recording){
-            *link=use->next;delete use; // Own successful Reset discarded this recording.
-        }else link=&use->next;
-    }
-    collect_modern_noaa_source_uses();
+    // Caller reached this helper only after its own original Reset succeeded.
+    g_modern_noaa_source_store.discard_after_reset(command,S_OK);
+    g_modern_noaa_source_store.collect();
 }
 
 std::unordered_map<ID3D12CommandList*,
@@ -31986,7 +31948,7 @@ ModernNoAASourceUse* acquire_modern_noaa_sources() {
     if(!modern_noaa_output_ready(contract) ||
         !g_modern_output_consumption.begin(g_modern_packed_outputs,contract,profile,true,generation,
             reinterpret_cast<uintptr_t>(use->queue.Get()),{true,true,true,false,false,false},use->claim))return nullptr;
-    use->next=g_modern_noaa_source_uses;g_modern_noaa_source_uses=use.get();return use.release();
+    return static_cast<ModernNoAASourceUse*>(g_modern_noaa_source_store.adopt(std::move(use)));
 }
 bool modern_noaa_sources_current(const ModernNoAASourceUse* use) {
     if(!use)return false;
@@ -32001,12 +31963,9 @@ void finish_modern_noaa_sources(ModernNoAASourceUse* use,bool submitted,bool xr_
     if(!use)return;
     std::scoped_lock lock{g_streamline_capture_mutex};
     g_modern_output_consumption.finish(use->claim,submitted,xr_succeeded);
-    use->cpu_active=false;
-    if(!use->recorded)erase_modern_noaa_source_use(use);
-    // Recorded failures stay retained until our successful Reset; submitted
-    // uses stay retained until their exact signal completes. Never free them
-    // just because xrEndFrame or a CPU scope returned.
-    collect_modern_noaa_source_uses();
+    g_modern_noaa_source_store.finish_cpu(use);
+    // Returned CPU scopes do not retire submitted GPU references. The shared
+    // store is also exercised by the standalone physical DirectX probe.
 }
 
 bool remastered_normal_epilogue_table_matches(const uint8_t* module,
@@ -50442,7 +50401,7 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
     }
 
     collect_modern_noaa_source_uses();
-    bool modern_ring=modern_noaa_output_requested() || g_modern_noaa_source_uses!=nullptr;
+    bool modern_ring=modern_noaa_output_requested() || g_modern_noaa_source_store.head!=nullptr;
     for(const auto& eye_ring:g_streamline_capture_ring)for(const auto& slot:eye_ring)
         modern_ring=modern_ring || slot.modern_output.identity.profile!=nullptr;
     if(modern_ring)for(const auto& eye_ring:g_streamline_capture_ring)for(const auto& slot:eye_ring)
@@ -54244,74 +54203,83 @@ void render_openxr_test_frame(
                 ID3D12CommandList* lists[] = {g_xr_command_list};
                 w3vr::minimal_xr_log::write("QUEUE_BEGIN", current_present, trace_pair_id, g_xr_fence_value + 1);
                 auto* submit_queue=modern_sources ? modern_sources->queue.Get():g_command_queue;
+                bool execute_admitted=true;
                 if(modern_sources){
                     std::scoped_lock lock{g_streamline_capture_mutex};
-                    modern_sources->phase=w3vr::modern_eye_pair::UsePhase::Executing;
+                    execute_admitted=g_modern_noaa_source_store.before_execute(modern_sources,submit_queue,1,lists);
                 }
-                submit_queue->ExecuteCommandLists(1, lists);
-                if (fsr_hudless_recorded) {
-                    publish_fsr_hudless_xr_color(
-                        g_xr_command_allocator_index,
-                        frame_state.predictedDisplayTime);
-                }
-                w3vr::minimal_xr_log::write("QUEUE_RETURN", current_present, trace_pair_id, g_xr_fence_value + 1);
-                // [FIX:AER-FULL-VR-COMPLETED-FRAME-AUTHORITY V1209 4/5]
-                // Retire the completed-frame serial only after the command
-                // list containing its final-backbuffer copy has reached the
-                // game queue. A close failure can therefore retry it.
-                if (cinema_completed_serial_to_consume != 0) {
-                    g_sequential_cinema_completed_serial =
-                        cinema_completed_serial_to_consume;
-                }
-                // [REFACTOR:COMMON-TEMPORAL-AFW-TRANSACTION V1226 6/8]
-                // Retire the temporal tag through the selected adapter only
-                // after the XR list containing its authoritative eye copy (and
-                // AFW peer when active) has reached the queue.
-                consume_mode3_temporal_cache_submission(
-                    temporal_backend_to_consume,
-                    temporal_submission_to_consume);
-                // [FIX:XR-ALLOCATOR-PIPELINING 4/4] Remember which submission
-                // this allocator belongs to. The frame that comes back round
-                // to it waits for exactly this value and nothing else, so the
-                // CPU keeps running while earlier frames finish on the GPU.
-                const uint64_t submission = ++g_xr_fence_value;
-                auto* submit_fence=modern_sources ? modern_sources->fence.Get():g_xr_fence;
-                if (SUCCEEDED(submit_queue->Signal(submit_fence, submission))) {
-                    if(modern_sources){
-                        std::scoped_lock lock{g_streamline_capture_mutex};
-                        modern_sources->fence_value=submission;
-                        modern_sources->phase=w3vr::modern_eye_pair::UsePhase::Pending;
+                if(!execute_admitted){
+                    g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                    submitted=false;
+                }else{
+                    submit_queue->ExecuteCommandLists(1, lists);
+                    if (fsr_hudless_recorded) {
+                        publish_fsr_hudless_xr_color(
+                            g_xr_command_allocator_index,
+                            frame_state.predictedDisplayTime);
                     }
-                    g_xr_command_allocator_fences[g_xr_command_allocator_index] =
-                        submission;
-                    // [FIX:CROSS-QUEUE-SCENE-CAPTURE-OWNERSHIP V1368 6/7]
-                    // When a packed cache resource is swapped back into the
-                    // capture ring, this exact primary-consumer fence becomes
-                    // its next reuse authority.
-                    for (uint32_t eye = 0; eye < 2; ++eye) {
-                        if (g_packed_present_cache[eye] != nullptr) {
-                            g_packed_present_cache_last_use_fence[eye] =
-                                g_xr_fence;
-                            g_packed_present_cache_last_use_fence_value[eye] =
-                                submission;
+                    w3vr::minimal_xr_log::write("QUEUE_RETURN", current_present, trace_pair_id, g_xr_fence_value + 1);
+                    // [FIX:AER-FULL-VR-COMPLETED-FRAME-AUTHORITY V1209 4/5]
+                    // Retire the completed-frame serial only after the command
+                    // list containing its final-backbuffer copy has reached the
+                    // game queue. A close failure can therefore retry it.
+                    if (cinema_completed_serial_to_consume != 0) {
+                        g_sequential_cinema_completed_serial =
+                            cinema_completed_serial_to_consume;
+                    }
+                    // [REFACTOR:COMMON-TEMPORAL-AFW-TRANSACTION V1226 6/8]
+                    // Retire the temporal tag through the selected adapter only
+                    // after the XR list containing its authoritative eye copy (and
+                    // AFW peer when active) has reached the queue.
+                    consume_mode3_temporal_cache_submission(
+                        temporal_backend_to_consume,
+                        temporal_submission_to_consume);
+                    // [FIX:XR-ALLOCATOR-PIPELINING 4/4] Remember which submission
+                    // this allocator belongs to. The frame that comes back round
+                    // to it waits for exactly this value and nothing else, so the
+                    // CPU keeps running while earlier frames finish on the GPU.
+                    const uint64_t submission = ++g_xr_fence_value;
+                    auto* submit_fence=modern_sources ? modern_sources->fence.Get():g_xr_fence;
+                    const HRESULT consumer_signal=submit_queue->Signal(submit_fence, submission);
+                    if (SUCCEEDED(consumer_signal)) {
+                        if(modern_sources){
+                            std::scoped_lock lock{g_streamline_capture_mutex};
+                            if(!g_modern_noaa_source_store.after_signal(modern_sources,consumer_signal,submission)){
+                                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                                submitted=false;
+                            }
+                        }
+                        g_xr_command_allocator_fences[g_xr_command_allocator_index] =
+                            submission;
+                        // [FIX:CROSS-QUEUE-SCENE-CAPTURE-OWNERSHIP V1368 6/7]
+                        // When a packed cache resource is swapped back into the
+                        // capture ring, this exact primary-consumer fence becomes
+                        // its next reuse authority.
+                        for (uint32_t eye = 0; eye < 2; ++eye) {
+                            if (g_packed_present_cache[eye] != nullptr) {
+                                g_packed_present_cache_last_use_fence[eye] =
+                                    g_xr_fence;
+                                g_packed_present_cache_last_use_fence_value[eye] =
+                                    submission;
+                            }
+                        }
+                        puredark_afw_bundle_submitted = true;
+                        puredark_afw_bundle_fence = submission;
+                    } else {
+                        // Without a usable fence value the next reuse of this
+                        // allocator must not assume the GPU is done with it.
+                        if(modern_noaa_output_requested()){
+                            g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                            g_xr_command_allocator_fences[g_xr_command_allocator_index]=UINT64_MAX;
+                            submitted=false;
+                            // Keep possibly submitted COM references quarantined.
+                            // A void wait or returned CPU scope is not retirement.
+                        }else{
+                            wait_for_xr_gpu();
+                            g_xr_command_allocator_fences[g_xr_command_allocator_index] = 0;
                         }
                     }
-                    puredark_afw_bundle_submitted = true;
-                    puredark_afw_bundle_fence = submission;
-                } else {
-                    // Without a usable fence value the next reuse of this
-                    // allocator must not assume the GPU is done with it.
-                    if(modern_noaa_output_requested()){
-                        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
-                        g_xr_command_allocator_fences[g_xr_command_allocator_index]=UINT64_MAX;
-                        submitted=false;
-                        // Keep possibly submitted COM references quarantined.
-                        // A void wait or returned CPU scope is not retirement.
-                    }else{
-                        wait_for_xr_gpu();
-                        g_xr_command_allocator_fences[g_xr_command_allocator_index] = 0;
-                    }
-                }
+                } // Only an admitted own recording reaches Execute/Signal.
             } else {
                 submitted = false;
                 log_taau_trace_line(
