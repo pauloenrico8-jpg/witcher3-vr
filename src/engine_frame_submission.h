@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine_camera_temporal.h"
 #include <cstdint>
 
 namespace w3vr::frame_submission {
@@ -13,6 +14,21 @@ inline constexpr std::uint32_t command_dispatch_rva = 0x022925E0;
 inline constexpr std::uint32_t unavailable_command_rva = 0x05C88BF0;
 inline constexpr std::uint32_t renderer_global_rva = 0x05A51950;
 inline constexpr std::uint32_t renderer_vtable_rva = 0x036E03C8;
+
+// Exact subsystem selection, not executable admission or Native ownership.
+struct Profile {
+    std::uint32_t allocator,constructor,dispatch,unavailable,renderer_global,renderer_vtable;
+};
+inline constexpr Profile remastered_500c{command_allocator_rva,command_constructor_rva,
+    command_dispatch_rva,unavailable_command_rva,renderer_global_rva,renderer_vtable_rva};
+inline constexpr Profile remastered_1048522{0x003945F0,0x0229FD80,0x0229ACF0,
+    0x05C92B30,0x05A5B948,0x036EB088};
+inline bool known(const Profile* profile){return profile==&remastered_500c || profile==&remastered_1048522;}
+inline const Profile* selected(const engine_camera::TemporalContract* contract){
+    if(contract==&engine_camera::remastered_500c)return &remastered_500c;
+    if(contract==&engine_camera::remastered_1048522)return &remastered_1048522;
+    return nullptr;
+}
 
 #if defined(_MSC_VER)
 using AllocateCommand = void*(__fastcall*)();
@@ -32,6 +48,7 @@ struct NativeCommandRoute {
     DispatchCommand dispatch{};
     void* unavailable_command{};
     bool renderer_ready{};
+    const Profile* profile{};
 };
 
 enum class Result { dispatched, invalid_frame, unavailable, allocation_failed };
@@ -47,7 +64,7 @@ enum class Result { dispatched, invalid_frame, unavailable, allocation_failed };
 inline Result submit_owned_frame(const NativeCommandRoute& route, void* frame,
     ReleaseFrame release) {
     if (frame == nullptr || release == nullptr) return Result::invalid_frame;
-    if (!route.renderer_ready || route.allocate == nullptr ||
+    if (!known(route.profile) || !route.renderer_ready || route.allocate == nullptr ||
         route.construct == nullptr || route.dispatch == nullptr ||
         route.unavailable_command == nullptr) {
         release(frame);
