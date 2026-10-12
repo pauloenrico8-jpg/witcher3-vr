@@ -393,6 +393,70 @@ struct TrackedSource:w3vr::modern_backbuffer_source::Record {
     unsigned* destroyed{};
     ~TrackedSource(){++*destroyed;}
 };
+void resize1_case(ID3D12Device* device,IDXGIFactory6* factory){
+    namespace binding=w3vr::modern_graphics_binding;
+    const auto instance=GetModuleHandleW(nullptr);WNDCLASSW wc{};wc.hInstance=instance;
+    wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"W3VRResize1ProbeHidden";
+    require(RegisterClassW(&wc)!=0,"resize1 class");
+    HWND window=CreateWindowExW(0,wc.lpszClassName,L"W3VR Resize1 probe",WS_POPUP,0,0,32,32,nullptr,nullptr,instance,nullptr);
+    require(window && !IsWindowVisible(window),"resize1 hidden window");
+    {
+        auto first_queue=queue(device),second_queue=queue(device);
+        DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=16;desc.Height=16;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        ComPtr<IDXGISwapChain1> chain1;check(factory->CreateSwapChainForHwnd(first_queue.Get(),window,&desc,nullptr,nullptr,&chain1),"resize1 factory");
+        ComPtr<IDXGISwapChain3> chain;check(chain1.As(&chain),"resize1 interface");binding::Registry registry;
+        require(registry.publish_factory(S_OK,first_queue.Get(),chain.Get()),"resize1 initial binding");
+        auto initial=registry.acquire();auto held=registry.acquire_backbuffer();
+        require(initial->present_count==2 && held.present_queue.Get()==first_queue.Get(),"factory queue per-buffer binding");
+        const UINT masks[]{1,1};IUnknown* explicit_queues[]{second_queue.Get(),first_queue.Get()};unsigned originals{};
+        auto resize=[&](UINT count,UINT extent,const UINT* actual_masks,IUnknown* const* actual_queues){
+            return registry.resize1_from_callback(chain.Get(),count,actual_masks,actual_queues,[&]{
+                ++originals;require(!registry.acquire() && !registry.current(initial),"resize1 admitted capture during Original");
+                return chain->ResizeBuffers1(count,extent,extent,DXGI_FORMAT_R8G8B8A8_UNORM,0,actual_masks,actual_queues);
+            });
+        };
+        const HRESULT failure=resize(2,32,masks,explicit_queues);
+        require(FAILED(failure) && originals==1,"held source did not block actual ResizeBuffers1 or Original repeated");
+        auto failed=registry.acquire();require(failed && failed->epoch>initial->epoch && failed->width==16 &&
+            failed->queue.Get()==first_queue.Get() && !failed->explicit_present_queues,"failed Resize1 published new input queue");
+        held.resource.Reset();check(resize(2,16,masks,explicit_queues),"actual Resize1 remap");
+        auto mapped=registry.acquire();require(mapped && mapped->explicit_present_queues && mapped->present_count==2 &&
+            mapped->present_queues[0].Get()==second_queue.Get() && mapped->present_queues[1].Get()==first_queue.Get() &&
+            mapped->creation_masks[0]==1 && mapped->epoch>failed->epoch && !registry.current(failed),"explicit per-buffer queue map lost");
+        // Use the actual current buffer's declared queue, including the remap.
+        auto current=registry.acquire_backbuffer();require(current.resource && current.index<2 &&
+            current.present_queue.Get()==mapped->present_queues[current.index].Get(),"current index queue did not come from explicit array");
+        auto upload=upload_pixels(device),result=buffer(device,D3D12_HEAP_TYPE_READBACK,stride*2,D3D12_RESOURCE_STATE_COPY_DEST);
+        Recording writer(device);D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource=current.resource.Get();b.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;
+        b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        writer.command->ResourceBarrier(1,&b);auto input=placed(upload.Get(),0),target=subresource(current.resource.Get());
+        writer.command->CopyTextureRegion(&target,0,0,0,&input,nullptr);++copies;
+        b.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_DEST;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;writer.command->ResourceBarrier(1,&b);
+        for(UINT i=0;i<2;++i){auto output=placed(result.Get(),i*stride);writer.command->CopyTextureRegion(&output,0,0,0,&target,nullptr);++copies;}
+        b.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;b.Transition.StateAfter=D3D12_RESOURCE_STATE_PRESENT;writer.command->ResourceBarrier(1,&b);writer.close();
+        ID3D12CommandList* lists[]{writer.command.Get()};current.present_queue->ExecuteCommandLists(1,lists);
+        auto finished=fence(device);check(current.present_queue->Signal(finished.Get(),1),"remapped actual signal");wait(finished.Get(),1);verify_pixels(result.Get(),0x31,0x31);
+        current.resource.Reset();
+        check(resize(0,16,masks,explicit_queues),"zero-count actual Resize1 same queue map");
+        auto zero=registry.acquire();require(zero && zero->buffer_count==2 && zero->present_queues[0].Get()==second_queue.Get(),"zero-count resize lost unchanged map");
+        ComPtr<IDXGISwapChain1> auxiliary1;check(factory->CreateSwapChainForComposition(first_queue.Get(),&desc,nullptr,&auxiliary1),"resize1 auxiliary factory");
+        ComPtr<IDXGISwapChain3> auxiliary;check(auxiliary1.As(&auxiliary),"resize1 auxiliary interface");unsigned foreign_calls{};
+        IUnknown* auxiliary_queues[]{first_queue.Get(),first_queue.Get()};
+        check(registry.resize1_from_callback(auxiliary.Get(),2,masks,auxiliary_queues,[&]{++foreign_calls;
+            return auxiliary->ResizeBuffers1(2,16,16,DXGI_FORMAT_R8G8B8A8_UNORM,0,masks,auxiliary_queues);}),"actual auxiliary Resize1");
+        require(foreign_calls==1 && registry.current(zero),"auxiliary Resize1 changed main authority");
+        check(registry.resize_from_callback(chain.Get(),[&]{++originals;return chain->ResizeBuffers(2,16,16,DXGI_FORMAT_R8G8B8A8_UNORM,0);}),"plain actual resize after explicit map");
+        require(!registry.acquire() && !registry.acquire_backbuffer().resource,"plain resize guessed explicit queue association");
+        check(resize(2,16,masks,explicit_queues),"explicit queue association recovery");
+        require(registry.ready() && registry.acquire()->epoch>zero->epoch,"explicit actual remap did not recover acquisition");
+        first_queue.Reset();second_queue.Reset();
+        require(mapped->present_queues[0]->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT,"old snapshot lost remapped queue reference");
+        std::printf("PASS actual ResizeBuffers1: per-buffer queue remap, native pixels, retained-source failure, zero-count same map, auxiliary isolation, plain-map rejection/recovery; Original calls=%u plus auxiliary=%u\n",originals,foreign_calls);
+    }
+    require(DestroyWindow(window)!=0 && UnregisterClassW(wc.lpszClassName,instance)!=0,"resize1 window cleanup");
+}
 namespace native_source_probe {
 namespace source=w3vr::modern_backbuffer_source;
 namespace hooks=w3vr::modern_backbuffer_hooks;
@@ -688,6 +752,7 @@ int main(int argc,char** argv)try{
     for(unsigned mode=0;mode<3;++mode)source_lifetime_case(device.Get(),factory.Get(),mode);
     read_only_source_case(device.Get(),factory.Get());
     native_source_hooks_case(device.Get(),factory.Get());
+    resize1_case(device.Get(),factory.Get());
     std::printf("PASS shared host source-use store: %u checks, %u real texture copies, physical readback\n",checks,copies);
     std::puts("Signal/partial-allocation HRESULTs are simulated; real device removal not induced.");
     std::puts("GAME=false HEADSET=false OPENXR=false NATIVE_CAMERA=false VR_FUNCTIONAL=false");return 0;
