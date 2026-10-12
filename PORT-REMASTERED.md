@@ -7,6 +7,63 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Recriação com filas explícitas por buffer — 12 de outubro
+
+Liguei `ResizeBuffers1` ao registro gráfico moderno. Essa chamada do DirectX
+recria os buffers e pode indicar uma fila de comandos diferente para cada um.
+O registro precisa conservar a associação fornecida pela chamada, além do
+número de época que distingue os buffers anteriores dos novos.
+
+O fluxo, passo a passo:
+
+1. Antes da chamada original, fecha temporariamente novas aquisições da captura
+   principal. Obtém referências próprias das filas declaradas por buffer e
+   confere interfaces DIRECT, dispositivo e identidades. A igualdade de dispositivo
+   sozinha não escolhe uma fila. Uma cadeia auxiliar não altera esse registro.
+2. Encaminha a chamada original uma vez, preservando quantidade, formato, flags
+   e os ponteiros originais dos dois arrays. Mantém o ajuste de resolução já
+   existente no host. Depois usa o resultado e as dimensões realmente retornadas.
+3. Em falha, conserva as filas e dimensões anteriores, com uma época nova que
+   invalida capturas antigas. Em sucesso, publica a associação explícita válida
+   por buffer. A aquisição conserva também a fila correspondente ao índice atual.
+4. Quando a quantidade informada é zero, aceita como prova somente uma associação
+   igual à anterior, com a quantidade real preservada. Não deduz uma troca de
+   filas de um array de extensão nominal zero. Uma recriação simples posterior
+   a um remapeamento explícito fecha a aquisição até uma associação explícita
+   nova: aquele caminho não informa suas filas ao registro.
+5. A prontidão moderna exige `ResizeBuffers1` realmente habilitado na mesma
+   implementação de cadeia. A captura confere os hooks nativos de todas as filas
+   declaradas. O campo de fila usado pelo trabalho próprio do XR representa uma
+   fila conservada; não afirma que todos os buffers pertencem somente a ela.
+
+`modern_graphics_binding.h` acompanha referências, filas por buffer e épocas;
+`dxgi_proxy.cpp` instala e encaminha a recriação e verifica sua prontidão;
+`modern_eye_source_use_gpu.cpp` exercita o mesmo helper com DirectX real.
+Escolhi conservar os argumentos explícitos porque a fila inicial de criação
+não demonstra qual fila foi declarada depois de uma recriação.
+
+A DLL compilou e **113/113 testes passaram em 7,83 segundos**.
+O programa separado passou com **29.070 verificações e 62 cópias reais**.
+O cenário novo executou `ResizeBuffers1` real, remapeou duas filas do mesmo
+dispositivo, escreveu na fila associada ao buffer atual e conferiu os pixels.
+Também verificou falha real com buffer retido, quantidade zero com associação
+igual, isolamento da cadeia auxiliar e recuperação após fechar uma associação
+não comprovada. Foram cinco chamadas originais na cadeia principal e uma auxiliar.
+A falha de Signal dos cenários anteriores continua explicitamente simulada.
+
+O cenário novo chama o helper de registro diretamente em seu próprio processo.
+Não executou o instalador ou callback de recriação do host dentro do Witcher,
+nem comprovou todos os wrappers, aliases, filas de vários dispositivos, mudança
+de fila com quantidade zero ou encerramento da DLL. A escrita conferida usa o
+buffer corrente; não é uma imagem de olho produzida pelo motor do jogo.
+
+**Nada experimental foi instalado e o VR continua sem versão jogável.** O bloqueio
+de versões permanece igual. Ainda faltam os endpoints reais das interfaces
+intermediárias, a instalação independente ao mudar de modo, o ciclo de destruição
+e o port completo de recursos, câmeras e históricos por olho. Primeiro comprovar
+duas imagens novas do jogo por quadro; depois Quest, cabeça, mãos, armas, dano
+e bloqueio físicos. A meta de 60 FPS permanece cancelada; DLSS/IntelFG opcionais.
+
 ## Captura ligada aos quatro hooks nativos habilitados — 12 de outubro
 
 A captura moderna passa a conferir os pontos de interceptação do DirectX que
