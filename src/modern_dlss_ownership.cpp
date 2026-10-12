@@ -105,6 +105,29 @@ bool installed_streamline_queue_base(const IUnknown* object) noexcept {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+bool installed_streamline_device_base(const IUnknown* object) noexcept {
+    constexpr std::array<unsigned char,32> expected{
+        0x0b,0x34,0xae,0x4e,0xc7,0x7e,0x35,0x2a,0xd1,0x71,0xc8,0xb8,0xed,0xcb,0xbc,0x08,
+        0x8f,0xbc,0xe7,0x0f,0xb8,0x67,0xde,0x8e,0xcf,0xf8,0x5c,0xac,0xab,0x75,0x48,0x10};
+    constexpr GUID device_type{0x10B90151,0x4435,0x4004,{0x9F,0xAD,0x19,0x36,0x14,0x88,0x89,0x9A}};
+    if(!object)return false;
+    const auto module=GetModuleHandleW(L"sl.interposer.dll");if(!module)return false;
+    const auto base=reinterpret_cast<std::uintptr_t>(module);
+    __try {
+        const auto table=*reinterpret_cast<const std::uintptr_t* const*>(object);
+        if(reinterpret_cast<std::uintptr_t>(table)!=base+0x788C0 ||
+            table[0]!=base+0x252C0 || table[1]!=base+0x24C80 || table[2]!=base+0x25380 ||
+            table[7]!=base+0x25500 || table[8]!=base+0x25510 || table[9]!=base+0x23740 || table[12]!=base+0x25810 ||
+            reinterpret_cast<std::uintptr_t>(GetProcAddress(module,"slGetNativeInterface"))!=base+0x7EA0 ||
+            *reinterpret_cast<const GUID*>(base+0x778F0)!=command_list_identity::kStreamlineBase ||
+            *reinterpret_cast<const GUID*>(base+0x77900)!=device_type)return false;
+        std::array<unsigned char,32> actual{};
+        const auto status=BCryptHash(BCRYPT_SHA256_ALG_HANDLE,nullptr,0,
+            reinterpret_cast<unsigned char*>(base+0x252C0),179,actual.data(),static_cast<ULONG>(actual.size()));
+        return status>=0 && actual==expected;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+
 NativeInterface resolve_native(IUnknown* input, REFIID iid, Classify classify,
     const StreamlineAccess& sdk) noexcept {
     NativeInterface result{};
@@ -128,7 +151,8 @@ NativeInterface resolve_native(IUnknown* input, REFIID iid, Classify classify,
             result.object = std::move(owned);
             return result;
         }
-        if (owner != Owner::Streamline && owner != Owner::ReShade) {
+        if ((owner==Owner::ReShade && !sdk.allow_reshade_base) ||
+            (owner != Owner::Streamline && owner != Owner::ReShade)) {
             result.failure = owner == Owner::Unknown
                 ? Failure::UnknownOwner : Failure::UnsupportedOwner;
             return result;
@@ -175,6 +199,31 @@ NativeInterface resolve_native(IUnknown* input, REFIID iid, Classify classify,
         current = next;
         result.failure = Failure::None;
     }
+}
+
+OwnedDevice acquire_device(IUnknown* input,Classify classify,const StreamlineAccess& sdk){
+    OwnedDevice result;auto native=resolve_native(input,__uuidof(ID3D12Device),classify,sdk);
+    if(!native){result.failure=native.failure;return result;}
+    result.device=take<ID3D12Device>(native);
+    if(!identity(result.device.Get(),classify,result.device_identity)){
+        result.device.Reset();result.failure=Failure::Interface;
+    }
+    return result;
+}
+HRESULT resolve_binding_endpoint(IUnknown* input,REFIID iid,void** output,Classify classify) noexcept {
+    if(!output)return E_POINTER;*output=nullptr;
+    if(!input || !classify)return E_INVALIDARG;
+    try {
+        if(iid==__uuidof(ID3D12Device)){
+            auto owned=acquire_device(input,classify,{nullptr,0,false,installed_streamline_device_base,false});
+            if(!owned)return E_NOINTERFACE;*output=owned.device.Detach();return S_OK;
+        }
+        if(iid==__uuidof(ID3D12CommandQueue)){
+            auto owned=acquire_queue(input,classify,{nullptr,0,false,installed_streamline_queue_base,false});
+            if(!owned)return E_NOINTERFACE;*output=owned.queue.Detach();return S_OK;
+        }
+    }catch(...){return E_FAIL;}
+    return E_NOINTERFACE;
 }
 
 OwnedCommand acquire_command(IUnknown* input, Classify classify, const StreamlineAccess& sdk) {

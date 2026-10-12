@@ -1519,10 +1519,11 @@ IDXGISwapChain* g_game_swapchain{};
 // Process-lifetime root: no automatic COM cleanup from DllMain. Owning
 // snapshots survive registry revocation; this is not an all-call/unload barrier.
 std::atomic<w3vr::modern_graphics_binding::Registry*> g_modern_graphics_registry{};
+HRESULT resolve_modern_binding_endpoint(IUnknown*,REFIID,void**) noexcept;
 w3vr::modern_graphics_binding::Registry* modern_graphics_registry(bool create=false){
     auto* current=g_modern_graphics_registry.load(std::memory_order_acquire);
     if(current || !create)return current;
-    auto* candidate=new(std::nothrow) w3vr::modern_graphics_binding::Registry;
+    auto* candidate=new(std::nothrow) w3vr::modern_graphics_binding::Registry(resolve_modern_binding_endpoint);
     if(!candidate)return nullptr;
     if(!g_modern_graphics_registry.compare_exchange_strong(current,candidate,std::memory_order_acq_rel)){
         delete candidate;return current;
@@ -12075,6 +12076,10 @@ w3vr::command_list_identity::Owner classify_command_list_owner(
         return Owner::RenderDoc;
     }
     return Owner::Unknown;
+}
+
+HRESULT resolve_modern_binding_endpoint(IUnknown* input,REFIID iid,void** output) noexcept {
+    return w3vr::modern_dlss_ownership::resolve_binding_endpoint(input,iid,output,classify_command_list_owner);
 }
 
 // [FIX:NESTED-COMMAND-LIST-IDENTITY V1532 1/3]
