@@ -6,6 +6,63 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Troca conjunta de texturas preservando o conjunto anterior — 12 de outubro
+
+Corrigi as duas rotinas que recriam as imagens próprias quando seu tamanho ou
+formato muda. Antes, a recriação podia liberar o conjunto antigo e depois falhar
+no meio da criação do novo. Agora, conserva o antigo até concluir a troca inteira.
+
+O fluxo, passo a passo:
+
+1. Reúne os endereços que possuem as quatro texturas de apresentação ou as
+   seis texturas de captura. Confere que não são endereços repetidos.
+2. Na rota moderna, rejeita a troca enquanto há uma gravação pendente,
+   referências conservadas pelo consumidor ou um sinal de uso ainda não
+   concluído. Consulta o sinal real da GPU; uma espera agendada não basta.
+3. Cria todas as novas texturas em referências temporárias. Se qualquer criação
+   falhar, libera somente essas novas referências; conserva as imagens antigas,
+   seus tamanhos e os registros de captura. Não publica um conjunto pela metade.
+4. Antes de substituir, confere novamente os endereços e o uso das imagens.
+   Depois coloca todas as novas referências no conjunto e libera as antigas.
+   Só após o sucesso o mod limpa os registros antigos e atualiza o tamanho.
+5. O conjunto de captura só é considerado completo quando as seis texturas
+   existem. Uma textura isolada não comprova que o conjunto inteiro foi criado.
+
+`modern_eye_resource_set.h` faz essa troca; `dxgi_proxy.cpp` usa o componente
+nas duas rotinas reais de recriação e fornece os sinais e a criação DirectX.
+O teste gráfico usa o mesmo componente. Escolhi preparar e conferir o conjunto
+inteiro antes de trocar para conservar uma situação coerente se algo falhar.
+A troca adiada não apresenta o conjunto antigo como duas imagens novas.
+
+O teste físico passou com **24 cópias reais e 14.530 verificações**, incluindo
+leitura dos pixels. Conferiu conjuntos de quatro e seis recursos, trabalho
+real da GPU deliberadamente pendente, referências ainda usadas pela CPU,
+gravação pendente, sinais ausentes ou desconhecidos, endereços alterados durante
+a criação, recursos repetidos e falha em cada posição de criação do conjunto.
+Depois das trocas rejeitadas, copiou novamente os pixels das texturas antigas
+para conferir que continuavam utilizáveis. Ao concluir a troca, todas as novas
+texturas tinham 32 por 32 pixels e eram distintas; as antigas tinham 16 por 16.
+
+As falhas de criação e de sinal foram resultados explicitamente simulados.
+As criações que tiveram sucesso, interfaces, filas, cópias, demais sinais e
+leitura dos pixels foram reais. Não esgotou a memória de vídeo nem induziu
+remoção do dispositivo. O teste gráfico é separado dos **113 testes da DLL**,
+que passaram em **10,89 segundos**. Não carregou o jogo, OpenXR ou o Quest.
+
+A proteção aplica-se a essas duas rotinas próprias. Não comprova todos os
+caminhos de troca e destruição do jogo, proteção das variáveis globais antes
+de obter uma referência, concorrência dos interceptadores nem encerramento
+da DLL. O código continua dependendo da trava de captura do chamador, que
+impede alterações simultâneas nesses conjuntos; ela não encerra todas as
+chamadas do jogo. A política de sinais da rota antiga foi conservada.
+
+**O VR ainda não é jogável. Nada experimental foi instalado no jogo e o bloqueio
+geral de versão permanece igual.** Ainda faltam a aquisição protegida dos
+recursos do jogo, o ciclo completo de produção e cancelamento do par, recursos
+e históricos do motor por olho e a comprovação das duas imagens reais do jogo
+por quadro. Depois vêm Quest, cabeça, mãos, armas, dano e bloqueio físicos.
+A meta de 60 FPS permanece cancelada; DLSS e geração de quadros são opcionais.
+
 ## Retenção de texturas testada com DirectX real — 12 de outubro
 
 Separei o registro de uso das texturas em um componente usado pelo próprio
