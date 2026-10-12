@@ -41,6 +41,7 @@
 #include "modern_eye_resource_set.h"
 #include "modern_graphics_binding.h"
 #include "modern_backbuffer_source.h"
+#include "modern_backbuffer_hooks.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
     D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
     D3D12_RESOURCE_STATE_PRESENT == 0 &&
@@ -1968,6 +1969,7 @@ struct ModernNoAASourceUse : w3vr::modern_eye_source_use::Use {
 };
 w3vr::modern_eye_source_use::Store g_modern_noaa_source_store{};
 w3vr::modern_backbuffer_source::Store g_modern_backbuffer_sources{};
+w3vr::modern_backbuffer_hooks::Receipts g_modern_backbuffer_hook_receipts;
 void collect_modern_noaa_source_uses() {g_modern_noaa_source_store.collect();}
 bool modern_noaa_source_held(ID3D12Resource* resource) {return g_modern_noaa_source_store.held(resource);}
 void discard_modern_noaa_xr_recordings(ID3D12GraphicsCommandList* command) {
@@ -2158,6 +2160,7 @@ bool capture_tagged_backbuffer_output(
     const w3vr::modern_graphics_binding::Snapshot& binding = {});
 bool modern_noaa_output_requested();
 bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract*);
+bool modern_backbuffer_hooks_accept(const w3vr::modern_graphics_binding::Snapshot&,ID3D12GraphicsCommandList*);
 bool native_stereo_capture_ready();
 void prepare_openxr_render_frame(uint32_t origin);
 XrTime locate_openxr_mode3_pair_pose();
@@ -2359,6 +2362,8 @@ SetGraphicsRootConstantBufferViewFn g_set_graphics_root_cbv{};
 SetComputeRootConstantBufferViewFn g_set_compute_root_cbv{};
 SetComputeRoot32BitConstantFn g_set_compute_root_32bit_constant{};
 SetComputeRoot32BitConstantsFn g_set_compute_root_32bit_constants{};
+using CloseCommandListFn=HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
+CloseCommandListFn g_close_command_list{};
 ResetCommandListFn g_reset_command_list{};
 w3vr::modern_dlss_native_hooks::Forwarder g_legacy_native_reset_forwarder;
 // Preserve the existing owner and its state updates. Unbound/proxy routes
@@ -10101,6 +10106,7 @@ void STDMETHODCALLTYPE hook_om_set_render_targets(
     const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor);
 ULONG STDMETHODCALLTYPE hook_resource_release(ID3D12Resource* resource);
 void install_resource_hooks(ID3D12Resource* resource);
+HRESULT STDMETHODCALLTYPE hook_close_command_list(ID3D12GraphicsCommandList*);
 void install_command_list_hooks();
 void install_streamline_resource_barrier_probe();
 bool reverse_enabled();
@@ -19616,7 +19622,7 @@ void install_reverse_hooks() {
         return;
     }
 
-    const bool metadata_hooks = taau_metadata_hooks_needed() ||
+    const bool metadata_hooks = modern_noaa_output_requested() || taau_metadata_hooks_needed() ||
         focus_projection_metadata_hooks_needed() ||
         asymmetric_tiled_culling_fix_needed() ||
         foliage_bound_basis_route_active() ||
@@ -19643,8 +19649,11 @@ void install_reverse_hooks() {
             dlss_cache_execute_publication) &&
         g_command_queue != nullptr && g_execute_command_lists == nullptr) {
         auto target = method<void*>(g_command_queue, 10);
-        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_execute_command_lists), reinterpret_cast<void**>(&g_execute_command_lists)) == MH_OK &&
-            MH_EnableHook(target) == MH_OK) {
+        const bool enabled=MH_CreateHook(target, reinterpret_cast<void*>(&hook_execute_command_lists), reinterpret_cast<void**>(&g_execute_command_lists)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK;
+        g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Execute,target,
+            reinterpret_cast<void*>(g_execute_command_lists),enabled);
+        if (enabled) {
             g_legacy_native_execute_forwarder =
                 w3vr::modern_dlss_native_hooks::execute_forwarder(target, g_execute_command_lists);
             log_line("Reverse hooked ID3D12CommandQueue::ExecuteCommandLists at %p", target);
@@ -19891,16 +19900,27 @@ void install_command_list_hooks() {
 
     if (g_reset_command_list == nullptr) {
         auto target = method<void*>(command_list, 10);
-        if (MH_CreateHook(target,
+        const bool enabled=MH_CreateHook(target,
                 reinterpret_cast<void*>(&hook_reset_command_list),
                 reinterpret_cast<void**>(&g_reset_command_list)) == MH_OK &&
-            MH_EnableHook(target) == MH_OK) {
+            MH_EnableHook(target) == MH_OK;
+        g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Reset,target,
+            reinterpret_cast<void*>(g_reset_command_list),enabled);
+        if (enabled) {
             g_legacy_native_reset_forwarder =
                 w3vr::modern_dlss_native_hooks::reset_forwarder(target, g_reset_command_list);
             log_line(
                 "Renderer hooked ID3D12GraphicsCommandList::Reset at %p",
                 target);
         }
+    }
+
+    if(modern_noaa_output_requested() && g_close_command_list==nullptr){
+        auto target=method<void*>(command_list,9);
+        const bool enabled=MH_CreateHook(target,reinterpret_cast<void*>(&hook_close_command_list),
+            reinterpret_cast<void**>(&g_close_command_list))==MH_OK && MH_EnableHook(target)==MH_OK;
+        g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Close,target,
+            reinterpret_cast<void*>(g_close_command_list),enabled);
     }
 
     if (g_draw_instanced == nullptr) {
@@ -22731,6 +22751,15 @@ void STDMETHODCALLTYPE hook_set_descriptor_heaps(
     }
 
     g_set_descriptor_heaps(command_list, num_descriptor_heaps, descriptor_heaps);
+}
+
+HRESULT STDMETHODCALLTYPE hook_close_command_list(ID3D12GraphicsCommandList* command_list) {
+    if(is_reshade_immediate_command_list(command_list))return g_close_command_list(command_list);
+    const auto epoch=load_command_list_recording_epoch(command_list);
+    const HRESULT result=g_close_command_list(command_list); // Original once; preserve HRESULT.
+    {std::scoped_lock lock{g_streamline_capture_mutex};
+        g_modern_backbuffer_sources.after_close(command_list,epoch,result);}
+    return result;
 }
 
 // [FIX:COMMAND-LIST-RESET-EPOCH V1120] D3D12 invalidates descriptor heaps,
@@ -29435,9 +29464,11 @@ void install_streamline_resource_barrier_probe() {
     }
 
     auto target = method<void*>(command_list, 26);
-    if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_resource_barrier),
-            reinterpret_cast<void**>(&g_resource_barrier)) == MH_OK &&
-        MH_EnableHook(target) == MH_OK) {
+    const bool enabled=MH_CreateHook(target, reinterpret_cast<void*>(&hook_resource_barrier),
+            reinterpret_cast<void**>(&g_resource_barrier)) == MH_OK && MH_EnableHook(target) == MH_OK;
+    g_modern_backbuffer_hook_receipts.publish(w3vr::modern_backbuffer_hooks::Site::Barrier,target,
+        reinterpret_cast<void*>(g_resource_barrier),enabled);
+    if (enabled) {
         log_line("Streamline output ResourceBarrier probe hooked at %p", target);
     }
     command_list->Close();
@@ -31954,6 +31985,16 @@ bool remastered_core_ready_for(const w3vr::engine_camera::TemporalContract* cont
             g_remastered_core_installed_profile.load(std::memory_order_acquire),
             g_remastered_core_hooks_ready.load(std::memory_order_acquire));
 }
+bool modern_backbuffer_hooks_accept(const w3vr::modern_graphics_binding::Snapshot& binding,
+    ID3D12GraphicsCommandList* command) {
+    using w3vr::command_list_identity::Owner;
+    if(!binding || !command || classify_command_list_owner(command)!=Owner::Native ||
+        classify_command_list_owner(binding->queue.Get())!=Owner::Native ||
+        command->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT ||
+        !modern_graphics_registry()->owns_child(binding,command))return false;
+    return g_modern_backbuffer_hook_receipts.accepts({method<void*>(command,10),
+        method<void*>(binding->queue.Get(),10),method<void*>(command,9),method<void*>(command,26)});
+}
 bool modern_noaa_output_requested() {
     return g_config.openxr_mode==3 && g_config.temporal_backend==TemporalBackend::None &&
         (w3vr::render_core::modern_selected(g_engine_camera_temporal_contract.load(std::memory_order_acquire)) ||
@@ -31961,6 +32002,7 @@ bool modern_noaa_output_requested() {
 }
 bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contract) {
     return modern_noaa_output_requested() && remastered_core_ready_for(contract) &&
+        g_modern_backbuffer_hook_receipts.ready() &&
         modern_graphics_current(modern_graphics_snapshot()) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire) &&
@@ -50626,6 +50668,7 @@ bool capture_tagged_backbuffer_output(
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     if(modern_identity && (is_reshade_immediate_command_list(command_list) ||
         !modern_noaa_output_ready(contract) || !modern_graphics_current(binding) ||
+        !modern_backbuffer_hooks_accept(binding,command_list) ||
         !w3vr::modern_eye_capture::admits(*modern_identity,contract,
             g_remastered_core_installed_profile.load(std::memory_order_acquire),true,generation) ||
         !w3vr::modern_eye_pair::finite(epoch) || modern_identity->frame.eye!=static_cast<int>(eye) ||
