@@ -114,6 +114,10 @@ if(BUILD_TESTING)
     target_include_directories(w3vr_modern_command_queue_tests PRIVATE src)
     add_test(NAME modern_captured_native_command_queue COMMAND w3vr_modern_command_queue_tests)
 
+    add_executable(w3vr_modern_eye_pair_tests tests/modern_eye_pair_tests.cpp)
+    target_include_directories(w3vr_modern_eye_pair_tests PRIVATE src)
+    add_test(NAME modern_noaa_fresh_pair_consumer COMMAND w3vr_modern_eye_pair_tests)
+
     add_executable(w3vr_modern_eye_capture_tests tests/modern_eye_capture_tests.cpp)
     target_include_directories(w3vr_modern_eye_capture_tests PRIVATE src)
     add_test(NAME modern_noaa_scoped_eye_capture COMMAND w3vr_modern_eye_capture_tests)

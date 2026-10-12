@@ -36,6 +36,7 @@
 #include "modern_queue_lifecycle.h"
 #include "engine_render_core.h"
 #include "modern_eye_capture.h"
+#include "modern_eye_pair.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
     D3D12_RESOURCE_STATE_COPY_DEST == 0x400 &&
     D3D12_RESOURCE_STATE_PRESENT == 0 &&
@@ -1904,6 +1905,7 @@ struct StreamlineCaptureSlot {
     XrView render_view{XR_TYPE_VIEW};
     bool render_view_valid{};
     bool native_asymmetric_projection{};
+    w3vr::modern_eye_pair::Output modern_output{};
 };
 // [FIX:CROSS-QUEUE-SCENE-CAPTURE-OWNERSHIP V1368 1/7] Recording a copy is not
 // publication. Preserve its exact slot identity until ExecuteCommandLists can
@@ -1914,6 +1916,7 @@ struct PendingStreamlineCapturePublication {
     uint32_t generation{};
     uint64_t pair_id{};
     uint64_t capture_serial{};
+    uint64_t recording_epoch{}; // Modern only; observed on the actual endpoint.
 };
 std::array<std::array<StreamlineCaptureSlot, kStreamlineCaptureRingSize>, 2> g_streamline_capture_ring{};
 std::atomic<uint64_t> g_streamline_capture_write_count[2]{};
@@ -1924,6 +1927,65 @@ std::atomic<uint32_t> g_streamline_capture_log_count[2]{};
 std::atomic<uint32_t> g_streamline_dual_capture_sequence{};
 std::atomic<uint32_t> g_streamline_dual_evaluate_log_count{};
 std::mutex g_streamline_capture_mutex{};
+w3vr::modern_eye_pair::Pair g_modern_packed_outputs{};
+w3vr::modern_eye_pair::Consumption g_modern_output_consumption{};
+std::atomic<bool> g_modern_noaa_consumer_blocked{};
+// Process-lifetime POD root. In-flight or failed-signal references are not
+// released by a static destructor in DllMain. This is not an unload barrier.
+struct ModernNoAASourceUse {
+    w3vr::modern_eye_pair::Claim claim{};
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,2> textures;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Fence>,2> producer_fences;
+    std::array<Microsoft::WRL::ComPtr<ID3D12CommandQueue>,2> producers;
+    bool native_asymmetric{};
+    std::array<XrView,2> views{{{XR_TYPE_VIEW},{XR_TYPE_VIEW}}};
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> recording;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12Resource> xr_destination;
+    w3vr::modern_eye_pair::UsePhase phase{w3vr::modern_eye_pair::UsePhase::Recording};
+    uint64_t fence_value{UINT64_MAX};
+    bool recorded{}, cpu_active{true};
+    ModernNoAASourceUse* next{};
+};
+ModernNoAASourceUse* g_modern_noaa_source_uses{};
+// All these ownership operations use the capture mutex. Numeric receipts are
+// kept separate from the added COM references and the actual fence result.
+void erase_modern_noaa_source_use(ModernNoAASourceUse* target) {
+    auto** link=&g_modern_noaa_source_uses;
+    while(*link && *link!=target)link=&(*link)->next;
+    if(*link){*link=target->next;delete target;}
+}
+void collect_modern_noaa_source_uses() {
+    auto** link=&g_modern_noaa_source_uses;
+    while(*link){
+        auto* use=*link;
+        const auto completed=use->phase==w3vr::modern_eye_pair::UsePhase::Pending && use->fence
+            ? use->fence->GetCompletedValue():UINT64_MAX;
+        if(w3vr::modern_eye_pair::retired(use->phase,use->fence_value,completed,use->cpu_active)){
+            *link=use->next;delete use;
+        }else link=&use->next;
+    }
+}
+bool modern_noaa_source_held(ID3D12Resource* resource) {
+    for(auto* use=g_modern_noaa_source_uses;use;use=use->next)
+        for(const auto& texture:use->textures)if(texture.Get()==resource)return true;
+    return false;
+}
+void discard_modern_noaa_xr_recordings(ID3D12GraphicsCommandList* command) {
+    std::scoped_lock lock{g_streamline_capture_mutex};
+    auto** link=&g_modern_noaa_source_uses;
+    while(*link){
+        auto* use=*link;
+        if(!use->cpu_active && use->recorded && use->recording.Get()==command &&
+            use->phase==w3vr::modern_eye_pair::UsePhase::Recording){
+            *link=use->next;delete use; // Own successful Reset discarded this recording.
+        }else link=&use->next;
+    }
+    collect_modern_noaa_source_uses();
+}
+
 std::unordered_map<ID3D12CommandList*,
     std::vector<PendingStreamlineCapturePublication>>
     g_streamline_capture_pending_publications{};
@@ -2100,7 +2162,10 @@ bool capture_tagged_backbuffer_output(
     const XrView& render_view,
     bool render_view_valid,
     uint32_t source_eye,
-    bool source_eye_valid);
+    bool source_eye_valid,
+    const w3vr::modern_eye_capture::Identity* modern_identity = nullptr);
+bool modern_noaa_output_requested();
+bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract*);
 bool native_stereo_capture_ready();
 void prepare_openxr_render_frame(uint32_t origin);
 XrTime locate_openxr_mode3_pair_pose();
@@ -20569,9 +20634,27 @@ take_streamline_capture_submissions(
         if (found == g_streamline_capture_pending_publications.end()) {
             continue;
         }
-        pending.insert(
-            pending.end(), found->second.begin(), found->second.end());
-        g_streamline_capture_pending_publications.erase(found);
+        std::vector<PendingStreamlineCapturePublication> rejected{};
+        for(const auto& publication:found->second){
+            if(publication.eye>1 || publication.slot>=kStreamlineCaptureRingSize)continue;
+            auto& slot=g_streamline_capture_ring[publication.eye][publication.slot];
+            if(slot.modern_output.identity.profile){
+                const auto epoch=load_command_list_recording_epoch(
+                    static_cast<ID3D12GraphicsCommandList*>(command_lists[index]));
+                if(slot.capture_serial!=publication.capture_serial ||
+                    slot.modern_output.command!=reinterpret_cast<uintptr_t>(command_lists[index]) ||
+                    slot.modern_output.recording_epoch!=publication.recording_epoch ||
+                    !w3vr::modern_eye_pair::finite(epoch) || epoch!=publication.recording_epoch){
+                    // Retain the reservation: unknown ordering cannot prove an
+                    // abandoned or retired GPU recording. A real Reset can.
+                    rejected.push_back(publication);continue;
+                }
+                slot.modern_output.submitted_epoch=epoch;
+            }
+            pending.push_back(publication);
+        }
+        if(rejected.empty())g_streamline_capture_pending_publications.erase(found);
+        else found->second=std::move(rejected);
     }
     return pending;
 }
@@ -20590,15 +20673,16 @@ void publish_streamline_capture_submissions(
         return;
     }
 
-    bool consumer_ordered = submission_ordered &&
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> ordered_consumer=g_command_queue;
+    bool consumer_ordered = submission_ordered && ordered_consumer &&
         producer_queue != nullptr && producer_queue_fence != nullptr &&
-        producer_queue_fence_value != 0;
+        w3vr::modern_eye_pair::finite(producer_queue_fence_value);
     HRESULT wait_result = S_OK;
-    if (consumer_ordered && producer_queue != g_command_queue) {
-        if (g_command_queue == nullptr) {
+    if (consumer_ordered && producer_queue != ordered_consumer.Get()) {
+        if (!ordered_consumer) {
             consumer_ordered = false;
         } else {
-            wait_result = g_command_queue->Wait(
+            wait_result = ordered_consumer->Wait(
                 producer_queue_fence, producer_queue_fence_value);
             consumer_ordered = SUCCEEDED(wait_result);
         }
@@ -20630,8 +20714,22 @@ void publish_streamline_capture_submissions(
                 publication.generation ==
                     g_streamline_capture_generation.load(
                         std::memory_order_acquire);
-            const bool publication_ready =
-                consumer_ordered && identity_current;
+            const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+            const bool modern=slot.modern_output.identity.profile!=nullptr;
+            const bool modern_current=!modern || (modern_noaa_output_ready(contract) &&
+                slot.modern_output.identity.profile==w3vr::render_core::modern_selected(contract) &&
+                slot.modern_output.recording_epoch==publication.recording_epoch &&
+                slot.modern_output.submitted_epoch==publication.recording_epoch);
+            const bool publication_ready=consumer_ordered && identity_current && modern_current;
+            if(modern){
+                auto& output=slot.modern_output;
+                output.producer=reinterpret_cast<uintptr_t>(producer_queue);
+                output.consumer=reinterpret_cast<uintptr_t>(ordered_consumer.Get());
+                output.fence=reinterpret_cast<uintptr_t>(producer_queue_fence);
+                output.fence_value=producer_queue_fence_value;
+                output.ordered=consumer_ordered;output.initialized=publication_ready;
+                output.recording_pending=false;
+            }
             slot.producer_queue = publication_ready
                 ? producer_queue : nullptr;
             slot.producer_queue_fence = publication_ready
@@ -22808,6 +22906,7 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
                     slot.source_eye_valid = false;
                     slot.render_view_valid = false;
                     slot.native_asymmetric_projection = false;
+                    slot.modern_output={};
                 }
             }
             g_streamline_capture_pending_publications.erase(found);
@@ -29282,7 +29381,7 @@ void STDMETHODCALLTYPE hook_resource_barrier(
                 capture_tagged_backbuffer_output(command_list,source,D3D12_RESOURCE_STATE_PRESENT,
                     static_cast<uint32_t>(request.eye),request.generation,request.pair,
                     modern_copy_tag.render_view,modern_copy_tag.render_view_valid,
-                    static_cast<uint32_t>(request.eye),true);
+                    static_cast<uint32_t>(request.eye),true,&g_modern_capture_identity);
             }
             source->Release();
         }
@@ -31852,6 +31951,64 @@ bool remastered_core_ready_for(const w3vr::engine_camera::TemporalContract* cont
             g_remastered_core_installed_profile.load(std::memory_order_acquire),
             g_remastered_core_hooks_ready.load(std::memory_order_acquire));
 }
+bool modern_noaa_output_requested() {
+    return g_config.openxr_mode==3 && g_config.temporal_backend==TemporalBackend::None &&
+        (w3vr::render_core::modern_selected(g_engine_camera_temporal_contract.load(std::memory_order_acquire)) ||
+            g_remastered_core_installed_profile.load(std::memory_order_acquire));
+}
+bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contract) {
+    return modern_noaa_output_requested() && remastered_core_ready_for(contract) &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire) &&
+        !mode3_aer_presentation_active() && !g_config.steady_icons;
+}
+ModernNoAASourceUse* acquire_modern_noaa_sources() {
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if(!modern_noaa_output_ready(contract))return nullptr;
+    auto use=std::make_unique<ModernNoAASourceUse>();
+    std::scoped_lock lock{g_streamline_capture_mutex};
+    collect_modern_noaa_source_uses();
+    const auto* profile=g_remastered_core_installed_profile.load(std::memory_order_acquire);
+    const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+    if(!g_packed_present_cache_valid || !g_command_queue || !g_xr_fence ||
+        !w3vr::modern_eye_pair::accepts(g_modern_packed_outputs,contract,profile,true,generation,
+            reinterpret_cast<uintptr_t>(g_command_queue),0))return nullptr;
+    use->queue=g_command_queue;use->fence=g_xr_fence;
+    for(uint32_t eye=0;eye<2;++eye){
+        if(g_modern_packed_outputs[eye].texture!=reinterpret_cast<uintptr_t>(g_packed_present_cache[eye]) ||
+            !g_packed_present_cache_view_valid[eye])return nullptr;
+        use->textures[eye]=g_packed_present_cache[eye];
+        use->producer_fences[eye]=reinterpret_cast<ID3D12Fence*>(g_modern_packed_outputs[eye].fence);
+        use->producers[eye]=reinterpret_cast<ID3D12CommandQueue*>(g_modern_packed_outputs[eye].producer);
+        use->views[eye]=g_packed_present_cache_views[eye];
+    }
+    use->native_asymmetric=g_packed_present_cache_native_asymmetric;
+    if(!modern_noaa_output_ready(contract) ||
+        !g_modern_output_consumption.begin(g_modern_packed_outputs,contract,profile,true,generation,
+            reinterpret_cast<uintptr_t>(use->queue.Get()),{true,true,true,false,false,false},use->claim))return nullptr;
+    use->next=g_modern_noaa_source_uses;g_modern_noaa_source_uses=use.get();return use.release();
+}
+bool modern_noaa_sources_current(const ModernNoAASourceUse* use) {
+    if(!use)return false;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    std::scoped_lock lock{g_streamline_capture_mutex};
+    return modern_noaa_output_ready(contract) && use->queue.Get()==g_command_queue && use->fence.Get()==g_xr_fence &&
+        g_modern_output_consumption.current(use->claim,contract,
+            g_remastered_core_installed_profile.load(std::memory_order_acquire),true,
+            g_streamline_capture_generation.load(std::memory_order_acquire),reinterpret_cast<uintptr_t>(use->queue.Get()));
+}
+void finish_modern_noaa_sources(ModernNoAASourceUse* use,bool submitted,bool xr_succeeded) {
+    if(!use)return;
+    std::scoped_lock lock{g_streamline_capture_mutex};
+    g_modern_output_consumption.finish(use->claim,submitted,xr_succeeded);
+    use->cpu_active=false;
+    if(!use->recorded)erase_modern_noaa_source_use(use);
+    // Recorded failures stay retained until our successful Reset; submitted
+    // uses stay retained until their exact signal completes. Never free them
+    // just because xrEndFrame or a CPU scope returned.
+    collect_modern_noaa_source_uses();
+}
+
 bool remastered_normal_epilogue_table_matches(const uint8_t* module,
     const w3vr::render_core::Profile* profile) {
     if (!module || (profile!=&w3vr::render_core::remastered_500c &&
@@ -49969,7 +50126,10 @@ bool update_packed_eye_cache() {
         return false;
     }
 
-    if (mode3_aer_presentation_active() &&
+    const bool modern_noaa=modern_noaa_output_requested();
+    const auto* modern_contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if(modern_noaa && !modern_noaa_output_ready(modern_contract))return false;
+    if (!modern_noaa && mode3_aer_presentation_active() &&
         !mode3_afw_exact_final_source_active()) {
         return update_mode3_aer_eye_cache();
     }
@@ -50018,6 +50178,10 @@ bool update_packed_eye_cache() {
              left.pair_id))) {
         return false;
     }
+    w3vr::modern_eye_pair::Pair modern_outputs{{left.modern_output,right.modern_output}};
+    if(modern_noaa && !w3vr::modern_eye_pair::accepts(modern_outputs,modern_contract,
+        g_remastered_core_installed_profile.load(std::memory_order_acquire),modern_noaa_output_ready(modern_contract),
+        generation,reinterpret_cast<uintptr_t>(g_command_queue),g_packed_accepted_pair_id))return false;
     const bool had_accepted_pair = g_packed_present_cache_valid;
     uint64_t accepted_pair = left.pair_id;
     uint32_t accepted_slot_indices[2]{
@@ -50191,7 +50355,9 @@ bool update_packed_eye_cache() {
         slot.source_eye_valid = false;
         slot.render_view_valid = false;
         slot.native_asymmetric_projection = false;
+        slot.modern_output={};
     }
+    g_modern_packed_outputs=modern_noaa ? modern_outputs:w3vr::modern_eye_pair::Pair{};
     g_packed_present_cache_valid = true;
     g_packed_present_cache_native_asymmetric = native_pair_complete;
     g_packed_accepted_pair_id = accepted_pair;
@@ -50275,6 +50441,13 @@ bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
         return true;
     }
 
+    collect_modern_noaa_source_uses();
+    bool modern_ring=modern_noaa_output_requested() || g_modern_noaa_source_uses!=nullptr;
+    for(const auto& eye_ring:g_streamline_capture_ring)for(const auto& slot:eye_ring)
+        modern_ring=modern_ring || slot.modern_output.identity.profile!=nullptr;
+    if(modern_ring)for(const auto& eye_ring:g_streamline_capture_ring)for(const auto& slot:eye_ring)
+        if(slot.recording_pending || modern_noaa_source_held(slot.resource) ||
+            !private_resource_slot_retired(slot.last_use_fence,slot.last_use_fence_value))return false;
     for (auto& eye_ring : g_streamline_capture_ring) {
         for (auto& slot : eye_ring) {
             if (slot.resource != nullptr) {
@@ -50345,6 +50518,7 @@ bool reserve_streamline_capture_slot(
         return false;
     }
     std::scoped_lock lock{g_streamline_capture_mutex};
+    collect_modern_noaa_source_uses();
     const uint64_t start = g_streamline_capture_write_count[eye].fetch_add(
         1, std::memory_order_relaxed);
     for (uint32_t offset = 0;
@@ -50353,7 +50527,7 @@ bool reserve_streamline_capture_slot(
             (start + offset) % kStreamlineCaptureRingSize);
         auto& candidate = g_streamline_capture_ring[eye][candidate_index];
         if (candidate.recording_pending || candidate.resource == nullptr ||
-            !private_resource_slot_retired(
+            modern_noaa_source_held(candidate.resource) || !private_resource_slot_retired(
                 candidate.last_use_fence,
                 candidate.last_use_fence_value)) {
             continue;
@@ -50364,6 +50538,7 @@ bool reserve_streamline_capture_slot(
         candidate.capture_serial = capture_serial;
         candidate.recording_pending = true;
         candidate.initialized = false;
+        candidate.modern_output={};
         candidate.producer_queue = nullptr;
         candidate.producer_queue_fence = nullptr;
         candidate.producer_queue_fence_value = 0;
@@ -50463,7 +50638,15 @@ bool capture_tagged_backbuffer_output(
     const XrView& render_view,
     bool render_view_valid,
     uint32_t source_eye,
-    bool source_eye_valid) {
+    bool source_eye_valid,
+    const w3vr::modern_eye_capture::Identity* modern_identity) {
+    const auto epoch=modern_identity ? load_command_list_recording_epoch(command_list):0;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if(modern_identity && (!modern_noaa_output_ready(contract) ||
+        !w3vr::modern_eye_capture::admits(*modern_identity,contract,
+            g_remastered_core_installed_profile.load(std::memory_order_acquire),true,generation) ||
+        !w3vr::modern_eye_pair::finite(epoch) || modern_identity->frame.eye!=static_cast<int>(eye) ||
+        modern_identity->frame.pair!=pair_id || source_eye!=eye || !source_eye_valid || !render_view_valid))return false;
     if (command_list == nullptr || source == nullptr || eye > 1 || pair_id == 0 ||
         pair_id < g_engine_pair_capture_floor.load(std::memory_order_relaxed) ||
         generation != g_streamline_capture_generation.load() ||
@@ -50525,8 +50708,13 @@ bool capture_tagged_backbuffer_output(
         slot.render_view_valid = render_view_valid;
         slot.native_asymmetric_projection =
             native_asymmetric_source_eye_tagged(pair_id, eye);
+        if(modern_identity){
+            slot.modern_output={*modern_identity,reinterpret_cast<uintptr_t>(slot.resource),
+                reinterpret_cast<uintptr_t>(command_list),0,0,0,epoch,0,capture_serial,0,
+                source_eye,true,render_view_valid,false,true,false};
+        }
         g_streamline_capture_pending_publications[command_list].push_back({
-            eye, slot_index, generation, pair_id, capture_serial});
+            eye, slot_index, generation, pair_id, capture_serial,epoch});
     }
 
     if (g_config.runtime_diagnostics &&
@@ -51048,7 +51236,19 @@ void render_openxr_test_frame(
     uint32_t mode3_common_afw_sequence_real_eye{UINT32_MAX};
     uint64_t mode3_common_afw_sequence_pair{};
     bool mode3_common_afw_sequenced_available{};
-    bool submitted = views_valid && frame_state.shouldRender;
+    const bool modern_noaa_scene=modern_noaa_output_requested() && !spatial_panel_active;
+    ModernNoAASourceUse* modern_sources=nullptr;
+    bool submitted = views_valid && frame_state.shouldRender &&
+        !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire);
+    if(modern_noaa_scene){
+        modern_sources=submitted ? acquire_modern_noaa_sources():nullptr;
+        submitted=submitted && modern_sources!=nullptr;
+    }
+    const bool packed_native_asymmetric=modern_sources ? modern_sources->native_asymmetric:g_packed_present_cache_native_asymmetric;
+    const auto packed_view=[&](uint32_t eye)->const XrView&{
+        return modern_sources ? modern_sources->views[eye]:g_packed_present_cache_views[eye];};
+    const auto packed_view_valid=[&](uint32_t eye){
+        return modern_sources ? true:g_packed_present_cache_view_valid[eye];};
     const uint64_t loading_video_scene_pair_floor =
         g_loading_video_scene_pair_floor.load(std::memory_order_acquire);
     const bool mode3_final_source_gameplay_pair_ready =
@@ -51265,7 +51465,13 @@ void render_openxr_test_frame(
                     xr_command_allocator, nullptr))) {
                 submitted = false;
             } else {
+                discard_modern_noaa_xr_recordings(g_xr_command_list);
                 command_list_recording = true;
+                if(modern_sources){
+                    std::scoped_lock lock{g_streamline_capture_mutex};
+                    modern_sources->recording=g_xr_command_list;
+                    modern_sources->allocator=xr_command_allocator;modern_sources->recorded=true;
+                }
                 flight_xr_record_begin =
                     w3vr::pipeline_flight::cpu_begin();
                 flight_xr_gpu = w3vr::pipeline_flight::gpu_begin(
@@ -51276,6 +51482,7 @@ void render_openxr_test_frame(
 
         if (submitted) {
             auto* texture = swapchain.images[image_index].texture;
+            if(modern_sources)modern_sources->xr_destination=texture;
             UINT submitted_width = swapchain.width;
             UINT submitted_height = swapchain.height;
             D3D12_RESOURCE_BARRIER to_rtv{};
@@ -51326,9 +51533,9 @@ void render_openxr_test_frame(
             }
 
             if ((clean_mono_mode(mode) || mode == kOpenXrModeStereo) &&
-                (direct_stereo || game_backbuffer != nullptr)) {
+                (direct_stereo || modern_sources || game_backbuffer != nullptr)) {
                 projection_copy_attempted = true;
-                const bool live_backbuffer_source = !direct_stereo;
+                const bool live_backbuffer_source = !direct_stereo && !modern_sources;
                 D3D12_RESOURCE_BARRIER source_to_copy{};
                 if (live_backbuffer_source) {
                     source_to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -51358,9 +51565,8 @@ void render_openxr_test_frame(
                 to_rtv.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
                 g_xr_command_list->ResourceBarrier(1, &to_rtv);
 
-                auto* primary_source = direct_stereo
-                    ? direct_stereo_sources[0]
-                    : game_backbuffer;
+                auto* primary_source = modern_sources ? modern_sources->textures[0].Get()
+                    : (direct_stereo ? direct_stereo_sources[0]:game_backbuffer);
                 auto source_desc = primary_source->GetDesc();
                 const UINT copy_width = static_cast<UINT>(std::min<uint64_t>(source_desc.Width, swapchain.width));
                 const UINT copy_height = std::min<UINT>(source_desc.Height, swapchain.height);
@@ -51736,7 +51942,7 @@ void render_openxr_test_frame(
                 const bool mode3_final_source_cinema_pair_available =
                     mode3_final_source_cinema_active &&
                     sequential_cinema_pair_available();
-                const bool packed_stereo_available =
+                const bool packed_stereo_available = modern_sources ||
                     mode3_final_source_cinema_pair_available ||
                     (mode == 3 &&
                         !mode3_final_present_source &&
@@ -52509,6 +52715,7 @@ void render_openxr_test_frame(
                             g_config.engine_sync_swap_eyes
                         ? 1u - eye
                         : eye;
+                    if(modern_sources)return modern_sources->textures[cache_eye].Get();
                     return direct_stereo
                         ? direct_stereo_sources[cache_eye]
                         : (stereo_cached
@@ -52581,8 +52788,8 @@ void render_openxr_test_frame(
                     ? (g_stereo_eye_cache_view_valid[0] &&
                         g_stereo_eye_cache_view_valid[1])
                     : (packed_stereo_available
-                        ? (g_packed_present_cache_view_valid[0] &&
-                            g_packed_present_cache_view_valid[1])
+                        ? (packed_view_valid(0) &&
+                            packed_view_valid(1))
                         : (stereo_cached &&
                             g_stereo_eye_cache_view_valid[0] &&
                             g_stereo_eye_cache_view_valid[1]));
@@ -52668,7 +52875,7 @@ void render_openxr_test_frame(
                     w3vr::native_asymmetric_transport_policy::
                         cinema_presentation_uses_native_asymmetric({
                             g_packed_present_cache_valid &&
-                                g_packed_present_cache_native_asymmetric,
+                                packed_native_asymmetric,
                             sequential_cinema_pair_available(),
                             g_sequential_cinema_pair_native_asymmetric});
                 native_asymmetric_projection =
@@ -52992,8 +53199,8 @@ void render_openxr_test_frame(
                                 mode3_source_projection_ready =
                                     g_sequential_cinema_accepted_generation ==
                                         projection_generation &&
-                                    g_packed_present_cache_view_valid[0] &&
-                                    g_packed_present_cache_view_valid[1];
+                                    packed_view_valid(0) &&
+                                    packed_view_valid(1);
                                 mode3_source_native_asymmetric =
                                     mode3_source_projection_ready &&
                                     g_sequential_cinema_pair_native_asymmetric;
@@ -53002,9 +53209,9 @@ void render_openxr_test_frame(
                                     w3vr::mode3_transport::
                                         decide_projection_pair(
                                             g_packed_present_cache_valid &&
-                                                g_packed_present_cache_view_valid[0],
+                                                packed_view_valid(0),
                                             g_packed_present_cache_valid &&
-                                                g_packed_present_cache_view_valid[1],
+                                                packed_view_valid(1),
                                             g_mode3_aer_presentation_generation,
                                             g_mode3_aer_presentation_generation,
                                             projection_generation,
@@ -53609,8 +53816,8 @@ void render_openxr_test_frame(
                         sequential_cinema_pair_active &&
                             sequential_cinema_pair_available(),
                         g_packed_present_cache_valid,
-                        g_packed_present_cache_view_valid[
-                            render_source_eye])) {
+                        packed_view_valid(
+                            render_source_eye))) {
                     // [FIX:AER-CINEMA-IMMUTABLE-PAIR-VIEW V1237 1/1]
                     // The sequential Cinema route presents the last complete
                     // packed pair while the next eye is already entering the
@@ -53620,7 +53827,7 @@ void render_openxr_test_frame(
                     // valid bit clear. Otherwise every first half-pair mixes
                     // retained pixels with the following render pose, causing
                     // head-motion flicker and defeating rotational timewarp.
-                    render_view = &g_packed_present_cache_views[render_source_eye];
+                    render_view = &packed_view(render_source_eye);
                     render_view_origin = "packed_cache";
                 } else if (mode == 3 &&
                     g_stereo_eye_cache_view_valid[render_source_eye]) {
@@ -54036,7 +54243,12 @@ void render_openxr_test_frame(
             if (SUCCEEDED(close_result)) {
                 ID3D12CommandList* lists[] = {g_xr_command_list};
                 w3vr::minimal_xr_log::write("QUEUE_BEGIN", current_present, trace_pair_id, g_xr_fence_value + 1);
-                g_command_queue->ExecuteCommandLists(1, lists);
+                auto* submit_queue=modern_sources ? modern_sources->queue.Get():g_command_queue;
+                if(modern_sources){
+                    std::scoped_lock lock{g_streamline_capture_mutex};
+                    modern_sources->phase=w3vr::modern_eye_pair::UsePhase::Executing;
+                }
+                submit_queue->ExecuteCommandLists(1, lists);
                 if (fsr_hudless_recorded) {
                     publish_fsr_hudless_xr_color(
                         g_xr_command_allocator_index,
@@ -54063,7 +54275,13 @@ void render_openxr_test_frame(
                 // to it waits for exactly this value and nothing else, so the
                 // CPU keeps running while earlier frames finish on the GPU.
                 const uint64_t submission = ++g_xr_fence_value;
-                if (SUCCEEDED(g_command_queue->Signal(g_xr_fence, submission))) {
+                auto* submit_fence=modern_sources ? modern_sources->fence.Get():g_xr_fence;
+                if (SUCCEEDED(submit_queue->Signal(submit_fence, submission))) {
+                    if(modern_sources){
+                        std::scoped_lock lock{g_streamline_capture_mutex};
+                        modern_sources->fence_value=submission;
+                        modern_sources->phase=w3vr::modern_eye_pair::UsePhase::Pending;
+                    }
                     g_xr_command_allocator_fences[g_xr_command_allocator_index] =
                         submission;
                     // [FIX:CROSS-QUEUE-SCENE-CAPTURE-OWNERSHIP V1368 6/7]
@@ -54083,8 +54301,16 @@ void render_openxr_test_frame(
                 } else {
                     // Without a usable fence value the next reuse of this
                     // allocator must not assume the GPU is done with it.
-                    wait_for_xr_gpu();
-                    g_xr_command_allocator_fences[g_xr_command_allocator_index] = 0;
+                    if(modern_noaa_output_requested()){
+                        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                        g_xr_command_allocator_fences[g_xr_command_allocator_index]=UINT64_MAX;
+                        submitted=false;
+                        // Keep possibly submitted COM references quarantined.
+                        // A void wait or returned CPU scope is not retirement.
+                    }else{
+                        wait_for_xr_gpu();
+                        g_xr_command_allocator_fences[g_xr_command_allocator_index] = 0;
+                    }
                 }
             } else {
                 submitted = false;
@@ -54288,6 +54514,9 @@ void render_openxr_test_frame(
     const XrCompositionLayerBaseHeader* menu_layers[] = {
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_layer)};
 
+    if(modern_noaa_scene && (!modern_sources || !modern_noaa_sources_current(modern_sources) ||
+        modern_sources->phase!=w3vr::modern_eye_pair::UsePhase::Pending ||
+        !w3vr::modern_eye_pair::finite(modern_sources->fence_value)))submitted=false;
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
     end_info.displayTime = frame_state.predictedDisplayTime;
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -54401,6 +54630,7 @@ void render_openxr_test_frame(
     w3vr::pipeline_flight::cpu_end(
         w3vr::pipeline_flight::Phase::XrEndFrame,
         flight_end_frame_begin);
+    finish_modern_noaa_sources(modern_sources,submitted && end_info.layerCount!=0,XR_SUCCEEDED(result));
     if (XR_SUCCEEDED(result)) {
         // [FIX:OPENXR-QUANTIZED-PAIR-POSE 3/3] This completed runtime frame is
         // the sole clock authority for the next REDengine pair prediction.
@@ -55394,10 +55624,14 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
         // appeared as a recurring old-scene flash.  Publish a new real pair
         // once, and reuse it only through the established two-Present rescue
         // when the producer genuinely falls behind.
-        const bool submit_openxr_frame =
-            cinema_detector_due ||
-            accepted_new_publication || !g_packed_present_cache_valid ||
-            projection_rescue_due;
+        const bool modern_noaa_scene=modern_noaa_output_requested() &&
+            g_engine_menu_state.load(std::memory_order_relaxed)==0 &&
+            !g_engine_loading_screen_video_active.load(std::memory_order_acquire) &&
+            (!g_cinema_mode_active.load(std::memory_order_relaxed) ||
+                (!g_force_mono_cinema.load(std::memory_order_relaxed) && g_config.cinema_full_vr));
+        const bool submit_openxr_frame = modern_noaa_scene
+            ? (accepted_new_publication || !g_xr_render_frame_prepared.load(std::memory_order_acquire))
+            : (cinema_detector_due || accepted_new_publication || !g_packed_present_cache_valid || projection_rescue_due);
         if (submit_openxr_frame) {
             if (projection_rescue_due && !accepted_new_publication &&
                 g_config.runtime_diagnostics) {
