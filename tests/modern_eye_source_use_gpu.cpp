@@ -1,4 +1,5 @@
 #include "modern_eye_source_use.h"
+#include "modern_eye_resource_set.h"
 #include <dxgi1_6.h>
 #include <cstdio>
 #include <cstring>
@@ -175,6 +176,93 @@ void failure_case(ID3D12Device* device){
     require(store.collect()==1 && destroyed==1,"new exact signal did not release quarantine");
     std::puts("PASS simulated Signal failure retains physical use; unrelated completion cannot retire it; new actual signal/readback closes probe");
 }
+template<std::size_t N>
+void replacement_case(ID3D12Device* device){
+    namespace sets=w3vr::modern_eye_resource_set;
+    std::array<ID3D12Resource*,N> active{};
+    for(auto*& resource:active)resource=texture(device).Detach();
+    const auto previous=active;
+    auto consumer=queue(device);auto completed=fence(device),gate=fence(device);
+    Recording recording(device);auto upload=upload_pixels(device);
+    auto result=buffer(device,D3D12_HEAP_TYPE_READBACK,stride*2,D3D12_RESOURCE_STATE_COPY_DEST);
+    {std::array<ComPtr<ID3D12Resource>,2> images{active[0],active[1]};
+        populate(recording,upload.Get(),images);readback(recording,result.Get(),images);}
+    recording.close();check(consumer->Wait(gate.Get(),1),"replacement blocked queue wait");
+    ID3D12CommandList* submitted[]{recording.command.Get()};consumer->ExecuteCommandLists(1,submitted);
+    check(consumer->Signal(completed.Get(),1),"replacement real signal");
+    use::Store store{};std::array<sets::Slot,N> slots{};
+    for(std::size_t i=0;i<N;++i)slots[i]={&active[i],completed.Get(),1,false};
+    unsigned creates{};
+    auto create=[&](std::size_t,ID3D12Resource** out)->HRESULT{++creates;*out=texture(device,32).Detach();return S_OK;};
+    require(!sets::replace(slots,store,true,create) && creates==0 && active==previous,
+        "unfinished real fence released/replaced old resource set");
+    check(gate->Signal(1),"release replacement test gate");wait(completed.Get(),1);verify_pixels(result.Get());
+    unsigned destroyed{};auto owned=std::make_unique<TrackedUse>();owned->destroyed=&destroyed;
+    owned->textures={active[0],active[1]};auto* cpu_use=store.adopt(std::move(owned));
+    require(!sets::replace(slots,store,true,create) && creates==0 && active==previous,
+        "CPU-held source set replaced even after GPU completion");
+    store.finish_cpu(cpu_use);require(destroyed==1,"unused CPU-only reference not released");
+    slots[N-1].recording_pending=true;
+    require(!sets::replace(slots,store,true,create) && creates==0,"pending original recording replaced");
+    slots[N-1].recording_pending=false;
+    slots[0].value=UINT64_MAX;
+    require(!sets::replace(slots,store,true,create) && creates==0,"unknown target signal replaced");
+    slots[0].value=1;slots[0].fence=nullptr;
+    require(!sets::replace(slots,store,true,create) && creates==0,"missing original fence replaced");
+    slots[0].fence=completed.Get();
+    auto changed=slots;changed[1].owner=changed[0].owner;
+    require(!sets::replace(changed,store,true,create) && creates==0,"aliased owning address admitted");
+    changed=slots;changed[0].owner=nullptr;
+    require(!sets::replace(changed,store,true,create) && creates==0,"null owning address admitted");
+    for(std::size_t failure=0;failure<N;++failure){
+        creates=0;
+        auto partial=[&](std::size_t i,ID3D12Resource** out)->HRESULT{
+            if(i==failure)return E_OUTOFMEMORY; // Explicit simulated allocation failure.
+            return create(i,out);
+        };
+        require(!sets::replace(slots,store,true,partial),"partial allocation committed");
+        require(creates==failure && active==previous,"partial allocation altered old owning set");
+        for(auto* resource:active)require(resource->GetDesc().Width==16,"partial allocation invalidated old extent");
+    }
+    require(!sets::replace(slots,store,true,[](std::size_t,ID3D12Resource**)->HRESULT{return S_OK;}) && active==previous,
+        "success-without-resource accepted");
+    require(!sets::replace(slots,store,true,[&](std::size_t,ID3D12Resource** out)->HRESULT{
+        *out=active[0];(*out)->AddRef();return S_OK;}) && active==previous,"old alias used as a new generation");
+    ID3D12Resource* staged_first{};
+    require(!sets::replace(slots,store,true,[&](std::size_t i,ID3D12Resource** out)->HRESULT{
+        if(i==0){*out=texture(device,32).Detach();staged_first=*out;}
+        else{*out=staged_first;(*out)->AddRef();}return S_OK;
+    }) && active==previous,"aliased staging eyes accepted");
+    unsigned late_destroyed{};use::Use* late_use{};
+    require(!sets::replace(slots,store,true,[&](std::size_t i,ID3D12Resource** out)->HRESULT{
+        if(i==N-1){auto late=std::make_unique<TrackedUse>();late->destroyed=&late_destroyed;
+            late->textures[0]=active[0];late_use=store.adopt(std::move(late));}
+        return create(i,out);
+    }) && active==previous,"factory acquired old source but replacement skipped final check");
+    store.finish_cpu(late_use);require(late_destroyed==1,"late CPU use not finished");
+    ComPtr<ID3D12Resource> old_first=active[0];ID3D12Resource* externally_changed{};
+    require(!sets::replace(slots,store,true,[&](std::size_t i,ID3D12Resource** out)->HRESULT{
+        if(i==N-1){active[0]->Release();active[0]=texture(device,64).Detach();externally_changed=active[0];}
+        return create(i,out);
+    }) && active[0]==externally_changed && active[0]->GetDesc().Width==64,
+        "factory changed owning address but stale snapshot overwrote it");
+    active[0]->Release();active[0]=old_first.Detach();require(active==previous,"test restoration mismatch");
+    // Reuse the actual old textures after all failed transactions; GetDesc
+    // alone would not prove that they still supply the expected pixel bytes.
+    Recording reuse_record(device);
+    {std::array<ComPtr<ID3D12Resource>,2> images{active[0],active[1]};
+        readback(reuse_record,result.Get(),images);}
+    reuse_record.close();ID3D12CommandList* reuse_lists[]{reuse_record.command.Get()};
+    consumer->ExecuteCommandLists(1,reuse_lists);check(consumer->Signal(completed.Get(),2),"reuse old set signal");
+    wait(completed.Get(),2);verify_pixels(result.Get());
+    creates=0;require(sets::replace(slots,store,true,create) && creates==N,"completed full replacement rejected");
+    for(std::size_t i=0;i<N;++i){
+        require(active[i]!=previous[i] && active[i]->GetDesc().Width==32,"complete replacement lost new texture");
+        for(std::size_t j=0;j<i;++j)require(active[i]!=active[j],"new outputs are aliased");
+    }
+    for(auto*& resource:active){resource->Release();resource=nullptr;}
+    std::printf("PASS %zu-resource host replacement: physical pending fence/readback, held references, original recording, every simulated create failure, atomic 16->32 commit\n",N);
+}
 int main()try{
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     ComPtr<IDXGIFactory6> factory;check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"factory");
@@ -183,8 +271,8 @@ int main()try{
     require((description.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)==0,"physical GPU required");
     std::printf("GPU %ls dedicated_bytes=%llu\n",description.Description,static_cast<unsigned long long>(description.DedicatedVideoMemory));
     ComPtr<ID3D12Device> device;check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"device");
-    copy_case(device.Get(),false);copy_case(device.Get(),true);reset_cases(device.Get());failure_case(device.Get());
+    copy_case(device.Get(),false);copy_case(device.Get(),true);reset_cases(device.Get());failure_case(device.Get());replacement_case<4>(device.Get());replacement_case<6>(device.Get());
     std::printf("PASS shared host source-use store: %u checks, %u real texture copies, physical readback\n",checks,copies);
-    std::puts("Signal-failure HRESULT is simulated; real device removal not induced.");
+    std::puts("Signal/partial-allocation HRESULTs are simulated; real device removal not induced.");
     std::puts("GAME=false HEADSET=false OPENXR=false NATIVE_CAMERA=false VR_FUNCTIONAL=false");return 0;
 }catch(const std::exception& error){std::printf("FAIL %s\n",error.what());return 1;}
