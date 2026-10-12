@@ -6,6 +6,68 @@ com estéreo simultâneo, cabeça livre, mãos/armas Touch e combate físico.
 Menções à meta nas etapas antigas são registros históricos. O arquivo compilado está na pasta de
 desenvolvimento e não foi instalado no jogo.
 
+## Retenção de texturas testada com DirectX real — 12 de outubro
+
+Separei o registro de uso das texturas em um componente usado pelo próprio
+mod e pelo teste gráfico. Nesta etapa, o teste criou recursos e executou cópias
+reais na placa de vídeo do PC. Não carregou o jogo, o headset ou OpenXR, que é
+a interface de comunicação com o sistema VR. As imagens do teste são padrões
+de laboratório; não são imagens produzidas pelo Witcher.
+
+O fluxo, passo a passo:
+
+1. O mod entrega ao componente as referências das duas texturas, dos sinais,
+   das filas de trabalho, da lista de comandos, do alocador e do destino XR.
+   Referências mantêm essas interfaces vivas; não garantem que seus pixels
+   permaneçam iguais nem protegem todos os objetos internos do jogo.
+2. Antes de enviar, confere que o registro está em gravação e corresponde
+   à fila, à lista e à quantidade realmente entregues para execução. Uma
+   rejeição fecha esse envio; não chama a execução original mesmo assim.
+3. Depois do envio original, recebe o resultado real do sinal e seu número.
+   O uso enviado só fica disponível para coleta quando esse sinal termina e
+   a CPU já encerrou seu uso. Falha de sinal conserva as referências.
+4. Uma reinicialização original com sucesso pode descartar apenas a gravação
+   abandonada daquela lista. Não libera um uso já enviado. Falha de fechamento
+   ou reinicialização não ganha uma permissão de descarte por suposição.
+5. O teste cria duas texturas de 16 por 16 pixels com padrões diferentes,
+   bloqueia deliberadamente o trabalho da GPU e retira as referências do
+   chamador. Cria novas texturas de 32 por 32 enquanto as antigas continuam
+   pendentes. Confere que o componente ainda conserva as antigas.
+6. Libera o bloqueio do teste, espera o sinal correto e lê os pixels de volta
+   para a CPU. Confere todos os bytes úteis de ambos os padrões e só então
+   coleta o uso. Repete com produtor e consumidor na mesma fila e em filas
+   diferentes, preservando a espera real entre essas filas.
+
+`modern_eye_source_use.h` contém o registro e a coleta usados pelo mod;
+`dxgi_proxy.cpp` fornece seus dados e encaminha as chamadas reais;
+`modern_eye_source_use_gpu.cpp` usa o mesmo componente em um processo separado.
+Escolhi compartilhar a implementação para que o teste exercite as operações
+que o mod usa, sem depender de uma cópia paralela dessas regras.
+
+O teste físico passou com **12 cópias reais de textura e 6.191 verificações**,
+incluindo conferência dos pixels. Testou retenção enquanto a GPU estava
+pendente, troca de tamanho dos recursos do chamador, conclusão com o sinal
+correto, argumentos de envio alterados e reinicialização e fechamento reais
+com sucesso e falha. O erro de sinal foi simulado por um resultado explícito;
+as cópias, interfaces, sinais posteriores e leitura dos pixels foram reais.
+Não induziu remoção do dispositivo. A repetição de sinal usada para encerrar
+essa hipótese é própria do teste; o mod conserva seu bloqueio após essa falha.
+
+A DLL compilou e **113/113 testes passaram em 11,02 segundos**. O teste
+gráfico é um executável separado e não faz parte desses 113 testes. Seus
+resultados não comprovam a instalação dos interceptadores no Witcher, a
+aquisição segura de objetos internos, todos os caminhos de troca de tamanho
+ou encerramento, concorrência no jogo, imagens estéreo do jogo, nem o Quest.
+
+**O VR ainda não é jogável e nada experimental foi instalado no jogo.** O
+bloqueio geral continua igual. Ainda faltam recursos e históricos do motor
+por olho, a ordem completa de desenho e envio, proteção contra chamadas em
+execução durante a retirada da DLL e a comprovação das duas imagens reais do
+jogo. O componente não resolve sozinho esse encerramento: usos sem prova de
+conclusão conservam suas referências. Depois das imagens reais no PC vêm
+Quest, cabeça, mãos, armas, dano e bloqueio físicos. A meta de 60 FPS permanece
+cancelada.
+
 ## Consumidor dos dois olhos novos e retenção das texturas — 11 de outubro
 
 Liguei a seleção dos dois olhos aos registros reais de captura e envio dos
