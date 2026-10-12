@@ -3,6 +3,7 @@
 #include "modern_graphics_binding.h"
 #include "modern_backbuffer_source.h"
 #include "modern_backbuffer_hooks.h"
+#include "modern_hook_original.h"
 #include "modern_dlss_ownership.h"
 #include <MinHook.h>
 #include <barrier>
@@ -502,30 +503,39 @@ struct Context {
     UINT expected_count{};ID3D12CommandList* const* expected_array{};bool args_preserved{true},original_unlocked{true};
 };
 thread_local Context* active{};
+thread_local const w3vr::modern_hook_original::Routes* legacy_routes{};
+thread_local const w3vr::modern_hook_original::Routes* native_routes{};
+template<class Function> Function routed_original(IUnknown* receiver,std::size_t slot,std::size_t site,Function installed){
+    if(!legacy_routes || !native_routes)return installed;
+    auto* actual=(*reinterpret_cast<void***>(receiver))[slot];
+    auto* selected=w3vr::modern_hook_original::select(actual,(*legacy_routes)[site],(*native_routes)[site]);
+    require(selected==reinterpret_cast<void*>(installed),"physical receiver selected different/absent original");
+    return reinterpret_cast<Function>(selected);
+}
 HRESULT STDMETHODCALLTYPE close_hook(ID3D12GraphicsCommandList* command){
-    const HRESULT result=close_original(command);
+    const HRESULT result=routed_original(command,9,2,close_original)(command);
     if(active && active->command==command){++active->closes;std::lock_guard lock{*active->mutex};active->store->after_close(command,8,result);}
     return result;
 }
 HRESULT STDMETHODCALLTYPE reset_hook(ID3D12GraphicsCommandList* command,ID3D12CommandAllocator* allocator,ID3D12PipelineState* state){
-    const HRESULT result=reset_original(command,allocator,state);
+    const HRESULT result=routed_original(command,10,0,reset_original)(command,allocator,state);
     if(active && active->command==command){++active->resets;std::lock_guard lock{*active->mutex};active->store->after_reset(command,8,result);}
     return result;
 }
 void STDMETHODCALLTYPE barrier_hook(ID3D12GraphicsCommandList* command,UINT count,const D3D12_RESOURCE_BARRIER* barriers){
-    barrier_original(command,count,barriers);
+    routed_original(command,26,3,barrier_original)(command,count,barriers);
     if(active && active->command==command)++active->barriers;
 }
 void STDMETHODCALLTYPE execute_hook(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
     auto* context=active;
     const bool ours=context && lists && std::find(lists,lists+count,context->command)!=lists+count;
-    if(!ours){execute_original(queue,count,lists);return;}
+    if(!ours){routed_original(queue,10,1,execute_original)(queue,count,lists);return;}
     context->args_preserved=context->args_preserved && count==context->expected_count && lists==context->expected_array;
     context->last_batch=context->store->execute_from_callback(*context->mutex,queue,count,lists,
         [&](auto* command){return command==context->command?8ULL:0ULL;},[&]{
             ++context->executes;
             const bool unlocked=context->mutex->try_lock();context->original_unlocked=context->original_unlocked && unlocked;
-            if(unlocked)context->mutex->unlock();execute_original(queue,count,lists);
+            if(unlocked)context->mutex->unlock();routed_original(queue,10,1,execute_original)(queue,count,lists);
         });
     const HRESULT signalled=queue->Signal(context->fence,1);
     {std::lock_guard lock{*context->mutex};context->store->after_signal(context->last_batch,SUCCEEDED(signalled),context->fence,1);}
@@ -739,6 +749,8 @@ void native_source_hooks_case(ID3D12Device* device,IDXGIFactory6* factory){
     hooks::Targets targets{probe::method(anchor.command.Get(),10),probe::method(native_queue.Get(),10),
         probe::method(anchor.command.Get(),9),probe::method(anchor.command.Get(),26)};
     hooks::Receipts receipts;
+    w3vr::modern_hook_original::Routes legacy_routes,native_routes;
+    probe::legacy_routes=&legacy_routes;probe::native_routes=&native_routes;
     require(!receipts.ready() && !receipts.accepts(targets),"empty hook receipts admitted Native capture");
     require(MH_Initialize()==MH_OK,"probe MinHook Initialize");
     const std::array<void*,4> detours{reinterpret_cast<void*>(&probe::reset_hook),reinterpret_cast<void*>(&probe::execute_hook),
@@ -748,12 +760,16 @@ void native_source_hooks_case(ID3D12Device* device,IDXGIFactory6* factory){
     for(std::size_t i=0;i<targets.size();++i)if(i!=2){
         require(hooks::native_target(targets[i]),"probe target was not concrete Native DirectX");
         require(MH_CreateHook(targets[i],detours[i],originals[i])==MH_OK,"probe old CreateHook");
+        require(legacy_routes[i].bind(targets[i],*originals[i]),"bind exact physical legacy original before Enable");
         require(MH_EnableHook(targets[i])==MH_OK,"probe old EnableHook");
         require(receipts.publish(static_cast<hooks::Site>(i),targets[i],*originals[i],true),"old exact enabled receipt");
     }
     require(!receipts.ready(),"three old sites admitted a bundle without Close");
     *originals[2]=nullptr;hooks::Installation installation;unsigned created{},enabled{};
-    auto create=[&](std::size_t i,void* target,void** original){++created;return MH_CreateHook(target,detours[i],original)==MH_OK;};
+    for(std::size_t i=0;i<targets.size();++i)if(*originals[i])
+        require(native_routes[i].bind(targets[i],*originals[i]),"bind reused exact physical native original");
+    auto create=[&](std::size_t i,void* target,void** original){++created;return MH_CreateHook(target,detours[i],original)==MH_OK &&
+        native_routes[i].bind(target,*original);};
     auto enable=[&](std::size_t,void* target){++enabled;return MH_EnableHook(target)==MH_OK;};
     require(!hooks::install_once(false,receipts,installation,targets,originals,create,enable) && !installation.attempted && !created && !enabled,
         "unrequested bundle mutated the old hooks");
@@ -777,6 +793,8 @@ void native_source_hooks_case(ID3D12Device* device,IDXGIFactory6* factory){
     // work. This does not claim the game's external all-call unload barrier.
     for(auto* target:targets){require(MH_DisableHook(target)==MH_OK,"probe disable after actual drain");
         require(MH_RemoveHook(target)==MH_OK,"probe remove with single probe thread stopped");}
+    probe::legacy_routes=nullptr;probe::native_routes=nullptr;
+    std::puts("PASS receiver-bound originals on real Native Reset/Execute/Close/Barrier, exact shared legacy owner and GPU pixel copies; SDK wrappers NOT executed");
     for(auto** original:originals)*original=nullptr;
     hooks::Receipts partial;hooks::Installation partial_state;unsigned partial_created{},partial_enabled{};
     auto partial_create=[&](std::size_t i,void* target,void** original){++partial_created;return MH_CreateHook(target,detours[i],original)==MH_OK;};
