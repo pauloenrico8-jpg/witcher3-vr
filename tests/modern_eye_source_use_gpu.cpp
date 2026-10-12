@@ -1,5 +1,8 @@
 #include "modern_eye_source_use.h"
 #include "modern_eye_resource_set.h"
+#include "modern_graphics_binding.h"
+#include <barrier>
+#include <thread>
 #include <dxgi1_6.h>
 #include <cstdio>
 #include <cstring>
@@ -263,6 +266,109 @@ void replacement_case(ID3D12Device* device){
     for(auto*& resource:active){resource->Release();resource=nullptr;}
     std::printf("PASS %zu-resource host replacement: physical pending fence/readback, held references, original recording, every simulated create failure, atomic 16->32 commit\n",N);
 }
+void binding_case(ID3D12Device* device,IDXGIFactory6* factory){
+    namespace binding=w3vr::modern_graphics_binding;
+    const auto instance=GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"W3VRBindingProbeHidden";
+    require(RegisterClassW(&wc)!=0,"own hidden window class");
+    HWND window=CreateWindowExW(0,wc.lpszClassName,L"W3VR binding probe",WS_POPUP,0,0,64,64,
+        nullptr,nullptr,instance,nullptr);require(window!=nullptr,"own hidden window");
+    require(!IsWindowVisible(window),"test window became visible");
+    {
+        auto original_queue=queue(device);
+        DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=32;desc.Height=32;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;
+        desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        ComPtr<IDXGISwapChain1> chain;
+        const HRESULT created=factory->CreateSwapChainForHwnd(original_queue.Get(),window,&desc,nullptr,nullptr,&chain);
+        check(created,"actual hidden native swapchain factory");
+        binding::Registry registry;
+        require(!registry.ready() && !registry.acquire_backbuffer().resource,"empty binding adopted a buffer");
+        require(!registry.publish_factory(E_FAIL,original_queue.Get(),chain.Get()) && !registry.ready(),
+            "explicit failed factory HRESULT published binding");
+        require(registry.publish_factory(created,original_queue.Get(),chain.Get()),"actual factory queue/output binding rejected");
+        auto first=registry.acquire();require(first && registry.current(first) && first->width==32 && first->height==32,
+            "factory snapshot is not exact current owner");
+        require(registry.publish_factory(created,original_queue.Get(),chain.Get()) && registry.acquire().get()==first.get(),
+            "same callback advanced epoch or replaced owner");
+        auto copied=std::make_shared<binding::Data>(*first);
+        require(!registry.current(copied),"copied snapshot acquired registry authority");
+        D3D12_COMMAND_QUEUE_DESC copy_desc{};copy_desc.Type=D3D12_COMMAND_LIST_TYPE_COPY;
+        ComPtr<ID3D12CommandQueue> wrong_queue;check(device->CreateCommandQueue(&copy_desc,IID_PPV_ARGS(&wrong_queue)),"actual copy queue");
+        require(!registry.publish_factory(S_OK,wrong_queue.Get(),chain.Get()) && registry.current(first),
+            "non-DIRECT original queue published binding");
+        auto auxiliary_queue=queue(device);ComPtr<IDXGISwapChain1> auxiliary;
+        const HRESULT auxiliary_created=factory->CreateSwapChainForComposition(auxiliary_queue.Get(),&desc,nullptr,&auxiliary);
+        check(auxiliary_created,"actual auxiliary composition swapchain factory");
+        require(!registry.publish_factory(auxiliary_created,auxiliary_queue.Get(),auxiliary.Get()) && registry.current(first),
+            "auxiliary real factory silently retargeted game binding");
+        require(!registry.publish_factory(created,auxiliary_queue.Get(),chain.Get()) && registry.current(first),
+            "same device alone inferred a different factory queue");
+        unsigned auxiliary_calls{};
+        const HRESULT auxiliary_resize=registry.resize_from_callback(auxiliary.Get(),[&]()->HRESULT{
+            ++auxiliary_calls;return auxiliary->ResizeBuffers(2,48,48,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+        });check(auxiliary_resize,"actual auxiliary resize");
+        require(auxiliary_calls==1 && registry.current(first) && registry.acquire()->width==32,
+            "foreign resize invalidated main binding or repeated Original");
+        auto held=registry.acquire_backbuffer();require(held.resource && registry.current(held.binding) &&
+            held.resource->GetDesc().Width==32,"owned current backbuffer query");
+        Recording own_record(device);require(registry.owns_child(first,own_record.command.Get()),"actual device child mismatch");own_record.close();
+        unsigned original_calls{},successful{};
+        const HRESULT failed=registry.resize_from_callback(chain.Get(),[&]()->HRESULT{
+            ++original_calls;require(!registry.ready() && !registry.acquire_backbuffer().resource,
+                "resize allowed acquisition while Original was active");
+            return chain->ResizeBuffers(2,64,64,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+        });
+        require(FAILED(failed) && original_calls==1,"held real backbuffer unexpectedly resized or Original called twice");
+        auto after_failure=registry.acquire();require(after_failure && registry.current(after_failure) &&
+            after_failure->epoch>first->epoch && after_failure->width==32 && !registry.current(first),
+            "failed Original resize changed dimensions or retained old authority");
+        held.resource.Reset();
+        const HRESULT resized=registry.resize_from_callback(chain.Get(),[&]()->HRESULT{
+            ++original_calls;return chain->ResizeBuffers(2,64,64,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+        });check(resized,"actual successful resize");++successful;
+        auto after_success=registry.acquire();require(after_success && after_success->width==64 && after_success->height==64 &&
+            after_success->epoch>after_failure->epoch && !registry.current(after_failure),"successful resize did not publish exact epoch/extent");
+        auto new_source=registry.acquire_backbuffer();require(new_source.resource && new_source.resource->GetDesc().Width==64,
+            "resized native backbuffer extent mismatch");new_source.resource.Reset();
+        // The test owns this window and never shows it. No desktop automation,
+        // game, headset, Native render hook or OpenXR is involved.
+        std::barrier start{4};std::atomic<bool> reader_failed{};std::atomic<unsigned> observed{};
+        std::array<std::thread,3> readers;
+        for(auto& reader:readers)reader=std::thread([&]{
+            auto initial=registry.acquire();if(!initial)reader_failed.store(true);
+            start.arrive_and_wait();
+            for(unsigned n=0;n<300;++n){auto snapshot=registry.acquire();
+                if(!snapshot)continue;
+                if(!snapshot->device || !snapshot->queue || !snapshot->chain ||
+                    snapshot->queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT || !binding::finite(snapshot->epoch))
+                    reader_failed.store(true);
+                observed.fetch_add(1);
+            }
+        });
+        start.arrive_and_wait();
+        for(unsigned n=0;n<8;++n){const UINT extent=64+(n%2)*16;
+            const HRESULT changed=registry.resize_from_callback(chain.Get(),[&]()->HRESULT{
+                ++original_calls;return chain->ResizeBuffers(2,extent,extent,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+            });check(changed,"concurrent snapshot actual resize");++successful;
+        }
+        for(auto& reader:readers)reader.join();
+        require(!reader_failed.load(),"concurrent owned snapshot lost physical interfaces");
+        // Even when all loop reads meet a revoked phase, their initial owned
+        // snapshots remain valid. Do not infer a minimum scheduling interleave.
+        original_queue.Reset();chain.Reset();
+        require(first->queue->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT && first->chain,
+            "caller released factory interfaces but snapshot lost ownership");
+        registry.stop_no_release();require(!registry.ready() && !registry.acquire() && !registry.current(after_success),
+            "atomic stop retained new acquisition authority");
+        require(first->queue->GetDesc().Type==D3D12_COMMAND_LIST_TYPE_DIRECT,
+            "registry revocation invalidated an existing owned reference");
+        std::printf("PASS owned graphics binding: actual factory/GetBuffer, 1 actual failed + %u successful ResizeBuffers, %u Original calls, 3 reader threads (%u snapshots), auxiliary chain isolated, epoch rejection and retained interfaces\n",
+            successful,original_calls,observed.load());
+    }
+    require(DestroyWindow(window)!=0,"destroy own hidden window");
+    require(UnregisterClassW(wc.lpszClassName,instance)!=0,"unregister own hidden class");
+}
 int main()try{
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     ComPtr<IDXGIFactory6> factory;check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"factory");
@@ -271,7 +377,7 @@ int main()try{
     require((description.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)==0,"physical GPU required");
     std::printf("GPU %ls dedicated_bytes=%llu\n",description.Description,static_cast<unsigned long long>(description.DedicatedVideoMemory));
     ComPtr<ID3D12Device> device;check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"device");
-    copy_case(device.Get(),false);copy_case(device.Get(),true);reset_cases(device.Get());failure_case(device.Get());replacement_case<4>(device.Get());replacement_case<6>(device.Get());
+    copy_case(device.Get(),false);copy_case(device.Get(),true);reset_cases(device.Get());failure_case(device.Get());replacement_case<4>(device.Get());replacement_case<6>(device.Get());binding_case(device.Get(),factory.Get());
     std::printf("PASS shared host source-use store: %u checks, %u real texture copies, physical readback\n",checks,copies);
     std::puts("Signal/partial-allocation HRESULTs are simulated; real device removal not induced.");
     std::puts("GAME=false HEADSET=false OPENXR=false NATIVE_CAMERA=false VR_FUNCTIONAL=false");return 0;
