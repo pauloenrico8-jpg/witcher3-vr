@@ -2,6 +2,7 @@
 #include "modern_queue_lifecycle.h"
 #include <thread>
 #include <latch>
+#include <vector>
 #include <cstdio>
 namespace q=w3vr::modern_command_queue;
 namespace {
@@ -79,7 +80,7 @@ void build_profiles_cannot_share_a_binding(){
   "new profile accepted old renderer type");
  // Revision observations retain the build identity too, without retaining Native objects.
  namespace life=w3vr::modern_queue_lifecycle;life::Observations observations;
- auto ticket=observations.begin(parsed.queue,true);require(observations.finish(ticket,parsed,true),"new profile observation refused");
+ auto ticket=observations.begin(parsed.queue,&life::remastered_1048522,true);require(observations.finish(ticket,parsed,true),"new profile observation refused");
  life::Snapshot snap{};require(observations.snapshot(parsed,snap)&&observations.current(snap),"new profile observation lost");
  life::Snapshot untouched{};untouched.revision=777;
  require(!observations.snapshot(other_profile,untouched)&&untouched.revision==777,"cross-build snapshot admitted or changed output");
@@ -146,16 +147,16 @@ void reject_foreign_or_published_primary(){
 }
 void construction_reading_before_owner_store(){
  namespace life=w3vr::modern_queue_lifecycle;
- require(life::known_construction(life::normal_construct_return,0),"normal construction mode not accepted");
- require(life::known_construction(life::alternate_construct_return,1),"alternate construction mode not accepted");
- require(!life::known_construction(life::normal_construct_return,1),"normal caller borrowed alternate mode");
- require(!life::known_construction(life::alternate_construct_return,0),"alternate caller borrowed normal mode");
- require(!life::known_construction(life::normal_construct_return+1,0),"neighboring caller accepted");
- require(!life::known_construction(life::alternate_construct_return,2),"unknown mode accepted");
- require(!life::known_construction(0,0),"unknown constructor caller accepted");
+ require(life::known_construction(&life::remastered_500c,life::normal_construct_return,0),"normal construction mode not accepted");
+ require(life::known_construction(&life::remastered_500c,life::alternate_construct_return,1),"alternate construction mode not accepted");
+ require(!life::known_construction(&life::remastered_500c,life::normal_construct_return,1),"normal caller borrowed alternate mode");
+ require(!life::known_construction(&life::remastered_500c,life::alternate_construct_return,0),"alternate caller borrowed normal mode");
+ require(!life::known_construction(&life::remastered_500c,life::normal_construct_return+1,0),"neighboring caller accepted");
+ require(!life::known_construction(&life::remastered_500c,life::alternate_construct_return,2),"unknown mode accepted");
+ require(!life::known_construction(&life::remastered_500c,0,0),"unknown constructor caller accepted");
  Fixture f;put(f.renderer,q::renderer_queue_offset,std::uintptr_t{});
  put(f.queue,life::owner_offset,f.identity.renderer);q::Identity parsed{};
- require(life::read_constructed_identity(f.identity.module,f.identity.renderer,f.renderer,
+ require(life::read_constructed_identity(&life::remastered_500c,f.identity.module,f.identity.renderer,f.renderer,
   f.identity.queue,f.queue,parsed)&&parsed==f.identity,"constructor owner not read before actual caller store");
  require(!f.read(parsed),"ordinary live reader accepted unpublished renderer queue");
  for(int reason=0;reason<8;++reason){Fixture c;put(c.renderer,q::renderer_queue_offset,std::uintptr_t{});
@@ -168,7 +169,7 @@ void construction_reading_before_owner_store(){
    case 5:qp=qp.first(life::constructed_prefix_bytes-1);break;
    case 6:put(c.queue,0x50,std::uintptr_t{});break;case 7:c.identity.module=0;break;}
   q::Identity rejected{};rejected.queue=0xBAD;
-  require(!life::read_constructed_identity(c.identity.module,c.identity.renderer,rp,c.identity.queue,qp,rejected)
+  require(!life::read_constructed_identity(&life::remastered_500c,c.identity.module,c.identity.renderer,rp,c.identity.queue,qp,rejected)
     && rejected.queue==0xBAD,"corrupt or already-published construction identity accepted/output changed");
  }
 }
@@ -176,8 +177,8 @@ void observed_generation_is_not_an_address(){
  namespace life=w3vr::modern_queue_lifecycle;
  Fixture f;life::Observations observations;life::Snapshot absent{};absent.revision=0xBAD;
  require(!observations.snapshot(f.identity,absent)&&absent.revision==0xBAD,"late unobserved queue admitted/output overwritten");
- require(!observations.begin(0,true).revision,"null native memory began a lifetime");
- auto first=observations.begin(f.identity.queue,true);
+ require(!observations.begin(0,&life::remastered_500c,true).revision,"null native memory began a lifetime");
+ auto first=observations.begin(f.identity.queue,&life::remastered_500c,true);
  require(first.revision && !observations.snapshot(f.identity,absent),"unfinished constructor admitted");
  require(observations.finish(first,f.identity,true),"completed constructor not admitted");
  life::Snapshot snapshot{};require(observations.snapshot(f.identity,snapshot)&&observations.current(snapshot),"current observation lost");
@@ -188,35 +189,35 @@ void observed_generation_is_not_an_address(){
  require(observations.current(snapshot),"unrelated stop invalidated observed queue");
  observations.retire(f.identity.queue);
  require(!observations.current(snapshot)&&!observations.snapshot(f.identity,absent),"stop left old snapshot current");
- auto second=observations.begin(f.identity.queue,true);
+ auto second=observations.begin(f.identity.queue,&life::remastered_500c,true);
  require(second.revision!=first.revision&&observations.finish(second,f.identity,true),"identical reused addresses did not get a new revision");
  life::Snapshot renewed{};require(observations.snapshot(f.identity,renewed)&&renewed.revision!=snapshot.revision&&
   !observations.current(snapshot),"byte-identical new allocation inherited old lifetime observation");
  observations.cancel(first);
  require(observations.current(renewed),"stale constructor rejection canceled a newer allocation");
- auto third=observations.begin(f.identity.queue,true);
+ auto third=observations.begin(f.identity.queue,&life::remastered_500c,true);
  observations.retire(f.identity.queue);
  require(!observations.finish(third,f.identity,true)&&!observations.current(renewed),"stop during construction reopened admission");
- auto fourth=observations.begin(f.identity.queue,true);auto wrong=f.identity;wrong.queue+=16;
+ auto fourth=observations.begin(f.identity.queue,&life::remastered_500c,true);auto wrong=f.identity;wrong.queue+=16;
  require(!observations.finish(fourth,wrong,true),"another queue completed this construction");
  observations.cancel(fourth);
  require(!observations.finish(fourth,f.identity,true),"canceled constructor later became live");
  life::Snapshot invalid{};require(!observations.current(invalid),"default snapshot admitted");
- life::Observations saturated(UINT64_MAX-1);auto last=saturated.begin(f.identity.queue,true);
+ life::Observations saturated(UINT64_MAX-1);auto last=saturated.begin(f.identity.queue,&life::remastered_500c,true);
  require(last.revision==UINT64_MAX-1&&saturated.finish(last,f.identity,true),"last nonwrapping revision unusable");
  life::Snapshot old{};require(saturated.snapshot(f.identity,old),"last revision not captured");
- require(!saturated.begin(f.identity.queue,true).revision && !saturated.current(old),"revision wrap/reuse preserved old admission");
+ require(!saturated.begin(f.identity.queue,&life::remastered_500c,true).revision && !saturated.current(old),"revision wrap/reuse preserved old admission");
  life::Observations full;
  for(unsigned i=0;i<64;++i){auto identity=f.identity;identity.queue+=i*0x1000;
-  auto construction=full.begin(identity.queue,true);require(construction.revision&&full.finish(construction,identity,true),"fixed observation table filled early");}
+  auto construction=full.begin(identity.queue,&life::remastered_500c,true);require(construction.revision&&full.finish(construction,identity,true),"fixed observation table filled early");}
  auto extra=f.identity;extra.queue+=64*0x1000;
- require(!full.begin(extra.queue,true).revision,"observation table exceeded its bound");
+ require(!full.begin(extra.queue,&life::remastered_500c,true).revision,"observation table exceeded its bound");
  full.retire(f.identity.queue);
- auto reused=full.begin(extra.queue,true);require(reused.revision&&full.finish(reused,extra,true),"retired storage could not be reused");
+ auto reused=full.begin(extra.queue,&life::remastered_500c,true);require(reused.revision&&full.finish(reused,extra,true),"retired storage could not be reused");
 }
 void constructor_and_stop_can_race(){
  namespace life=w3vr::modern_queue_lifecycle;
- Fixture f;life::Observations observations;auto pending=observations.begin(f.identity.queue,true);
+ Fixture f;life::Observations observations;auto pending=observations.begin(f.identity.queue,&life::remastered_500c,true);
  std::latch go(1);bool finished{};
  std::thread constructor([&]{go.wait();finished=observations.finish(pending,f.identity,true);});
  std::thread stop([&]{go.wait();observations.retire(f.identity.queue);});
@@ -231,39 +232,148 @@ void constructor_and_stop_can_race(){
 void partial_activation_cannot_adopt_an_earlier_construction(){
  namespace life=w3vr::modern_queue_lifecycle;
  Fixture f;life::Observations observations;life::Snapshot untouched{};untouched.revision=0xBAD;
- auto early=observations.begin(f.identity.queue,false);
+ auto early=observations.begin(f.identity.queue,&life::remastered_500c,false);
  require(!early.queue && !early.revision,"partial activation issued a construction ticket");
  require(!observations.finish(early,f.identity,false),"partial installation completed a construction");
  require(!observations.finish(early,f.identity,true),"activation during native construction admitted its earlier entry");
  require(!observations.snapshot(f.identity,untouched)&&untouched.revision==0xBAD,"rejected early entry changed snapshot output");
- auto admitted=observations.begin(f.identity.queue,true);
+ auto admitted=observations.begin(f.identity.queue,&life::remastered_500c,true);
  require(admitted.revision==1 && observations.finish(admitted,f.identity,true),"early rejection consumed first revision or blocked ready entry");
  life::Snapshot prior{};require(observations.snapshot(f.identity,prior),"ready construction snapshot absent");
  // Closed entry must invalidate a previous allocation at the same address.
- auto closed_reuse=observations.begin(f.identity.queue,false);
+ auto closed_reuse=observations.begin(f.identity.queue,&life::remastered_500c,false);
  require(!closed_reuse.revision && !observations.current(prior),"closed reused address kept old admission");
  require(!observations.finish(closed_reuse,f.identity,true),"closed address reuse gained a late ticket");
- auto pending=observations.begin(f.identity.queue,true);
+ auto pending=observations.begin(f.identity.queue,&life::remastered_500c,true);
  require(!observations.finish(pending,f.identity,false),"closed exit admitted ready entry");
  require(!observations.finish(pending,f.identity,true),"rejected closed exit was revived on later activation");
  require(!observations.snapshot(f.identity,untouched),"closed exit left a complete record");
- auto replaced=observations.begin(f.identity.queue,true);
- auto replacement=observations.begin(f.identity.queue,true);
+ auto replaced=observations.begin(f.identity.queue,&life::remastered_500c,true);
+ auto replacement=observations.begin(f.identity.queue,&life::remastered_500c,true);
  require(replacement.revision!=replaced.revision && observations.finish(replacement,f.identity,true),"new construction lost its own revision");
  life::Snapshot renewed{};require(observations.snapshot(f.identity,renewed),"replacement observation absent");
  require(!observations.finish(replaced,f.identity,false)&&observations.current(renewed),"old closed exit canceled a newer construction");
  // Observe admission independently for two queues; rejecting one cannot adopt
  // or cancel another owner's construction when activation completes.
  auto other=f.identity;other.queue+=0x1000;
- auto other_early=observations.begin(other.queue,false);
+ auto other_early=observations.begin(other.queue,&life::remastered_500c,false);
  require(!observations.finish(other_early,other,true)&&observations.current(renewed),"another early queue changed admitted queue");
- auto other_ready=observations.begin(other.queue,true);
+ auto other_ready=observations.begin(other.queue,&life::remastered_500c,true);
  require(observations.finish(other_ready,other,true),"new ready queue rejected after earlier closed entry");
  observations.retire(other.queue);
  require(!observations.finish(other_ready,other,true)&&observations.current(renewed),"stop reopened construction or affected another owner");
 }
 
+void lifecycle_profiles_and_tickets(){
+ namespace life=w3vr::modern_queue_lifecycle;namespace camera=w3vr::engine_camera;
+ for(const auto* contract:{&camera::remastered_500c,&camera::remastered_1048522}){
+  const auto* profile=life::selected(contract);const auto* queue_profile=q::selected(contract);
+  require(profile && profile->queue==queue_profile,"lifecycle and queue profile select together");
+  const auto* other=profile==&life::remastered_500c?&life::remastered_1048522:&life::remastered_500c;
+  require(life::ready_for(contract,profile,true) && !life::ready_for(contract,profile,false),"matching readiness required");
+  require(!life::ready_for(contract,other,true),"different installed version refused");
+  auto copied=*contract;auto copied_profile=*profile;
+  require(!q::selected(&copied) && !life::selected(&copied) && !life::ready_for(&copied,profile,true),"copied contract refused");
+  require(!life::ready_for(contract,&copied_profile,true) && !life::ready_for(contract,nullptr,true),"copied/null installation refused");
+  for(int mode:{0,1}){
+   const auto caller=mode==0?profile->normal_return:profile->alternate_return;
+   require(life::known_construction(profile,caller,std::uint8_t(mode)),"exact caller/mode recognized");
+   require(!life::known_construction(other,caller,std::uint8_t(mode)) &&
+    !life::known_construction(profile,caller,std::uint8_t(1-mode)),"cross version or other mode refused");
+   require(!life::known_construction(&copied_profile,caller,std::uint8_t(mode)) &&
+    !life::known_construction(profile,caller+1,std::uint8_t(mode)),"copied or neighboring caller refused");
+  }
+  for(const auto& hook:profile->hooks){
+   const std::vector<std::uint8_t> bytes(hook.prefix.begin(),hook.prefix.end());
+   require(life::prefix_matches(hook.prefix,bytes),"exact target prefix recognized");
+   require(!life::prefix_matches(hook.prefix,std::span(bytes).first(bytes.size()-1)),"short instruction prefix refused");
+   for(std::size_t i=0;i<bytes.size();++i){auto corrupt=bytes;corrupt[i]^=1;
+    require(!life::prefix_matches(hook.prefix,corrupt),"changed instruction prefix refused");}
+  }
+  Fixture f;f.identity.profile=queue_profile;
+  put(f.renderer,0,f.identity.module+queue_profile->renderer_vtable);
+  put(f.renderer,queue_profile->renderer_queue,std::uintptr_t{});
+  put(f.queue,0,f.identity.module+queue_profile->queue_vtable);
+  put(f.queue,life::owner_offset,f.identity.renderer);
+  q::Identity parsed{};
+  require(life::read_constructed_identity(profile,f.identity.module,f.identity.renderer,f.renderer,
+    f.identity.queue,f.queue,parsed) && parsed==f.identity,"constructed identity keeps its explicit queue profile");
+  const auto sentinel=parsed;
+  require(!life::read_constructed_identity(other,f.identity.module,f.identity.renderer,f.renderer,f.identity.queue,f.queue,parsed) &&
+   parsed==sentinel,"mixed construction rejected without changing output");
+  require(!life::read_constructed_identity(&copied_profile,f.identity.module,f.identity.renderer,f.renderer,f.identity.queue,f.queue,parsed) &&
+   parsed==sentinel,"copied construction profile cannot read bytes");
+  for(int reason=0;reason<8;++reason){auto rp=f.renderer;auto qp=f.queue;
+   std::span<const std::uint8_t> rview=rp,qview=qp;
+   switch(reason){case 0:put(rp,queue_profile->renderer_queue,f.identity.queue);break;
+    case 1:put(qp,life::owner_offset,f.identity.renderer+16);break;
+    case 2:put(qp,0,f.identity.module+other->queue->queue_vtable);break;
+    case 3:put(rp,0,f.identity.module+other->queue->renderer_vtable);break;
+    case 4:rview=rview.first(queue_profile->renderer_prefix-1);break;
+    case 5:qview=qview.first(life::constructed_prefix_bytes-1);break;
+    case 6:put(qp,0x50,std::uintptr_t{});break;case 7:put(qp,0x40,std::int32_t(-1));break;}
+   require(!life::read_constructed_identity(profile,f.identity.module,f.identity.renderer,rview,
+    f.identity.queue,qview,parsed) && parsed==sentinel,"bad construction memory rejected atomically");
+  }
+  life::Observations observations;
+  auto ticket=observations.begin(f.identity.queue,profile,true);
+  require(ticket.profile==profile && ticket.revision,"ticket captures installation version");
+  auto wrong=f.identity;wrong.profile=other->queue;
+  require(!observations.finish(ticket,wrong,true),"same pointers cannot complete a ticket from another version");
+  require(observations.finish(ticket,f.identity,true),"matching ticket completes");
+  life::Snapshot snapshot{};require(observations.snapshot(f.identity,snapshot),"matching snapshot found");
+  auto closed=observations.begin(f.identity.queue,&copied_profile,true);
+  require(!closed.revision && !observations.current(snapshot) && !observations.finish(closed,f.identity,true),
+   "rejected profile invalidates numeric address reuse and cannot later become admitted");
+  auto pending=observations.begin(f.identity.queue,profile,true);
+  auto replacement=observations.begin(f.identity.queue,other,true);
+  observations.cancel(pending);
+  require(observations.finish(replacement,wrong,true),"old profile rejection cannot cancel new version ticket");
+  life::Snapshot renewed{};require(observations.snapshot(wrong,renewed) && observations.current(renewed),"replacement snapshot current");
+  observations.retire(wrong.queue);require(!observations.current(renewed),"retirement closes replacement version");
+ }
+ require(!q::selected(nullptr) && !life::selected(nullptr) && !life::selected(&camera::legacy_404),"unknown/legacy lifecycle closed");
+ require(!life::prefix_matches({},{}),"empty code proof refused");
 }
-int main(){build_profiles_cannot_share_a_binding();valid_binding_and_mutable_cursor();reject_corrupt_identity();reject_foreign_or_published_primary();
+void observer_installation_preserves_forwarders(){
+ namespace life=w3vr::modern_queue_lifecycle;namespace camera=w3vr::engine_camera;
+ for(const auto* contract:{&camera::remastered_500c,&camera::remastered_1048522}){
+  const auto* profile=life::selected(contract);
+  for(int scenario=-1;scenario<13;++scenario){
+   // -1 success; 0..2 create failure; 3..5 enable failure; 6..11 change
+   // selected contract inside each original operation; 12 invalid at entry.
+   const camera::TemporalContract* live=scenario==12?nullptr:contract;
+   std::array<void*,3> forwarders{};std::array<bool,3> active{};
+   int creates{},enables{},disabled{},operations{};bool bad_order{};
+   const bool ok=life::install_observers(contract,profile,
+    [&](std::size_t i){++creates;++operations;forwarders[i]=reinterpret_cast<void*>(std::uintptr_t(0x1000)+std::uintptr_t(i)*16);
+     if(scenario==6+int(i))live=nullptr;
+     return scenario!=int(i);},
+    [&](std::size_t i){++enables;++operations;bad_order|=creates!=3;
+     if(scenario==9+int(i))live=nullptr;
+     if(scenario==3+int(i))return false;active[i]=true;return true;},
+    [&](std::size_t i){++disabled;active[i]=false;},
+    [&](){return live==contract;});
+   require(ok==(scenario==-1),"installation admits only full unchanged success");
+   require(!bad_order,"enable cannot precede all creates");
+   for(int i=0;i<creates;++i)require(forwarders[std::size_t(i)]==reinterpret_cast<void*>(std::uintptr_t(0x1000)+std::uintptr_t(i)*16),
+    "created forwarder retained after every failure and contract change");
+   if(ok)require(creates==3 && enables==3 && disabled==0 && active==std::array<bool,3>{true,true,true},"complete observer bundle active");
+   else require(active==std::array<bool,3>{false,false,false},"partial activation leaves admission closed");
+   if(scenario==12)require(operations==0,"closed entry does not create Native hooks");
+  }
+  auto copy=*profile;int called{};
+  require(!life::install_observers(contract,&copy,[&](std::size_t){++called;return true;},
+    [&](std::size_t){++called;return true;},[&](std::size_t){++called;},[](){return true;}) && called==0,
+    "copied install plan invokes no callbacks");
+  const auto* other=profile==&life::remastered_500c?&life::remastered_1048522:&life::remastered_500c;
+  require(!life::install_observers(contract,other,[&](std::size_t){++called;return true;},
+    [&](std::size_t){++called;return true;},[&](std::size_t){++called;},[](){return true;}) && called==0,
+    "mixed installation invokes no callbacks");
+ }
+}
+
+}
+int main(){lifecycle_profiles_and_tickets();observer_installation_preserves_forwarders();build_profiles_cannot_share_a_binding();valid_binding_and_mutable_cursor();reject_corrupt_identity();reject_foreign_or_published_primary();
  construction_reading_before_owner_store();observed_generation_is_not_an_address();constructor_and_stop_can_race();partial_activation_cannot_adopt_an_earlier_construction();
  std::printf("Modern captured native queue: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;}

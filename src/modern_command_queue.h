@@ -1,5 +1,6 @@
 #pragma once
 #include "engine_frame_submission.h"
+#include "engine_camera_temporal.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -18,21 +19,32 @@ inline constexpr std::size_t renderer_prefix_bytes=0x118,queue_prefix_bytes=0x64
 inline constexpr std::uint32_t payload_bytes=24,aligned_payload_bytes=32,record_bytes=48;
 inline constexpr std::uint32_t unpublished_marker=0x4A545330;
 inline constexpr std::int32_t ring_budget_difference=0x13880;
-inline constexpr std::array<std::uint8_t,16> allocator_signature{
- 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48};
+inline constexpr std::array<std::uint8_t,15> allocator_signature{
+ 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18};
+inline constexpr std::array<std::uint8_t,15> current_allocator_signature{
+ 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18};
 // Explicit subsystem profiles only. This does not admit either executable to
 // the global engine preflight, select hooks, or prove object/queue lifetime.
 struct Profile {
  std::uintptr_t renderer_vtable,queue_vtable,scene_command_vtable,payload_allocator;
  std::size_t renderer_queue,renderer_prefix;
+ std::uintptr_t renderer_global;
+ std::span<const std::uint8_t> allocator_prefix;
 };
 inline constexpr Profile remastered_500c{
  frame_submission::renderer_vtable_rva,queue_vtable_rva,scene_command_vtable_rva,
- payload_allocator_rva,renderer_queue_offset,renderer_prefix_bytes};
+ payload_allocator_rva,renderer_queue_offset,renderer_prefix_bytes,
+ frame_submission::renderer_global_rva,allocator_signature};
 inline constexpr Profile remastered_1048522{
- 0x036EB088,0x036ECE48,0x0395ABD8,0x0232A780,0x110,0x118};
+ 0x036EB088,0x036ECE48,0x0395ABD8,0x0232A780,0x110,0x118,
+ 0x05A5B948,current_allocator_signature};
 inline bool known_profile(const Profile* profile){
  return profile==&remastered_500c || profile==&remastered_1048522;
+}
+inline const Profile* selected(const engine_camera::TemporalContract* contract){
+ if(contract==&engine_camera::remastered_500c)return &remastered_500c;
+ if(contract==&engine_camera::remastered_1048522)return &remastered_1048522;
+ return nullptr;
 }
 static_assert(remastered_500c.renderer_prefix>=remastered_500c.renderer_queue+sizeof(std::uintptr_t));
 static_assert(remastered_1048522.renderer_prefix>=remastered_1048522.renderer_queue+sizeof(std::uintptr_t));
