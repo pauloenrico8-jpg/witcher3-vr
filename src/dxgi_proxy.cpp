@@ -41453,13 +41453,16 @@ bool engine_scene_factory_inputs_ready(const w3vr::engine_camera::TemporalContra
             settings != nullptr, descriptor != nullptr, extent_readable, extent[0], extent[1]);
 }
 
+bool remastered_queue_ready_for(const w3vr::engine_camera::TemporalContract* contract);
 bool remastered_command_renderer_ready(uintptr_t module) {
-    if (module == 0) return false;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* profile=w3vr::modern_command_queue::selected(contract);
+    if (module==0 || !profile || !remastered_queue_ready_for(contract)) return false;
     __try {
         const auto renderer = *reinterpret_cast<const uintptr_t*>(module +
-            w3vr::frame_submission::renderer_global_rva);
+            profile->renderer_global);
         return renderer != 0 && *reinterpret_cast<const uintptr_t*>(renderer) ==
-            module + w3vr::frame_submission::renderer_vtable_rva;
+            module + profile->renderer_vtable && remastered_queue_ready_for(contract);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -41500,14 +41503,26 @@ RemasteredQueueDestroy g_remastered_queue_destroy{};
 w3vr::modern_queue_lifecycle::Observations g_remastered_queue_observations;
 std::atomic<bool> g_remastered_queue_lifecycle_hooks_ready{};
 std::atomic<bool> g_remastered_queue_lifecycle_install_attempted{};
+// Retain the installed target even after partial failure for entered forwarders.
+// The profile alone is not readiness or protection against unload.
+std::atomic<const w3vr::modern_queue_lifecycle::Profile*> g_remastered_queue_installed_profile{};
 
-bool read_remastered_constructed_queue(uintptr_t module,void* memory,void* owner,
+bool remastered_queue_ready_for(const w3vr::engine_camera::TemporalContract* contract) {
+    return g_engine_camera_temporal_contract.load(std::memory_order_acquire)==contract &&
+        w3vr::modern_queue_lifecycle::ready_for(contract,
+            g_remastered_queue_installed_profile.load(std::memory_order_acquire),
+            g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire));
+}
+bool read_remastered_constructed_queue(uintptr_t module,
+    const w3vr::engine_camera::TemporalContract* contract,
+    const w3vr::modern_queue_lifecycle::Profile* profile,void* memory,void* owner,
     w3vr::modern_command_queue::Identity& result) {
     namespace q=w3vr::modern_command_queue;
     namespace life=w3vr::modern_queue_lifecycle;
+    if(!life::known(profile) || life::selected(contract)!=profile || !remastered_queue_ready_for(contract))return false;
     const auto renderer=reinterpret_cast<uintptr_t>(owner),queue=reinterpret_cast<uintptr_t>(memory);
     uintptr_t end{};
-    if(!q::add(renderer,q::renderer_prefix_bytes,end) || !q::add(queue,life::constructed_prefix_bytes,end))return false;
+    if(!q::add(renderer,profile->queue->renderer_prefix,end) || !q::add(queue,life::constructed_prefix_bytes,end))return false;
     std::array<uint8_t,q::renderer_prefix_bytes> rp{},repeat_rp{};
     std::array<uint8_t,life::constructed_prefix_bytes> qp{},repeat_qp{};
     __try {
@@ -41515,34 +41530,33 @@ bool read_remastered_constructed_queue(uintptr_t module,void* memory,void* owner
         std::memcpy(repeat_rp.data(),owner,repeat_rp.size());std::memcpy(repeat_qp.data(),memory,repeat_qp.size());
     } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
     q::Identity first{},second{};
-    if(!life::read_constructed_identity(module,renderer,rp,queue,qp,first) ||
-        !life::read_constructed_identity(module,renderer,repeat_rp,queue,repeat_qp,second) || first!=second)return false;
+    if(!life::read_constructed_identity(profile,module,renderer,rp,queue,qp,first) ||
+        !life::read_constructed_identity(profile,module,renderer,repeat_rp,queue,repeat_qp,second) || first!=second ||
+        !remastered_queue_ready_for(contract))return false;
     result=first;return true;
 }
 void* __fastcall hook_remastered_queue_construct(void* memory,void* owner,uint8_t mode) {
     namespace life=w3vr::modern_queue_lifecycle;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* profile=g_remastered_queue_installed_profile.load(std::memory_order_acquire);
     const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto address=reinterpret_cast<uintptr_t>(_ReturnAddress());
     const auto caller=module && address>=module?address-module:0;
-    // Constructor return precedes the caller's renderer+110 store. Read the
-    // actual constructor owner at queue+68; never synthesize that store.
-    const auto construction=g_remastered_queue_observations.begin(reinterpret_cast<uintptr_t>(memory),
-        g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire));
+    // Always invalidate address reuse, even when the installed version/caller is
+    // rejected. Entry admission is frozen; activation inside Native cannot adopt it.
+    const bool admitted=remastered_queue_ready_for(contract) && life::known_construction(profile,caller,mode);
+    const auto construction=g_remastered_queue_observations.begin(reinterpret_cast<uintptr_t>(memory),profile,admitted);
     auto* result=g_remastered_queue_construct(memory,owner,mode);
     w3vr::modern_command_queue::Identity identity{};
-    // A rejected entry cannot become admitted when installation finishes inside
-    // the native constructor. Check readiness again before probing native memory.
-    if(!construction.revision || result!=memory || !life::known_construction(caller,mode) ||
-        !g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire) ||
-        !read_remastered_constructed_queue(module,memory,owner,identity) ||
-        !g_remastered_queue_observations.finish(construction,identity,
-            g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire)))
+    if(!construction.revision || result!=memory || !remastered_queue_ready_for(contract) ||
+        !read_remastered_constructed_queue(module,contract,profile,memory,owner,identity) ||
+        !g_remastered_queue_observations.finish(construction,identity,remastered_queue_ready_for(contract)))
         g_remastered_queue_observations.cancel(construction);
     return result;
 }
 void __fastcall hook_remastered_queue_stop(void* queue) {
-    // Close admission before the original posts its null-vtable stop command.
-    // No lock is held across the native allocation/publication or its waits.
+    // Retire before Native, even with readiness closed. This is not a stop/join
+    // proof or an external barrier against other callbacks already in flight.
     g_remastered_queue_observations.retire(reinterpret_cast<uintptr_t>(queue));
     g_remastered_queue_stop(queue);
 }
@@ -41552,31 +41566,34 @@ void* __fastcall hook_remastered_queue_destroy(void* queue,uint32_t flags) {
 }
 bool install_remastered_queue_lifecycle_hooks() {
     namespace life=w3vr::modern_queue_lifecycle;
-    if(g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire))return true;
-    if(selected_scene_factory_version()!=w3vr::scene_factory::Version::remastered_500c)return false;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* profile=life::selected(contract);
+    if(!profile)return false;
+    if(g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire))return remastered_queue_ready_for(contract);
     if(g_remastered_queue_lifecycle_install_attempted.exchange(true,std::memory_order_acq_rel))return false;
     auto* module=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     if(!module)return false;
-    struct Hook {uintptr_t rva;void* detour;void** original;std::span<const uint8_t> signature;};
+    struct Hook {void* detour;void** original;};
     const std::array<Hook,3> hooks{{
-        {life::construct_rva,reinterpret_cast<void*>(&hook_remastered_queue_construct),
-            reinterpret_cast<void**>(&g_remastered_queue_construct),life::construct_signature},
-        {life::stop_rva,reinterpret_cast<void*>(&hook_remastered_queue_stop),
-            reinterpret_cast<void**>(&g_remastered_queue_stop),life::stop_signature},
-        {life::destroy_rva,reinterpret_cast<void*>(&hook_remastered_queue_destroy),
-            reinterpret_cast<void**>(&g_remastered_queue_destroy),life::destroy_signature}}};
-    for(const auto& hook:hooks)if(!remastered_render_entry_matches(module+hook.rva,hook.signature))return false;
-    for(const auto& hook:hooks)if(MH_CreateHook(module+hook.rva,hook.detour,hook.original)!=MH_OK)return false;
-    size_t enabled{};
-    for(;enabled<hooks.size();++enabled)if(MH_EnableHook(module+hooks[enabled].rva)!=MH_OK)break;
-    if(enabled!=hooks.size()){
-        for(size_t i=0;i<enabled;++i)MH_DisableHook(module+hooks[i].rva);
+        {reinterpret_cast<void*>(&hook_remastered_queue_construct),reinterpret_cast<void**>(&g_remastered_queue_construct)},
+        {reinterpret_cast<void*>(&hook_remastered_queue_stop),reinterpret_cast<void**>(&g_remastered_queue_stop)},
+        {reinterpret_cast<void*>(&hook_remastered_queue_destroy),reinterpret_cast<void**>(&g_remastered_queue_destroy)}}};
+    for(const auto& target:profile->hooks)
+        if(!remastered_render_entry_matches(module+target.rva,target.prefix))return false;
+    const auto current=[contract](){return g_engine_camera_temporal_contract.load(std::memory_order_acquire)==contract;};
+    if(!current())return false;
+    g_remastered_queue_installed_profile.store(profile,std::memory_order_release);
+    const bool installed=life::install_observers(contract,profile,
+        [&](size_t i){return MH_CreateHook(module+profile->hooks[i].rva,hooks[i].detour,hooks[i].original)==MH_OK;},
+        [&](size_t i){return MH_EnableHook(module+profile->hooks[i].rva)==MH_OK;},
+        [&](size_t i){MH_DisableHook(module+profile->hooks[i].rva);},current);
+    if(!installed){
         log_line("Remastered queue lifecycle activation incomplete; admission closed, originals retained");
         return false;
     }
     g_remastered_queue_lifecycle_hooks_ready.store(true,std::memory_order_release);
-    log_line("Remastered queue constructor/stop/destroy observers installed; observations are not lifetime leases");
-    return true;
+    log_line("Remastered queue observers installed for selected profile; observations are not lifetime leases");
+    return remastered_queue_ready_for(contract);
 }
 
 struct RemasteredPreparationContext {
@@ -41590,10 +41607,13 @@ struct RemasteredPreparationContext {
     bool operator==(const RemasteredPreparationContext&) const = default;
 };
 
-bool read_remastered_command_queue(uintptr_t module,w3vr::modern_command_queue::Identity& result) {
+bool read_remastered_command_queue(uintptr_t module,const w3vr::engine_camera::TemporalContract* contract,
+    w3vr::modern_command_queue::Identity& result) {
     namespace cq=w3vr::modern_command_queue;
+    const auto* profile=cq::selected(contract);
+    if(!profile || !remastered_queue_ready_for(contract))return false;
     uintptr_t renderer{},queue{},end{},global{};
-    if(!cq::add(module,w3vr::frame_submission::renderer_global_rva,global) ||
+    if(!cq::add(module,profile->renderer_global,global) ||
         !cq::add(global,sizeof(renderer),end))return false;
     std::array<uint8_t,cq::renderer_prefix_bytes> rp{},repeat_rp{};
     std::array<uint8_t,cq::queue_prefix_bytes> qp{},repeat_qp{};
@@ -41601,7 +41621,7 @@ bool read_remastered_command_queue(uintptr_t module,w3vr::modern_command_queue::
         std::memcpy(&renderer,reinterpret_cast<const void*>(global),sizeof(renderer));
         if(!cq::add(renderer,rp.size(),end))return false;
         std::memcpy(rp.data(),reinterpret_cast<const void*>(renderer),rp.size());
-        std::memcpy(&queue,rp.data()+cq::renderer_queue_offset,sizeof(queue));
+        std::memcpy(&queue,rp.data()+profile->renderer_queue,sizeof(queue));
         if(!cq::add(queue,qp.size(),end))return false;
         std::memcpy(qp.data(),reinterpret_cast<const void*>(queue),qp.size());
         std::memcpy(repeat_rp.data(),reinterpret_cast<const void*>(renderer),repeat_rp.size());
@@ -41611,8 +41631,9 @@ bool read_remastered_command_queue(uintptr_t module,w3vr::modern_command_queue::
         if(renderer_again!=renderer)return false;
     } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
     cq::Identity first{},second{};
-    if(!cq::read_identity(module,renderer,rp,queue,qp,first) ||
-        !cq::read_identity(module,renderer,repeat_rp,queue,repeat_qp,second) || first!=second)return false;
+    if(!cq::read_identity(profile,module,renderer,rp,queue,qp,first) ||
+        !cq::read_identity(profile,module,renderer,repeat_rp,queue,repeat_qp,second) || first!=second ||
+        !remastered_queue_ready_for(contract))return false;
     // Compare identity fields only: live budget/count/cursor naturally change.
     result=first;return true;
 }
@@ -41642,7 +41663,11 @@ bool remastered_primary_command_matches(const w3vr::modern_command_queue::Identi
 bool read_remastered_preparation_context(uintptr_t module, void* game,
     RemasteredPreparationContext& context) {
     context = {};
-    if (module == 0 || game == nullptr) return false;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    // This preparation context still uses the old independently examined engine
+    // and effects globals. A current queue profile must not admit those reads.
+    if (module==0 || game==nullptr || contract!=&w3vr::engine_camera::remastered_500c ||
+        !remastered_queue_ready_for(contract)) return false;
     __try {
         memcpy(&context.world_handle, static_cast<const uint8_t*>(game) + 0x100,
             sizeof(context.world_handle));
@@ -41676,8 +41701,8 @@ bool read_remastered_preparation_context(uintptr_t module, void* game,
         memcpy(&shared_callback, static_cast<const uint8_t*>(context.engine) + 0x40,
             sizeof(shared_callback));
         return shared_callback == nullptr &&
-            g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire) &&
-            read_remastered_command_queue(module,context.command_queue) &&
+            remastered_queue_ready_for(contract) &&
+            read_remastered_command_queue(module,contract,context.command_queue) &&
             g_remastered_queue_observations.snapshot(context.command_queue,context.queue_observation);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         context = {};
@@ -41726,12 +41751,17 @@ void* allocate_remastered_command_in_captured_queue() {
     if(!scope || !g_remastered_preparation_hooks_ready.load(std::memory_order_acquire) ||
         selected_scene_factory_version()!=w3vr::scene_factory::Version::remastered_500c ||
         !read_remastered_preparation_context(module,scope->game,current) || current!=scope->context)return nullptr;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* profile=cq::selected(contract);
+    if(!profile || profile!=scope->context.command_queue.profile || !remastered_queue_ready_for(contract))return nullptr;
     uintptr_t entry{},end{};
-    if(!cq::add(module,cq::payload_allocator_rva,entry) || !cq::add(entry,cq::allocator_signature.size(),end))return nullptr;
+    if(!cq::add(module,profile->payload_allocator,entry) || !cq::add(entry,profile->allocator_prefix.size(),end))return nullptr;
     __try {
-        if(std::memcmp(reinterpret_cast<const void*>(entry),cq::allocator_signature.data(),cq::allocator_signature.size())!=0)return nullptr;
+        if(std::memcmp(reinterpret_cast<const void*>(entry),profile->allocator_prefix.data(),profile->allocator_prefix.size())!=0)return nullptr;
     } __except(EXCEPTION_EXECUTE_HANDLER) {return nullptr;}
-    return cq::allocate_bound(reinterpret_cast<cq::AllocatePayload>(entry),scope->context.command_queue,current.command_queue);
+    if(!remastered_queue_ready_for(contract))return nullptr;
+    return cq::allocate_bound(cq::Allocator{profile,reinterpret_cast<cq::AllocatePayload>(entry)},
+        scope->context.command_queue,current.command_queue);
 }
 
 w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(
