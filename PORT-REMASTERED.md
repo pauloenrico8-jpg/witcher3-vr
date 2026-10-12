@@ -7,6 +7,66 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Fila de quadros ligada à instalação da mesma versão — 11 de outubro
+
+Adaptei os pontos que acompanham a criação, a parada e a destruição da fila
+para a atualização atual. A fila recebe os pedidos de desenho do jogo. Um
+observador acompanha esses acontecimentos e encaminha a chamada original;
+não cria sozinho uma imagem de olho nem mantém os objetos do jogo vivos.
+
+O fluxo, passo a passo:
+
+1. Escolhe explicitamente a lista da versão já identificada. Essa lista reúne
+   a fila, seus pontos de entrada, os chamadores de criação e as assinaturas
+   esperadas. Assinatura significa os primeiros bytes da função; todas terminam
+   no fim de instruções completas e foram conferidas em cada versão.
+2. Confere os três pontos, cria as três ligações e depois ativa as três. Só
+   anuncia prontidão quando todas passam e a seleção continua igual. Faz uma
+   única tentativa. Uma falha conserva os caminhos para chamar as funções
+   originais e desativa as entradas já ativadas; não remove esses caminhos.
+3. Cada criação registra endereço, número de criação e versão da instalação.
+   Um endereço reutilizado perde o registro anterior, mesmo se a nova chamada
+   for rejeitada. Uma chamada que entrou antes da prontidão não ganha permissão
+   só porque a instalação terminou durante a execução da função original.
+4. Depois da função original, confere chamador, modo, resultado e dados da
+   mesma versão. Lê o responsável informado pelo construtor antes de o jogo
+   guardar a fila nesse responsável. Conserva a gravação e o resultado originais.
+5. Ao concluir o registro, exige o mesmo número de criação e a mesma versão
+   da identidade lida. Dados de outra atualização, mesmo com endereços iguais,
+   não completam o registro. A rejeição de uma criação antiga também não cancela
+   uma criação nova. Parada e destruição retiram o registro antes da chamada
+   original, conservando argumentos, resultado e uma execução dessa chamada.
+6. As leituras da fila em uso e a reserva de comandos agora recebem uma lista
+   explícita da mesma versão. Conferem novamente a seleção e a instalação;
+   conservam o responsável, o tamanho pedido e o resultado da reserva original.
+   Comparar duas leituras não mantém a memória viva durante uma troca ou parada.
+7. A preparação de quadros e efeitos que ainda usa regras da versão anterior
+   rejeita a atualização atual antes de ler seus dados. Uma fila reconhecida não
+   libera essa preparação nem o bloqueio geral do jogo. As versões ausentes,
+   desconhecidas, copiadas ou misturadas continuam sem admissão.
+
+`modern_queue_lifecycle.h` reúne as listas, a instalação e os registros de
+criação; `modern_command_queue.h` identifica a fila e limita a reserva;
+`dxgi_proxy.cpp` liga as regras às chamadas do jogo. Escolhi guardar a versão
+no registro porque o mesmo endereço e um sinal geral de “pronto” não distinguem
+uma criação nova nem identificam as funções realmente instaladas.
+
+A DLL compilou e **112/112 testes passaram em 10,00 segundos**. O teste da
+fila fez **510 verificações na CPU**, 320 a mais nesta etapa. Incluem ambas
+as versões, limites das leituras, misturas, endereços reutilizados, parada
+durante criação, falhas em cada criação e ativação e troca da seleção durante
+as operações simuladas. Usam dados fabricados e substitutos das operações de
+instalação; não executaram MinHook no jogo, falhas reais de memória, GPU,
+Quest ou combate físico. As análises novas do executável permanecem privadas.
+
+**O VR ainda não funciona e nada experimental foi instalado.** Remastered e
+reentrada continuam bloqueados. Ainda faltam a preparação atual, seus efeitos,
+históricos, recursos e a apresentação de duas imagens novas do mesmo par.
+Esses observadores não comprovam todos os caminhos de destruição, a proteção
+contra chamadas em execução durante a retirada da DLL, nem a conclusão do
+trabalho da placa de vídeo. Primeiro imagens reais no PC; depois Quest,
+cabeça, mãos, armas, dano e bloqueio físicos.
+
 ## Preparação dos dois olhos ligada à versão atual — 11 de outubro
 
 Adaptei os dados de entrada da criação de quadros e a preparação de posição
