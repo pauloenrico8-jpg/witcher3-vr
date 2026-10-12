@@ -7,6 +7,70 @@ O objetivo permanece VR com imagens novas nos dois olhos, mãos e armas livres,
 combate físico. Em 06/10 o usuário cancelou a meta de 60 FPS em Novigrad;
 o foco passou a ser concluir o mod VR. Menções anteriores à meta são históricas.
 
+## Captura ligada aos quatro hooks nativos habilitados — 12 de outubro
+
+A captura moderna passa a conferir os pontos de interceptação do DirectX que
+usará. Um hook é uma ligação que permite acompanhar uma chamada original.
+Ter um ponteiro para ela, sozinho, não demonstra que a ligação foi habilitada.
+
+O fluxo, passo a passo:
+
+1. Os instaladores guardam o alvo e a função original somente depois do resultado
+   de criação e habilitação daquele hook. Exigem quatro pontos: transição de
+   recursos, fechamento, reinicialização e envio. Um alvo de proxy, uma falha ou
+   um conjunto incompleto não dá prontidão à captura moderna.
+2. Antes da cópia, confere os métodos concretos da lista e da fila conservada no
+   registro gráfico. As interfaces precisam ser nativas, do dispositivo correto
+   e usar os mesmos quatro alvos habilitados. A prontidão do consumo das imagens
+   também exige esse conjunto. Não herda autoridade de um indicador genérico.
+3. No fechamento da lista, captura a época antes de chamar a função original.
+   Encaminha a chamada uma vez e conserva seu resultado. Só depois informa esse
+   resultado à retenção da origem. Uma chamada de outra lista ou de uma época
+   desconhecida não fecha a gravação acompanhada.
+4. O envio observado exige fechamento bem-sucedido da gravação correta. Se essa
+   prova faltar, a chamada original ainda recebe seu array e as referências
+   permanecem conservadas. Fechamento não representa conclusão da GPU: continuam
+   valendo a reinicialização comprovada e todos os sinais exatos de cada envio.
+5. O caminho interno opaco do ReShade permanece separado. A captura moderna já
+   rejeita suas listas imediatas. Não transforme essa exclusão em observação
+   inventada, nem desative os hooks de outras listas por uma chamada sem captura.
+
+`modern_backbuffer_hooks.h` confere os quatro registros de instalação;
+`modern_backbuffer_source.h` acompanha o fechamento e a retenção dos envios;
+`dxgi_proxy.cpp` liga ambos aos instaladores e chamadas originais. A escolha evita
+aceitar uma imagem cujo ciclo de envio não tenha esses pontos conhecidos.
+Isso ainda não prova todos os caminhos possíveis de wrappers ou destruição.
+
+A DLL compilou e **113/113 testes passaram em 9,26 segundos**.
+O programa gráfico separado passou com **27.001 verificações e 59 cópias
+reais**, incluindo conferência dos pixels. Instalou os quatro hooks com MinHook,
+que é a biblioteca de interceptação usada pelo projeto, nas funções nativas
+reais do DirectX. Acompanhou um envio, um fechamento, duas reinicializações e
+dez transições no cenário adicional. Preservou o array original de duas listas
+e chamou a função original de envio sem manter a trava de metadados.
+
+O teste rejeitou instalação incompleta, métodos misturados, alvo desconhecido,
+registro apenas criado sem habilitação e prontidão revogada. Usou também um
+fechamento real bem-sucedido para conferir a rejeição de outra época, além de
+fechamento de outra lista. O ciclo adicional manteve o buffer enquanto a GPU
+estava bloqueada e permitiu sua recriação depois da conclusão comprovada.
+A falha de sinal nos casos anteriores continua explicitamente simulada.
+
+O teste instalou MinHook apenas no seu próprio processo, em funções de teste que
+usam os mesmos contratos de instalação e retenção. Não instalou os callbacks do
+host dentro do Witcher, não desenhou seus olhos e não executou OpenXR ou Quest.
+A época e os identificadores de jogo usados pelo teste são fabricados.
+Não prova falhas reais de instalação do host, todos os wrappers, a destruição
+sem reinicialização, ResizeBuffers1 ou a barreira de encerramento da DLL.
+
+**O VR continua sem versão jogável e nada experimental foi instalado no jogo.**
+O bloqueio de versões continua igual. Próximo trabalho: conferir os caminhos
+concretos de wrapper e recriação, a retomada de instalação ao mudar de modo e o
+ciclo de destruição das listas; depois concluir recursos, câmeras e históricos
+por olho e provar duas imagens novas do jogo em cada quadro. Quest, cabeça,
+mãos, armas, dano e bloqueio físico ainda dependem dessa prova.
+A meta de 60 FPS permanece cancelada; DLSS e IntelFG continuam opcionais.
+
 ## Origem conservada até reinicialização e conclusão de todos os envios — 12 de outubro
 
 Liguei a retenção da imagem de origem à gravação e ao envio real dos comandos.

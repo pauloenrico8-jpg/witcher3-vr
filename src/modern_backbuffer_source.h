@@ -22,7 +22,7 @@ struct Record {
     ComPtr<ID3D12Resource> source,destination;
     ComPtr<ID3D12GraphicsCommandList> command;
     Key key;
-    bool cpu_active{true},recorded{},sealed{},quarantined{};
+    bool cpu_active{true},recorded{},closed{},sealed{},quarantined{};
     std::vector<Submission> submissions;
     Record* next{};
     virtual ~Record()=default;
@@ -81,7 +81,7 @@ struct Store {
             if(!r->recorded || r->sealed || std::find(actual_lists,actual_lists+actual_count,r->command.Get())==actual_lists+actual_count)continue;
             // Observation rejection cannot discard references of a list that
             // the Original still receives. Unknown use remains quarantined.
-            if(r->quarantined || !queue_key || actual_queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT ||
+            if(r->quarantined || !r->closed || !queue_key || actual_queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT ||
                 queue_key.Get()!=r->binding->device_identity.Get() ||
                 epoch(r->command.Get())!=r->key.recording_epoch || nonce>=UINT64_MAX-1){
                 r->quarantined=true;continue;
@@ -109,6 +109,15 @@ struct Store {
             auto key=modern_graphics_binding::identity(device.Get());
             if(!key || key.Get()!=ticket.record->binding->device_identity.Get())continue;
             use->fence=actual_fence;use->value=actual_value;use->signal_ok=true;
+        }
+    }
+    // Closing is observed AFTER the exact Original result, with the epoch
+    // captured before it. A successful Close is not GPU completion.
+    void after_close(ID3D12GraphicsCommandList* actual_command,std::uint64_t epoch,HRESULT original_result){
+        if(!actual_command || !modern_eye_pair::finite(epoch))return;
+        for(auto* r=head;r;r=r->next)if(r->command.Get()==actual_command && r->key.recording_epoch==epoch){
+            if(SUCCEEDED(original_result) && !r->sealed)r->closed=true;
+            else r->quarantined=true;
         }
     }
     void after_reset(ID3D12GraphicsCommandList* actual_command,std::uint64_t discarded_epoch,HRESULT original_result){

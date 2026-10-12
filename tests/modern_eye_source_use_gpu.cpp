@@ -2,6 +2,8 @@
 #include "modern_eye_resource_set.h"
 #include "modern_graphics_binding.h"
 #include "modern_backbuffer_source.h"
+#include "modern_backbuffer_hooks.h"
+#include <MinHook.h>
 #include <barrier>
 #include <thread>
 #include <dxgi1_6.h>
@@ -44,7 +46,7 @@ struct Recording {
         check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"allocator");
         check(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&command)),"list");
     }
-    void close(){check(command->Close(),"close");}
+    HRESULT close(){const auto result=command->Close();check(result,"close");return result;}
 };
 void wait(ID3D12Fence* finished,UINT64 value){
     HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);require(event!=nullptr,"event");
@@ -391,7 +393,52 @@ struct TrackedSource:w3vr::modern_backbuffer_source::Record {
     unsigned* destroyed{};
     ~TrackedSource(){++*destroyed;}
 };
-void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned mode){
+namespace native_source_probe {
+namespace source=w3vr::modern_backbuffer_source;
+namespace hooks=w3vr::modern_backbuffer_hooks;
+using Reset=HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*,ID3D12CommandAllocator*,ID3D12PipelineState*);
+using Close=HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
+using Execute=void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*);
+using Barrier=void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*);
+Reset reset_original{};Close close_original{};Execute execute_original{};Barrier barrier_original{};
+struct Context {
+    source::Store* store{};std::mutex* mutex{};ID3D12GraphicsCommandList* command{};
+    ID3D12Fence* fence{};source::Batch last_batch;unsigned executes{},closes{},resets{},barriers{};
+    UINT expected_count{};ID3D12CommandList* const* expected_array{};bool args_preserved{true},original_unlocked{true};
+};
+thread_local Context* active{};
+HRESULT STDMETHODCALLTYPE close_hook(ID3D12GraphicsCommandList* command){
+    const HRESULT result=close_original(command);
+    if(active && active->command==command){++active->closes;std::lock_guard lock{*active->mutex};active->store->after_close(command,8,result);}
+    return result;
+}
+HRESULT STDMETHODCALLTYPE reset_hook(ID3D12GraphicsCommandList* command,ID3D12CommandAllocator* allocator,ID3D12PipelineState* state){
+    const HRESULT result=reset_original(command,allocator,state);
+    if(active && active->command==command){++active->resets;std::lock_guard lock{*active->mutex};active->store->after_reset(command,8,result);}
+    return result;
+}
+void STDMETHODCALLTYPE barrier_hook(ID3D12GraphicsCommandList* command,UINT count,const D3D12_RESOURCE_BARRIER* barriers){
+    barrier_original(command,count,barriers);
+    if(active && active->command==command)++active->barriers;
+}
+void STDMETHODCALLTYPE execute_hook(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
+    auto* context=active;
+    const bool ours=context && lists && std::find(lists,lists+count,context->command)!=lists+count;
+    if(!ours){execute_original(queue,count,lists);return;}
+    context->args_preserved=context->args_preserved && count==context->expected_count && lists==context->expected_array;
+    context->last_batch=context->store->execute_from_callback(*context->mutex,queue,count,lists,
+        [&](auto* command){return command==context->command?8ULL:0ULL;},[&]{
+            ++context->executes;
+            const bool unlocked=context->mutex->try_lock();context->original_unlocked=context->original_unlocked && unlocked;
+            if(unlocked)context->mutex->unlock();execute_original(queue,count,lists);
+        });
+    const HRESULT signalled=queue->Signal(context->fence,1);
+    {std::lock_guard lock{*context->mutex};context->store->after_signal(context->last_batch,SUCCEEDED(signalled),context->fence,1);}
+}
+void* method(IUnknown* object,std::size_t slot){return (*reinterpret_cast<void***>(object))[slot];}
+}
+void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned mode,bool native_callbacks=false){
+
     namespace source=w3vr::modern_backbuffer_source;
     namespace graphics=w3vr::modern_graphics_binding;
     const auto instance=GetModuleHandleW(nullptr);
@@ -413,6 +460,8 @@ void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned m
         auto upload=upload_pixels(device),result=buffer(device,D3D12_HEAP_TYPE_READBACK,stride*2,D3D12_RESOURCE_STATE_COPY_DEST);
         Recording recording(device),empty(device);empty.close();
         source::Store retained{};std::mutex metadata_mutex;unsigned destroyed{};
+        native_source_probe::Context observed{&retained,&metadata_mutex,recording.command.Get(),completed.Get()};
+        if(native_callbacks)native_source_probe::active=&observed;
         for(unsigned eye=0;eye<2;++eye){
             auto r=std::make_unique<TrackedSource>();r->destroyed=&destroyed;r->binding=snapshot;
             r->source=acquired.resource;r->destination=destinations[eye];r->command=recording.command;
@@ -454,8 +503,16 @@ void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned m
         require(retained.size()==2 && retained.collect()==0,"failed Reset discarded source recording");
         const HRESULT foreign_reset=empty.command->Reset(empty.allocator.Get(),nullptr);check(foreign_reset,"actual unrelated Reset");
         retained.after_reset(empty.command.Get(),8,foreign_reset);
-        require(retained.size()==2 && retained.collect()==0,"unrelated Reset discarded source recording");empty.close();
-        recording.close();acquired.resource.Reset();destinations={};
+        require(retained.size()==2 && retained.collect()==0,"unrelated Reset discarded source recording");
+        retained.after_close(empty.command.Get(),8,empty.close());
+        for(auto* record=retained.head;record;record=record->next)require(!record->closed,"foreign Close marked source recording closed");
+        const HRESULT closed=recording.close();
+        if(!native_callbacks){
+            retained.after_close(recording.command.Get(),9,closed);
+            retained.after_close(recording.command.Get(),0,closed);
+            for(auto* record=retained.head;record;record=record->next)require(!record->closed,"wrong/unknown epoch inherited successful Close");
+        }
+        retained.after_close(recording.command.Get(),8,closed);acquired.resource.Reset();destinations={};
         require(retained.size()==2 && destroyed==0 && retained.held(native_source),"CPU return released recorded native buffer");
         unsigned resize_calls{};
         auto resize=[&]{return binding.resize_from_callback(chain.Get(),[&]()->HRESULT{
@@ -465,7 +522,11 @@ void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned m
         auto epoch=[&](auto* command){return command==recording.command.Get()?8ULL:0ULL;};
         ID3D12CommandList* lists[]{empty.command.Get(),recording.command.Get()};
         check(producer->Wait(gate.Get(),1),"block real source producer");
-        auto batch=retained.execute_from_callback(metadata_mutex,producer.Get(),2,lists,epoch,[&]{
+        source::Batch batch;
+        if(native_callbacks){
+            observed.expected_count=2;observed.expected_array=lists;producer->ExecuteCommandLists(2,lists);
+            batch=observed.last_batch;original_calls=observed.executes;
+        }else batch=retained.execute_from_callback(metadata_mutex,producer.Get(),2,lists,epoch,[&]{
             ++original_calls;producer->ExecuteCommandLists(2,lists);});
         require(batch.size()==2 && original_calls==1,"two-list Original array was suppressed or source missing");
         if(mode==2){
@@ -507,6 +568,13 @@ void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned m
         retained.collect();require(retained.size()==0 && destroyed==2,"source did not retire after seal and ALL exact signals");
         check(resize(),"real resize after source retirement");
         require(binding.acquire()->width==32,"source retirement resize dimensions");
+        if(native_callbacks){
+            require(observed.args_preserved && observed.original_unlocked && observed.executes==1 && observed.closes>0 && observed.resets>0 && observed.barriers>0,
+                "actual Native callbacks did not preserve arguments/Original/unlocked call");
+            native_source_probe::active=nullptr;
+            std::printf("PASS real MinHook source callbacks: Execute=%u Close=%u Reset=%u Barrier=%u, original unlocked, exact 2-list array\n",
+                observed.executes,observed.closes,observed.resets,observed.barriers);
+        }
         std::printf("PASS native backbuffer source mode=%u: 2-list Original calls=%u, actual ResizeBuffers calls=%u, recorded/replay/submitted ownership, exact successful Reset and GPU readback\n",
             mode,original_calls,resize_calls);
     }
@@ -554,7 +622,7 @@ void read_only_source_case(ID3D12Device* device,IDXGIFactory6* factory){
             b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;recording.command->ResourceBarrier(1,&b);
             retained.finish_cpu(owned);
         }
-        readback(recording,result.Get(),destinations);recording.close();inputs={};destinations={};
+        readback(recording,result.Get(),destinations);retained.after_close(recording.command.Get(),8,recording.close());inputs={};destinations={};
         check(reader->Wait(gate.Get(),1),"block actual read-only source use");ID3D12CommandList* lists[]{empty.command.Get(),recording.command.Get()};unsigned originals{};
         auto batch=retained.execute_from_callback(mutex,reader.Get(),2,lists,[](auto*){return 8ULL;},[&]{++originals;reader->ExecuteCommandLists(2,lists);});
         const HRESULT signalled=reader->Signal(completed.Get(),1);check(signalled,"real reader signal");
@@ -570,6 +638,42 @@ void read_only_source_case(ID3D12Device* device,IDXGIFactory6* factory){
     }
     require(DestroyWindow(window)!=0 && UnregisterClassW(wc.lpszClassName,instance)!=0,"close read source hidden window");
 }
+void native_source_hooks_case(ID3D12Device* device,IDXGIFactory6* factory){
+    namespace probe=native_source_probe;namespace hooks=probe::hooks;
+    Recording anchor(device);auto native_queue=queue(device);
+    hooks::Targets targets{probe::method(anchor.command.Get(),10),probe::method(native_queue.Get(),10),
+        probe::method(anchor.command.Get(),9),probe::method(anchor.command.Get(),26)};
+    hooks::Receipts receipts;
+    require(!receipts.ready() && !receipts.accepts(targets),"empty hook receipts admitted Native capture");
+    require(MH_Initialize()==MH_OK,"probe MinHook Initialize");
+    const std::array<void*,4> detours{reinterpret_cast<void*>(&probe::reset_hook),reinterpret_cast<void*>(&probe::execute_hook),
+        reinterpret_cast<void*>(&probe::close_hook),reinterpret_cast<void*>(&probe::barrier_hook)};
+    const std::array<void**,4> originals{reinterpret_cast<void**>(&probe::reset_original),reinterpret_cast<void**>(&probe::execute_original),
+        reinterpret_cast<void**>(&probe::close_original),reinterpret_cast<void**>(&probe::barrier_original)};
+    for(std::size_t i=0;i<targets.size();++i){
+        require(hooks::native_target(targets[i]),"probe target was not concrete Native DirectX");
+        require(MH_CreateHook(targets[i],detours[i],originals[i])==MH_OK,"probe CreateHook");
+        require(!receipts.accepts(targets),"unenabled/partial hooks admitted capture");
+        require(MH_EnableHook(targets[i])==MH_OK,"probe EnableHook");
+        require(receipts.publish(static_cast<hooks::Site>(i),targets[i],*originals[i],true),"real enabled hook receipt");
+        if(i+1<targets.size())require(!receipts.accepts(targets),"partial Native bundle admitted capture");
+    }
+    require(receipts.ready() && receipts.accepts(targets),"complete exact Native bundle was rejected");
+    auto mixed=targets;std::swap(mixed[0],mixed[2]);require(!receipts.accepts(mixed),"mixed Native methods admitted capture");
+    mixed=targets;mixed[1]=nullptr;require(!receipts.accepts(mixed),"unknown Execute target admitted capture");
+    hooks::Receipts failure;
+    require(!failure.publish(hooks::Site::Reset,targets[0],*originals[0],false),"Create-only receipt counted as enabled");
+    for(std::size_t i=0;i<targets.size();++i)failure.publish(static_cast<hooks::Site>(i),targets[i],*originals[i],true);
+    require(!failure.accepts(targets),"failed receipt silently recovered through later enables");
+    source_lifetime_case(device,factory,0,true);
+    receipts.revoke();require(!receipts.ready() && !receipts.accepts(targets),"revoked receipt admitted capture");
+    // Standalone probe has one calling thread and has drained all its actual
+    // work. This does not claim the game's external all-call unload barrier.
+    for(auto* target:targets){require(MH_DisableHook(target)==MH_OK,"probe disable after actual drain");
+        require(MH_RemoveHook(target)==MH_OK,"probe remove with single probe thread stopped");}
+    require(MH_Uninitialize()==MH_OK,"probe uninitialize");
+    std::puts("PASS actual Native 4-hook receipts, partial/mixed/revoked rejection and GPU source lifecycle; game callbacks not tested");
+}
 int main(int argc,char** argv)try{
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     ComPtr<IDXGIFactory6> factory;check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"factory");
@@ -583,6 +687,7 @@ int main(int argc,char** argv)try{
     copy_case(device.Get(),false);copy_case(device.Get(),true);reset_cases(device.Get());failure_case(device.Get());replacement_case<4>(device.Get());replacement_case<6>(device.Get());binding_case(device.Get(),factory.Get());
     for(unsigned mode=0;mode<3;++mode)source_lifetime_case(device.Get(),factory.Get(),mode);
     read_only_source_case(device.Get(),factory.Get());
+    native_source_hooks_case(device.Get(),factory.Get());
     std::printf("PASS shared host source-use store: %u checks, %u real texture copies, physical readback\n",checks,copies);
     std::puts("Signal/partial-allocation HRESULTs are simulated; real device removal not induced.");
     std::puts("GAME=false HEADSET=false OPENXR=false NATIVE_CAMERA=false VR_FUNCTIONAL=false");return 0;
