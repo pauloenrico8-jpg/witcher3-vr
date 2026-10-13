@@ -7,6 +7,48 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Matriz padrão observada na construção da câmera — 13 de outubro
+
+A matriz padrão é o conjunto de valores que mantém uma transformação sem
+introduzir deslocamento ou rotação. O observador agora confere o valor usado
+pelo construtor da câmera, no mesmo fluxo em que acompanha sua origem e tempo.
+
+O fluxo, passo a passo:
+
+1. `modern_camera_defaults.h` aceita somente a versão conhecida e os dois
+   pontos de leitura examinados. Lê os valores para uma cópia própria e os
+   compara com a matriz padrão esperada, repetindo as leituras.
+2. `dxgi_proxy.cpp` guarda essa cópia antes da chamada original ao construtor.
+   Depois da chamada, confere os valores novamente junto com a origem e o
+   relógio que já acompanhava. Uma mudança detectada recusa a observação.
+3. Quando a fábrica usa os dados anteriores, a matriz é conferida outra vez.
+   Uma falha nessa conferência revoga a observação, sem aceitá-la mais tarde
+   como se a leitura tivesse sido válida.
+4. A leitura é protegida contra falhas de acesso. O observador conserva a saída
+   anterior quando um endereço é inválido ou a página está inacessível.
+   A chamada original ao construtor continua
+   recebendo os mesmos argumentos e devolvendo seu resultado.
+
+Escolhi observar o valor realmente consumido porque identificar sua rotina de
+inicialização no arquivo não garante o estado da memória naquele momento.
+O observador não inicializa nem modifica essa matriz. Duas leituras iguais
+não são uma trava contra alterações concorrentes nem autorização para chamar
+um construtor adicional.
+
+A DLL compilou e **120 testes passaram em 13,95 segundos**. O teste novo fez
+**65 conferências**, incluindo cada valor alterado, falha em cada leitura,
+versão desconhecida, saída preservada e páginas próprias do Windows tornadas
+inacessíveis ou não comprometidas. O mesmo leitor protegido é usado pelo host
+e pelo teste. Os endereços e dados de teste são próprios; nenhum código do
+jogo foi executado nessa verificação.
+
+**O VR ainda não funciona.** Nada experimental foi instalado. A seleção global
+continua restrita à versão anterior, e o caminho Remastered permanece fechado.
+Esta etapa não chama o construtor extra nem escreve históricos nas câmeras.
+Ainda faltam as dependências restantes da construção, seus consumidores e a
+validação de duas imagens novas do jogo por quadro, antes de testar no Quest
+ou integrar mãos, armas e combate físico.
+
 ## Centro de visão nos quatro históricos próprios — 13 de outubro
 
 Cada olho pode ter um centro de visão diferente, mesmo quando a posição e a

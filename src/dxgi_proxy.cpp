@@ -33,6 +33,7 @@
 #include "modern_factory_clock_windows.h"
 #include "modern_temporal_source.h"
 #include "modern_camera_history.h"
+#include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
 #include "modern_vegetation_view.h"
@@ -2514,6 +2515,7 @@ void install_current_temporal_reset_hook();
 struct RemasteredTemporalSourceTicket {
     w3vr::factory_clock::BorrowedScope clock;
     w3vr::temporal_source::Candidate candidate;
+    w3vr::camera_defaults::Words defaults{}; // OWN copied module values, no object lifetime.
     void* producer{};
     bool admitted{};
 };
@@ -42232,19 +42234,24 @@ bool begin_remastered_temporal_source(uintptr_t caller,void* history,float time,
     c.rotation=reinterpret_cast<uintptr_t>(rotation);c.time=time;c.fov=fov;c.aspect=aspect;
     c.near_plane=near_plane;c.far_plane=far_plane;c.scale=scale;
     if(!ticket.clock.sample(c.thread,c.clock) || !read_normal_temporal_source_route(c.owner,module,c.history,
-        c.position,c.rotation,c.director,c.prefix) || !w3vr::temporal_source::accepted(c))return false;
+        c.position,c.rotation,c.director,c.prefix) || !w3vr::temporal_source::accepted(c) ||
+        !w3vr::camera_defaults::read(contract,w3vr::camera_defaults::selected(contract),module,
+            &w3vr::camera_defaults::guarded_read,ticket.defaults))return false;
     ticket.producer=producer;ticket.admitted=true;return true;
 }
 void finish_remastered_temporal_source(RemasteredTemporalSourceTicket& ticket,void* result) {
     if(!ticket.admitted)return;
     auto* producer=static_cast<RemasteredProducerScope*>(ticket.producer);auto& c=ticket.candidate;
     const auto module=ticket.clock.borrowed_caller().module;
+    w3vr::camera_defaults::Words defaults{};
     uintptr_t director{};w3vr::temporal_source::Prefix repeated{};w3vr::engine_camera::TemporalRecord record{};
     const bool current=producer==g_remastered_producer_scope && remastered_scope_current(producer,c.contract) &&
         g_current_temporal_builder_ready.load(std::memory_order_acquire) &&
         w3vr::factory_clock::windows::revalidate(c.contract,ticket.clock) &&
         read_normal_temporal_source_route(c.owner,module,c.history,c.position,c.rotation,director,repeated) &&
-        director==c.director && repeated==c.prefix && read_normal_temporal_record(c.history,record);
+        director==c.director && repeated==c.prefix && read_normal_temporal_record(c.history,record) &&
+        w3vr::camera_defaults::read(c.contract,w3vr::camera_defaults::selected(c.contract),module,
+            &w3vr::camera_defaults::guarded_read,defaults) && defaults==ticket.defaults;
     producer->temporal_source.capture(c,record,reinterpret_cast<uintptr_t>(result),current);
 }
 // Exact two-pointer leaf. Observe AFTER Original; assembly restores registers
@@ -42325,6 +42332,7 @@ void install_current_temporal_reset_hook() {
 bool remastered_temporal_source_matches(const w3vr::engine_camera::TemporalContract* contract,
     uintptr_t descriptor,const w3vr::factory_clock::BorrowedScope& clock) {
     auto* producer=g_remastered_producer_scope;w3vr::factory_clock::Sample sample{};
+    w3vr::camera_defaults::Words defaults{};
     w3vr::engine_camera::TemporalRecord previous{};
     uintptr_t record{};
     return contract==&w3vr::engine_camera::remastered_1048522 && remastered_scope_current(producer,contract) &&
@@ -42332,7 +42340,9 @@ bool remastered_temporal_source_matches(const w3vr::engine_camera::TemporalContr
         g_current_temporal_builder_ready.load(std::memory_order_acquire)) && clock.sample(GetCurrentThreadId(),sample) &&
         w3vr::factory_clock::offset(descriptor,0x10+0x530,record) && read_normal_temporal_record(record,previous) &&
         producer->temporal_source.matches(contract,descriptor,reinterpret_cast<uintptr_t>(producer->game),
-            GetCurrentThreadId(),sample,previous,true);
+            GetCurrentThreadId(),sample,previous,
+            w3vr::camera_defaults::read(contract,w3vr::camera_defaults::selected(contract),
+                clock.borrowed_caller().module,&w3vr::camera_defaults::guarded_read,defaults));
 }
 
 void* allocate_remastered_command_in_captured_queue() {
