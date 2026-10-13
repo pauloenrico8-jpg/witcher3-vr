@@ -32,6 +32,8 @@
 #include "modern_camera_pose.h"
 #include "modern_factory_clock_windows.h"
 #include "modern_temporal_source.h"
+#include "temporal_record_leaf_bridge.h"
+#include <bcrypt.h>
 #include "modern_vegetation_view.h"
 #include "modern_world_culling_view.h"
 #include "modern_command_queue.h"
@@ -477,6 +479,8 @@ static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
 #include <utility>
 #include <vector>
 #include <array>
+
+extern "C" void* w3vr_temporal_leaf_original{};
 
 namespace {
 
@@ -2502,6 +2506,10 @@ EngineTemporalCameraBuildFn g_engine_temporal_camera_build{};
 std::atomic<bool> g_current_temporal_builder_installed{},g_current_temporal_builder_ready{};
 bool g_current_temporal_builder_attempted{};
 std::mutex g_current_temporal_builder_install_mutex;
+std::atomic<bool> g_current_temporal_reset_ready{};
+bool g_current_temporal_reset_attempted{};
+std::mutex g_current_temporal_reset_install_mutex;
+void install_current_temporal_reset_hook();
 struct RemasteredTemporalSourceTicket {
     w3vr::factory_clock::BorrowedScope clock;
     w3vr::temporal_source::Candidate candidate;
@@ -41177,6 +41185,7 @@ void install_engine_world_vector_to_view_ratio_hook() {
 // corrected camera for both the existing DLSS route and Mode-3 TAAU. Logging
 // remains fully dependent on Diagnostic Logging.
 void install_current_temporal_camera_builder_hook() {
+    install_current_temporal_reset_hook();
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     if(contract!=&w3vr::engine_camera::remastered_1048522)return;
     const bool current=true;
@@ -42226,13 +42235,89 @@ void finish_remastered_temporal_source(RemasteredTemporalSourceTicket& ticket,vo
         director==c.director && repeated==c.prefix && read_normal_temporal_record(c.history,record);
     producer->temporal_source.capture(c,record,reinterpret_cast<uintptr_t>(result),current);
 }
+// Exact two-pointer leaf. Observe AFTER Original; assembly restores registers
+// that an ordinary C++ hook is allowed to destroy, including the caller's R8.
+bool read_normal_reset_route(uintptr_t owner,uintptr_t module,uintptr_t history,uintptr_t& director) {
+    namespace fc=w3vr::factory_clock;
+    if(!owner || (owner&7) || owner>UINTPTR_MAX-0x121)return false;
+    __try {
+        if(*reinterpret_cast<const uint8_t*>(owner+0x120)!=0)return false;
+        const auto handle=*reinterpret_cast<const uintptr_t*>(owner+0xF0);
+        if(!handle || (handle&7) || handle>UINTPTR_MAX-16)return false;
+        const auto world=*reinterpret_cast<const uintptr_t*>(handle+8);
+        if(!world || (world&7) || world>UINTPTR_MAX-0x5488)return false;
+        const auto d=*reinterpret_cast<const uintptr_t*>(world+0x5480);
+        if(!d || (d&7) || d>UINTPTR_MAX-0x7FB || history!=d+0x6D0)return false;
+        const auto table=*reinterpret_cast<const uintptr_t*>(d);
+        if((table!=module+0x3989EA8 && table!=module+0x3810308) ||
+            *reinterpret_cast<const uint8_t*>(d+0x6C0)!=0)return false;
+        director=d;return true;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+extern "C" void w3vr_temporal_leaf_after(w3vr::temporal_leaf::Frame* frame) {
+    namespace fc=w3vr::factory_clock;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto* producer=g_remastered_producer_scope;
+    const uintptr_t module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if(!frame || contract!=&w3vr::engine_camera::remastered_1048522 ||
+        !g_current_temporal_reset_ready.load(std::memory_order_acquire) ||
+        !remastered_scope_current(producer,contract) || frame->caller!=module+w3vr::temporal_source::reset_return ||
+        frame->source!=module+w3vr::temporal_source::reset_source)return;
+    w3vr::native_caller_context::Snapshot root{};
+    if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
+        module+fc::current.fragment,24},root) || root.rbp<0x80)return;
+    const uintptr_t descriptor=root.rbp-0x80;
+    fc::BorrowedScope clock;
+    if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,descriptor,
+        clock,fc::CallSite::descriptor_constructor) ||
+        clock.borrowed_caller().rdi!=reinterpret_cast<uintptr_t>(producer->game))return;
+    w3vr::temporal_source::ResetCandidate c{contract,module,descriptor,reinterpret_cast<uintptr_t>(producer->game),
+        0,frame->destination,frame->source,GetCurrentThreadId()};
+    w3vr::engine_camera::TemporalRecord canonical{},copied{};uintptr_t repeated{};
+    const bool observed=clock.sample(c.thread,c.clock) && read_normal_reset_route(c.owner,module,c.history,c.director) &&
+        read_normal_temporal_record(c.source,canonical) && read_normal_temporal_record(c.history,copied) &&
+        fc::windows::revalidate(contract,clock) && read_normal_reset_route(c.owner,module,c.history,repeated) &&
+        repeated==c.director && producer==g_remastered_producer_scope && remastered_scope_current(producer,contract) &&
+        g_current_temporal_reset_ready.load(std::memory_order_acquire);
+    producer->temporal_source.capture_reset(c,canonical,copied,frame->integer[0],observed);
+}
+bool current_temporal_reset_prefix_matches(uintptr_t module) {
+    if(!w3vr::factory_clock::windows::module_matches(&w3vr::factory_clock::current,module))return false;
+    // Entire bounded leaf: admission relies on it not writing flags or R8.
+    constexpr std::array<unsigned char,32> expected{0x97,0xf5,0x42,0xe3,0xc8,0x19,0x96,0x80,0xf3,0x26,0xdf,0x49,0x96,0x2e,0xa5,0x39,0x97,0xca,0x38,0xbc,0x03,0x0d,0x1e,0x39,0xc6,0xf6,0xce,0x78,0x35,0x99,0x72,0x92};
+    __try {
+        std::array<unsigned char,32> actual{};
+        return BCryptHash(BCRYPT_SHA256_ALG_HANDLE,nullptr,0,reinterpret_cast<unsigned char*>(module+0x3539A0),
+            0x145,actual.data(),static_cast<ULONG>(actual.size()))>=0 && actual==expected;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+void install_current_temporal_reset_hook() {
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if(contract!=&w3vr::engine_camera::remastered_1048522 || !w3vr::temporal_leaf::available())return;
+    std::scoped_lock lock{g_current_temporal_reset_install_mutex};
+    if(g_current_temporal_reset_attempted)return;
+    const uintptr_t module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if(!current_temporal_reset_prefix_matches(module))return;
+    g_current_temporal_reset_attempted=true;
+    auto* target=reinterpret_cast<void*>(module+0x3539A0);
+    const bool created=MH_CreateHook(target,reinterpret_cast<void*>(&w3vr_temporal_leaf_entry),
+        &w3vr_temporal_leaf_original)==MH_OK;
+    const bool enabled=created && MH_EnableHook(target)==MH_OK;
+    const bool ready=enabled && g_engine_camera_temporal_contract.load(std::memory_order_acquire)==contract &&
+        w3vr::factory_clock::windows::module_matches(&w3vr::factory_clock::current,module);
+    g_current_temporal_reset_ready.store(ready,std::memory_order_release);
+    if(enabled && !ready)MH_DisableHook(target);
+    // Partial creation conserves the original and admits no retry or unload.
+}
+
 bool remastered_temporal_source_matches(const w3vr::engine_camera::TemporalContract* contract,
     uintptr_t descriptor,const w3vr::factory_clock::BorrowedScope& clock) {
     auto* producer=g_remastered_producer_scope;w3vr::factory_clock::Sample sample{};
     w3vr::engine_camera::TemporalRecord previous{};
     uintptr_t record{};
     return contract==&w3vr::engine_camera::remastered_1048522 && remastered_scope_current(producer,contract) &&
-        g_current_temporal_builder_ready.load(std::memory_order_acquire) && clock.sample(GetCurrentThreadId(),sample) &&
+        (producer->temporal_source.reset_observed() ? g_current_temporal_reset_ready.load(std::memory_order_acquire) :
+        g_current_temporal_builder_ready.load(std::memory_order_acquire)) && clock.sample(GetCurrentThreadId(),sample) &&
         w3vr::factory_clock::offset(descriptor,0x10+0x530,record) && read_normal_temporal_record(record,previous) &&
         producer->temporal_source.matches(contract,descriptor,reinterpret_cast<uintptr_t>(producer->game),
             GetCurrentThreadId(),sample,previous,true);

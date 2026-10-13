@@ -7,6 +7,56 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Reinício do histórico sem perder os valores da chamada — 13 de outubro
+
+O motor tem um caminho que reinicia o histórico da câmera sem chamar seu
+construtor de histórico. O mod agora observa a cópia desse reinício e a vincula
+à mesma cena e ao mesmo objeto do jogo, em vez de exigir uma construção que
+não aconteceu ou inventar dados anteriores.
+
+O fluxo, passo a passo:
+
+1. A ponte em `temporal_record_leaf_bridge.asm` chama a cópia original primeiro,
+   uma vez. Depois conserva os valores deixados pelo original, antes de chamar
+   a observação em C++. Ao sair, devolve esses valores ao chamador.
+2. Isso inclui sete registros inteiros, todos os dezesseis registros de vetor
+   e os indicadores do processador. São pequenas áreas de trabalho que uma
+   função normalmente pode mudar; essa rotina específica deixa valores ali
+   que outra parte do motor ainda usa. Seu corpo inteiro é conferido antes
+   da instalação porque a ponte depende desse comportamento específico.
+3. A observação exige a chamada de reinício, a origem nativa exata, o descritor
+   original, o objeto do relógio e a câmera normal correspondentes. Confere
+   os campos do registro copiado e os valores da mesma chamada do processador.
+4. `modern_temporal_source.h` conserva o recibo do reinício como caso separado.
+   Ele não fornece dados de câmera anterior nem autoriza um tempo para chamar
+   o construtor. A fábrica compara esse registro com o que recebeu do motor.
+   Uma falha encerra o recibo; uma segunda observação não o substitui.
+5. A instalação só anuncia prontidão depois de criar e habilitar a ligação.
+   Uma instalação parcial conserva o original e não tenta novamente sozinha.
+   Isso ainda não demonstra que a DLL pode ser descarregada com segurança.
+
+Escolhi uma ponte de observação depois do original porque uma função C++ comum
+poderia apagar o valor de um registro que a cópia seguinte ainda utiliza.
+O arquivo de definição `.h` descreve apenas o espaço próprio da observação,
+sem presumir o retorno de outras funções do motor. As cópias de câmeras privadas
+e alternativas continuam encaminhadas e não ganham essa prova de reinício.
+
+A DLL compilou e **118 testes passaram em 12,03 segundos**. O teste novo fez
+**871 conferências**, com 96 interceptações reais de uma função própria,
+192 chamadas próprias e três threads. Comparou os registros e indicadores
+com a mesma função sem a observação; também percorreu a pilha real do Windows.
+O teste de relógio e recibos fez **985 conferências**, com 211 novas sobre dados
+fabricados de reinício, identidades, recusas permanentes e campos do registro.
+Esses testes não executaram a cópia, câmera ou instalação no Witcher.
+
+**O VR ainda não funciona.** Nada foi instalado no jogo, nenhuma imagem nova
+do jogo foi produzida e o bloqueio das versões Remastered permanece. O próximo
+passo é manter os quatro conjuntos de dados anteriores das câmeras por olho,
+respeitando reinício, continuidade e geração, e reconstruí-los no tempo nativo
+comprovado. Permanecem pendentes as imagens, recursos e parada segura do motor.
+Depois de duas imagens reais por quadro no PC vêm Quest, cabeça, mãos, armas,
+dano, bloqueio e aparo por contato físico. DLSS continua opcional.
+
 ## Origem e tempo do histórico ligados à construção nativa — 13 de outubro
 
 O mod passa a observar os dados anteriores no momento em que o jogo os usa

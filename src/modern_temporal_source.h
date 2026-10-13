@@ -49,10 +49,29 @@ inline bool record_equal(std::span<const std::uint8_t> a,std::span<const std::ui
 // Own copied values within ONE synchronous producer. The temporary record is
 // proof of THIS observed builder result, never a previous-frame record cache.
 // This does not construct histories, own native objects or publish GPU data.
+inline constexpr std::uintptr_t reset_return=0x02384AE4;
+inline constexpr std::uintptr_t reset_source=0x05151560;
+struct ResetCandidate {
+    const engine_camera::TemporalContract* contract{};
+    std::uintptr_t module{},descriptor{},owner{},director{},history{},source{};
+    std::uint32_t thread{};
+    factory_clock::Sample clock{}; // Producer identity only, NOT NativeBuilder time admission.
+};
+inline bool accepted(const ResetCandidate& c) noexcept {
+    std::uintptr_t history{},source{};
+    factory_clock::Values v{};v.ticks=c.clock.ticks;v.scale=c.clock.scale;
+    factory_clock::Sample s{};
+    return c.contract==&engine_camera::remastered_1048522 && c.module && !(c.module&0xFFF) &&
+        c.descriptor && !(c.descriptor&7) && c.owner && !(c.owner&7) && c.director && !(c.director&7) &&
+        c.thread && c.director<=UINTPTR_MAX-0x7FB && c.module<=UINTPTR_MAX-reset_source-engine_camera::record_bytes &&
+        factory_clock::offset(c.director,0x6D0,history) && c.history==history &&
+        factory_clock::offset(c.module,reset_source,source) && c.source==source &&
+        factory_clock::sample_from(v,s) && same_float(s.time,c.clock.time);
+}
 class Captured {
     Candidate candidate_{};
     engine_camera::TemporalRecord record_{};
-    bool attempted_{},valid_{};
+    bool attempted_{},valid_{},reset_{};
 public:
     Captured()=default;
     Captured(const Captured&)=delete;
@@ -66,6 +85,16 @@ public:
         if(!still_current || !accepted(c) || result!=c.history || record[0]!=1 || !same_float(time,c.time))return false;
         candidate_=c;record_=record;valid_=true;return true;
     }
+    bool capture_reset(const ResetCandidate& c,const engine_camera::TemporalRecord& canonical,
+        const engine_camera::TemporalRecord& copied,std::uintptr_t result,bool still_current) noexcept {
+        if(attempted_){revoke();return false;}attempted_=true;
+        if(!still_current || !accepted(c) || result!=c.history || canonical[0]!=0 ||
+            !record_equal(canonical,copied))return false;
+        candidate_.contract=c.contract;candidate_.descriptor=c.descriptor;candidate_.owner=c.owner;
+        candidate_.thread=c.thread;candidate_.clock=c.clock;candidate_.time=c.clock.time;
+        record_=copied;valid_=true;reset_=true;return true;
+    }
+    bool reset_observed() const noexcept {return valid_ && reset_;}
     bool matches(const engine_camera::TemporalContract* contract,std::uintptr_t descriptor,
         std::uintptr_t owner,std::uint32_t thread,const factory_clock::Sample& clock,
         std::span<const std::uint8_t> native_previous,bool still_current) noexcept {
@@ -75,7 +104,7 @@ public:
             record_equal(native_previous,record_);
         if(!accepted)revoke();return accepted;
     }
-    bool previous_inputs(Prefix& out) const noexcept {if(!valid_)return false;out=candidate_.prefix;return true;}
+    bool previous_inputs(Prefix& out) const noexcept {if(!valid_ || reset_)return false;out=candidate_.prefix;return true;}
     void revoke() noexcept {valid_=false;attempted_=true;}
 };
 } // namespace w3vr::temporal_source

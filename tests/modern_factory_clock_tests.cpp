@@ -85,8 +85,41 @@ void source_receipt_checks(){
     require(!captured.capture(c,record,c.history,true) && !captured.previous_inputs(prefix),"second same-producer observation silently replaced first");
     require(own_builder_calls==1,"receipt checks called builder again");
 }
+void reset_receipt_checks(){
+    namespace ts=w3vr::temporal_source;
+    ts::ResetCandidate c{contract,module,desc,owner,0x500000,0x5006D0,module+ts::reset_source,77};
+    require(sample_from(values(),c.clock),"reset producer identity unavailable");
+    w3vr::engine_camera::TemporalRecord canonical{};
+    for(std::size_t i=1;i<canonical.size();++i)canonical[i]=static_cast<std::uint8_t>(i*19);
+    auto copied=canonical;
+    ts::Captured reset;
+    require(reset.capture_reset(c,canonical,copied,c.history,true) && reset.reset_observed(),"exact own invalid copy not captured");
+    ts::Prefix unchanged{};unchanged.fill(0xA5);
+    require(!reset.previous_inputs(unchanged) && unchanged[0]==0xA5,"invalid path invented previous-input/time proof");
+    require(reset.matches(contract,desc,owner,77,c.clock,copied,true),"own invalid receipt not matched");
+    for(unsigned k=0;k<15;++k){
+        auto bad=c;auto src=canonical,dst=copied;auto result=c.history;bool live=true;
+        if(k==0)bad.contract=nullptr;if(k==1)bad.module++;if(k==2)bad.source++;
+        if(k==3)bad.director++;if(k==4)bad.history++;if(k==5)bad.descriptor=0;
+        if(k==6)bad.owner=0;if(k==7)bad.thread=0;if(k==8)src[0]=1;if(k==9)result++;if(k==10)live=false;
+        if(k==11)bad.director=UINTPTR_MAX-7;if(k==12)bad.module=UINTPTR_MAX&~std::uintptr_t(0xFFF);
+        if(k==13)bad.contract=&w3vr::engine_camera::remastered_500c;if(k==14)dst[0]=1;
+        ts::Captured rejected;
+        require(!rejected.capture_reset(bad,src,dst,result,live) && !rejected.reset_observed(),"foreign invalid copy admitted");
+        require(!rejected.capture_reset(c,canonical,copied,c.history,true),"invalid failure rearmed");
+    }
+    for(std::size_t i=0;i<copied.size();++i){
+        ts::Captured fixture;auto changed=copied;changed[i]^=1;
+        const bool padding=(i>=1 && i<4) || (i>=0xC && i<0x10) || (i>=0x2C && i<0x30);
+        require(fixture.capture_reset(c,canonical,changed,c.history,true)==padding,"invalid fields/padding compared incorrectly");
+    }
+    auto altered=c.clock;altered.ticks++;
+    require(!reset.matches(contract,desc,owner,77,altered,copied,true) &&
+        !reset.matches(contract,desc,owner,77,c.clock,copied,true),"revoked reset became valid again");
+}
 int main(){
     source_receipt_checks();
+    reset_receipt_checks();
     require(selected(contract)==&current && !selected(nullptr) &&
         !selected(&w3vr::engine_camera::legacy_404) && !selected(&w3vr::engine_camera::remastered_500c),"unexamined caller gained profile");
     auto copied_contract=*contract;require(!selected(&copied_contract),"copied camera contract admitted");
