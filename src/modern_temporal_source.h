@@ -68,6 +68,13 @@ inline bool accepted(const ResetCandidate& c) noexcept {
         factory_clock::offset(c.module,reset_source,source) && c.source==source &&
         factory_clock::sample_from(v,s) && same_float(s.time,c.clock.time);
 }
+enum class Kind { missing,built,reset };
+struct Observation {
+    Kind kind{Kind::missing};
+    factory_clock::Sample clock{}; // Reset clock is producer identity only.
+    Prefix previous{};
+    engine_camera::TemporalRecord reset_record{};
+};
 class Captured {
     Candidate candidate_{};
     engine_camera::TemporalRecord record_{};
@@ -105,6 +112,14 @@ public:
         if(!accepted)revoke();return accepted;
     }
     bool previous_inputs(Prefix& out) const noexcept {if(!valid_ || reset_)return false;out=candidate_.prefix;return true;}
+    // Copied values only. No Game pointer or constructor/lifetime permission.
+    bool observation(Observation& out) const noexcept {
+        if(!valid_)return false;
+        Observation staged{};staged.clock=candidate_.clock;
+        if(reset_){staged.kind=Kind::reset;staged.reset_record=record_;}
+        else{staged.kind=Kind::built;staged.previous=candidate_.prefix;}
+        out=staged;return true;
+    }
     void revoke() noexcept {valid_=false;attempted_=true;}
 };
 } // namespace w3vr::temporal_source

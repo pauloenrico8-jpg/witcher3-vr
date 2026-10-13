@@ -32,6 +32,7 @@
 #include "modern_camera_pose.h"
 #include "modern_factory_clock_windows.h"
 #include "modern_temporal_source.h"
+#include "modern_camera_history.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
 #include "modern_vegetation_view.h"
@@ -42129,6 +42130,9 @@ bool read_remastered_preparation_context(uintptr_t module,
 
 struct RemasteredProducerScope;
 thread_local RemasteredProducerScope* g_remastered_producer_scope{};
+std::mutex g_remastered_camera_history_mutex;
+w3vr::camera_history::Bank g_remastered_camera_history;
+
 struct RemasteredProducerScope {
     RemasteredProducerScope(void* native_game,const w3vr::engine_camera::TemporalContract* captured)
         :game(native_game),contract(captured),
@@ -42136,7 +42140,11 @@ struct RemasteredProducerScope {
         admitted(native_game && remastered_preparation_ready_for(captured) &&
             w3vr::frame_preparation::selected(captured)==profile),
         binding(g_remastered_producer_scope,this,admitted){}
-    ~RemasteredProducerScope(){pair.cancel();}
+    ~RemasteredProducerScope(){
+        pair.cancel();
+        if(history_staged){std::scoped_lock history_lock{g_remastered_camera_history_mutex};
+            g_remastered_camera_history.cancel(history_plan.ticket);}
+    }
     void* game{};
     const w3vr::engine_camera::TemporalContract* contract{};
     const w3vr::frame_preparation::Profile* profile{};
@@ -42146,11 +42154,15 @@ struct RemasteredProducerScope {
     bool factory_reserved{};
     w3vr::frame_preparation::PendingPair pair{};
     w3vr::temporal_source::Captured temporal_source;
+    w3vr::camera_history::Plan history_plan{};
+    bool history_staged{};
     w3vr::frame_preparation::ScopedProducer<RemasteredProducerScope> binding;
 };
 
 void invalidate_remastered_prepared_pair(void* owner, void* primary, void* duplicate) {
     const auto* scope = static_cast<const RemasteredProducerScope*>(owner);
+    if(scope->history_staged){std::scoped_lock history_lock{g_remastered_camera_history_mutex};
+        g_remastered_camera_history.cancel(scope->history_plan.ticket);}
     {
         std::scoped_lock lock{g_engine_dual_frame_mutex};
         g_engine_dual_frame_eyes.erase(primary);
@@ -42434,6 +42446,16 @@ void* __fastcall hook_remastered_command_construct(void* command,void* frame,voi
         const bool matched=read_remastered_preparation_context(module,contract,scope->game,current) &&
             current==scope->context && result==command && remastered_primary_command_matches(current.command_queue,command,frame);
         const auto completion=scope->pair.at_native_command(frame,remastered_prepared_command_route(module,contract,scope->profile),matched);
+        if(scope->history_staged){
+            const auto identity=scope->history_plan.inputs.identity;
+            const bool matching=remastered_scope_current(scope,contract) && identity.contract==contract &&
+                identity.generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
+                identity.pair==scope->pair_id;
+            std::scoped_lock history_lock{g_remastered_camera_history_mutex};
+            g_remastered_camera_history.commit_cpu(scope->history_plan,identity,
+                matching && completion==prep::PendingPair::Completion::dispatched);
+            scope->history_staged=false;
+        }
         if(completion==prep::PendingPair::Completion::dispatched && g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1)<2)
             log_line("Remastered duplicate prepared and dispatched pair=%llu",static_cast<unsigned long long>(scope->pair_id));
     }
@@ -42801,6 +42823,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         // two private descriptors from ONE unmodified byte snapshot with
         // primary-eye lens inputs and both internal poses, then let native
         // scratch/frame copies perform their normal matrix rebuilds.
+        const w3vr::modern_camera_pose::Options frozen_pose_options{
+            g_config.hmd_position_scale,g_config.hmd_lock_game_pitch};
         remastered_pair_pose = snapshot_current_hmd_camera_pose();
         remastered_pair_generation = g_streamline_capture_generation.load(std::memory_order_acquire);
         remastered_pair_pose_prepared = g_config.hmd_freelook && !g_config.hmd_compositor_only &&
@@ -42814,10 +42838,24 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                 remastered_temporal_source_matches(factory_contract,reinterpret_cast<uintptr_t>(scene_descriptor),normal_factory_clock))) &&
             w3vr::modern_camera_pose::prepare_pair(factory_contract,*right_scene_descriptor,
                 remastered_pair_pose.tracking,
-                {g_config.hmd_position_scale, g_config.hmd_lock_game_pitch}, remastered_pose_pair) &&
+                frozen_pose_options, remastered_pose_pair) &&
             w3vr::modern_camera_pose::prepared_for(remastered_pose_pair,factory_contract,pair_pose_display_time) &&
             g_engine_camera_temporal_contract.load(std::memory_order_acquire)==factory_contract &&
             g_streamline_capture_generation.load(std::memory_order_acquire)==remastered_pair_generation;
+        if(remastered_pair_pose_prepared && factory_contract==&w3vr::engine_camera::remastered_1048522){
+            auto* scope=g_remastered_producer_scope;
+            w3vr::camera_history::Inputs inputs{};w3vr::temporal_source::Observation source{};
+            const w3vr::camera_history::Identity identity{factory_contract,remastered_pair_generation,pair_id,pair_pose_display_time};
+            const bool observed=remastered_scope_current(scope,factory_contract) &&
+                scope->temporal_source.observation(source) &&
+                w3vr::camera_history::snapshot(remastered_pose_pair,*right_scene_descriptor,
+                    remastered_pair_pose.tracking,frozen_pose_options,identity,inputs);
+            std::scoped_lock history_lock{g_remastered_camera_history_mutex};
+            const bool staged=observed && g_remastered_camera_history.prepare(inputs,source,scope->history_plan);
+            if(scope)scope->history_staged=staged;
+            if(!staged){g_remastered_camera_history.clear();remastered_pair_pose_prepared=false;}
+            // Data-only reservation. No NativeBuilder call or camera history write.
+        }
         if (remastered_pair_pose_prepared) {
             primary_scene_descriptor = remastered_pose_pair.descriptors[primary_eye].data();
             right_scene_descriptor = &remastered_pose_pair.descriptors[duplicate_eye];
