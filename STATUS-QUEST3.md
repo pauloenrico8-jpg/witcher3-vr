@@ -7,6 +7,50 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Centro de visão nos dados enviados aos efeitos — 13 de outubro
+
+Os efeitos recebem uma tabela de números que relaciona a imagem atual à
+anterior. O mod agora prepara uma cópia dessa tabela com o centro de visão do
+olho correspondente, no caminho sem antialiasing temporal.
+
+O fluxo, passo a passo:
+
+1. `modern_effect_reprojection.h` confere a versão e os três formatos de envio
+   examinados. Compara a tabela recebida com a câmera atual e verifica a fórmula
+   usando a lente e a visão atuais e anteriores. Dados inválidos são recusados.
+2. Retira o centro da imagem atual, aplica a transformação e acrescenta o centro
+   anterior. Essa ordem mantém o ponto do mundo na posição certa após a mudança
+   de câmera. A correção é preparada em memória própria.
+3. `dxgi_proxy.cpp` exige a marca exata do olho e do quadro. O Windows recupera
+   o descritor usado pela função de fora; ele precisa corresponder à câmera do
+   quadro. Isso impede aceitar outra captura somente por ter valores iguais.
+4. Confere novamente os dados e encaminha uma única chamada original. Só troca
+   o ponteiro da cópia temporária nas três rotas conhecidas; identificadores,
+   argumentos restantes e resultado original são preservados. As câmeras e
+   os objetos do jogo não são modificados por essa correção.
+5. A instalação tem uma tentativa e só publica prontidão depois da ativação.
+   Em falha, conserva a ligação para encaminhar chamadas. Isso ainda não resolve
+   a proteção de todas as chamadas durante o encerramento do jogo.
+
+Escolhi corrigir o envio porque o jogo calcula essa tabela antes de acrescentar
+os centros às projeções. Alterar o histórico inteiro nesse ponto poderia repetir
+uma correção. Versão, origem, tamanho, tabela, continuidade e geração precisam
+coincidir; em qualquer recusa, o envio segue com seus dados originais.
+
+A DLL compilou e **122 testes passaram em 15,65 segundos**. O teste novo fez
+**842 conferências** de pontos em perspectiva, três formatos de envio,
+preservação dos demais bytes, sobreposição e recusas. O teste do Windows fez
+**389 conferências em três threads**, incluindo a recuperação real do registro
+adicional usado para identificar uma das câmeras. Funções, dados e pilha desses
+testes são próprios. A matemática também foi conferida em um modelo privado.
+Nenhum callback do host, instalação de hook no jogo, SDK, GPU ou Quest foi
+executado nesta etapa.
+
+**O VR ainda não funciona.** A seleção global continua igual e o caminho
+Remastered permanece fechado. Nada experimental foi instalado. Ainda faltam
+provar a execução desse caminho no jogo e a ordem e duração dos recursos que
+produzem duas imagens novas por quadro, antes do Quest e do combate físico.
+
 ## Quatro históricos construídos em memória própria — 13 de outubro
 
 Os dados da câmera anterior ajudam o jogo a comparar a imagem atual com a
