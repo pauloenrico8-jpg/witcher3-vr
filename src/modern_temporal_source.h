@@ -112,6 +112,9 @@ public:
         if(!accepted)revoke();return accepted;
     }
     bool previous_inputs(Prefix& out) const noexcept {if(!valid_ || reset_)return false;out=candidate_.prefix;return true;}
+    bool built_record(engine_camera::TemporalRecord& out) const noexcept {
+        if(!valid_ || reset_)return false;out=record_;return true;
+    }
     // Copied values only. No Game pointer or constructor/lifetime permission.
     bool observation(Observation& out) const noexcept {
         if(!valid_)return false;
