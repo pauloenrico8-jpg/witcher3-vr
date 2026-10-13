@@ -7,6 +7,59 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Resultados do produtor preservados após a observação — 12 de outubro
+
+A função do jogo que prepara a cena estava ligada a uma função C++ declarada
+como se não devolvesse resultado. O significado exato do resultado ainda não
+foi comprovado. Agora uma ponte em Assembly, instruções diretas do processador,
+conserva os valores recebidos e devolvidos sem convertê-los para um tipo escolhido
+pelo mod. Isso também protege o resultado das operações feitas ao encerrar a
+observação da cena.
+
+O fluxo, passo a passo:
+
+1. Na entrada, a ponte conserva os quatro espaços de argumentos inteiros e
+   quatro espaços de argumentos vetoriais do padrão Windows de 64 bits.
+2. A parte C++ mantém a observação do produtor que já existia. A ponte repõe
+   os argumentos originais e chama a função original uma vez.
+3. Assim que ela termina, conserva seus resultados inteiros e vetoriais,
+   inclusive os bits superiores dos vetores, antes de qualquer limpeza do mod.
+4. Depois de encerrar a observação, repõe esses resultados e retorna ao
+   chamador. Nenhuma conversão de número, ponteiro ou valor fracionário ocorre.
+5. Os metadados das duas funções Assembly permitem que o Windows percorra
+   suas chamadas. A instalação exige suporte AVX no processador e no Windows;
+   esse recurso conserva os vetores completos usados nessa rota do jogo.
+
+`engine_producer_bridge.asm` faz a passagem dos dados;
+`engine_producer_bridge.h` define a disposição do registro temporário;
+`dxgi_proxy.cpp` conserva o mesmo período de observação em C++. Escolhi separar
+essa passagem porque uma operação de limpeza pode modificar os espaços usados
+para devolver um resultado, mesmo quando a função original acabou corretamente.
+A ponte cobre os argumentos em registros desta rota conhecida; não transporta
+argumentos adicionais na pilha e não declara uma assinatura universal do jogo.
+O endereço da função original fica opaco, sem uma chamada C++ que presuma seu
+retorno. A instalação parcial conserva os originais conforme a regra existente.
+
+A DLL compilou e os **117 testes passaram**. O teste próprio fez **697
+conferências, 100 chamadas originais e 96 passagens pela interceptação real**,
+em três threads. MinHook, a ferramenta que desvia a chamada, atuou somente
+sobre uma função criada para esse teste. Um alvo Assembly independente leu os
+argumentos efetivos e devolveu os bits prescritos; outra função alterou os
+registros antes e depois da chamada para verificar a restauração. Valores de
+NaN, infinito, zero negativo e partes superiores dos vetores foram conservados.
+O mesmo código da ponte foi usado pelo teste e pela DLL.
+
+**O VR ainda não funciona.** Não foi executado o jogo, seu produtor, SDK,
+OpenXR, placa de vídeo ou Quest nesta etapa. Conservar o resultado do
+processador não prova a vida útil dos objetos apontados, retirada segura da
+DLL ou sincronização do motor. O gate global das versões Remastered continua
+fechado e nada experimental foi instalado no jogo.
+
+O próximo passo é ligar os dados anteriores das câmeras ao instante correto do
+jogo, com sua ordem de atualização, invalidações e continuidade comprovadas.
+Ainda faltam recursos e históricos por olho e duas imagens novas do jogo em
+cada quadro; depois vêm as mãos, armas e o combate por contato físico.
+
 ## Relógio ligado à chamada normal da câmera — 12 de outubro
 
 O preparo das duas câmeras da atualização atual passa a conferir o relógio da
