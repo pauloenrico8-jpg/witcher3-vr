@@ -69,6 +69,8 @@ inline bool table_matches(const Profile* profile,std::uintptr_t module,std::uint
     for(auto rva:profile->primary_vtables){std::uintptr_t wanted{};if(offset(module,rva,wanted) && table==wanted)return true;}
     return false;
 }
+enum class CallSite {factory,descriptor_constructor};
+inline constexpr std::uintptr_t descriptor_constructor_return=0x0227DEDA;
 struct Caller {
     std::uintptr_t pc{},module{},fragment{},sp{},rbp{},rdi{},stack_low{},stack_high{};
     std::uint32_t thread{};
@@ -98,10 +100,11 @@ inline bool camera_matches(const Profile* profile,std::uintptr_t module,const Va
 }
 struct Sample {std::int64_t ticks{};double scale{};float time{};};
 inline bool caller_matches(const Profile* profile,const Caller& caller,std::uintptr_t descriptor,
-    std::uint32_t thread) noexcept {
+    std::uint32_t thread,CallSite site=CallSite::factory) noexcept {
+    if(site!=CallSite::factory && site!=CallSite::descriptor_constructor)return false;
     std::uintptr_t pc{},fragment{},image_end{};
     return known(profile) && thread && caller.thread==thread &&
-        offset(caller.module,profile->factory_return,pc) && offset(caller.module,profile->fragment,fragment) &&
+        offset(caller.module,site==CallSite::factory ? profile->factory_return : descriptor_constructor_return,pc) && offset(caller.module,profile->fragment,fragment) &&
         offset(caller.module,profile->image_bytes,image_end) && caller.pc==pc && caller.fragment==fragment &&
         range(caller.sp,8,caller.stack_low,caller.stack_high) && !(caller.sp&7) && !(caller.rbp&7) &&
         caller.rbp>=0x80 && descriptor==caller.rbp-0x80 && descriptor>=caller.sp &&
@@ -133,11 +136,11 @@ public:
     BorrowedScope& operator=(BorrowedScope&&)=delete;
     bool begin(const engine_camera::TemporalContract* contract,const Profile* profile,
         const Caller& caller,std::uintptr_t descriptor,const Values& values,bool code_matches,
-        std::uint32_t thread) noexcept {
+        std::uint32_t thread,CallSite site=CallSite::factory) noexcept {
         if(attempted_){active_=false;return false;}attempted_=true;
         Sample sample{};
         if(!known(profile) || selected(contract)!=profile || !code_matches ||
-            !caller_matches(profile,caller,descriptor,thread) ||
+            !caller_matches(profile,caller,descriptor,thread,site) ||
             values.owner!=caller.rdi || !table_matches(profile,caller.module,values.table) ||
             !camera_matches(profile,caller.module,values) ||
             !sample_from(values,sample))return false;

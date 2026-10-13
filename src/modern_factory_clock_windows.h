@@ -82,9 +82,11 @@ inline bool read_values(const Profile* profile,std::uintptr_t module,std::uintpt
     out=candidate;return true;
 }
 inline bool observe(const engine_camera::TemporalContract* contract,std::uintptr_t module,
-    std::uintptr_t return_pc,std::uintptr_t descriptor,BorrowedScope& scope) noexcept {
+    std::uintptr_t return_pc,std::uintptr_t descriptor,BorrowedScope& scope,
+    CallSite site=CallSite::factory) noexcept {
     const auto* profile=selected(contract);std::uintptr_t expected_pc{},fragment{};
-    if(!profile || !offset(module,profile->factory_return,expected_pc) || return_pc!=expected_pc ||
+    if((site!=CallSite::factory && site!=CallSite::descriptor_constructor) || !profile ||
+        !offset(module,site==CallSite::factory ? profile->factory_return : descriptor_constructor_return,expected_pc) || return_pc!=expected_pc ||
         !offset(module,profile->fragment,fragment) || !module_matches(profile,module)){scope.revoke();return false;}
     native_caller_context::Snapshot snapshot{};
     if(!native_caller_context::capture({return_pc,module,fragment,24},snapshot)){scope.revoke();return false;}
@@ -92,10 +94,10 @@ inline bool observe(const engine_camera::TemporalContract* contract,std::uintptr
     const Caller caller{snapshot.pc,snapshot.image_base,snapshot.unwind_entry,snapshot.sp,
         snapshot.rbp,snapshot.rdi,snapshot.stack_low,snapshot.stack_high,thread};
     // Reject a different stack argument BEFORE dereferencing a clock owner.
-    if(!caller_matches(profile,caller,descriptor,thread)){scope.revoke();return false;}
+    if(!caller_matches(profile,caller,descriptor,thread,site)){scope.revoke();return false;}
     Values values{};
     if(!read_values(profile,module,caller.rdi,descriptor,values)){scope.revoke();return false;}
-    return scope.begin(contract,profile,caller,descriptor,values,module_matches(profile,module),thread);
+    return scope.begin(contract,profile,caller,descriptor,values,module_matches(profile,module),thread,site);
 }
 inline bool revalidate(const engine_camera::TemporalContract* contract,BorrowedScope& scope) noexcept {
     const auto* profile=scope.profile();const auto& caller=scope.borrowed_caller();Values values{};

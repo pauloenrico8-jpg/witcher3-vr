@@ -31,6 +31,7 @@
 #include "engine_camera_copy_context.h"
 #include "modern_camera_pose.h"
 #include "modern_factory_clock_windows.h"
+#include "modern_temporal_source.h"
 #include "modern_vegetation_view.h"
 #include "modern_world_culling_view.h"
 #include "modern_command_queue.h"
@@ -2498,6 +2499,29 @@ std::atomic<float> g_native_world_fov_degrees{60.0f};
 std::atomic<bool> g_native_world_fov_valid{};
 using EngineTemporalCameraBuildFn = w3vr::engine_camera::NativeBuilder;
 EngineTemporalCameraBuildFn g_engine_temporal_camera_build{};
+std::atomic<bool> g_current_temporal_builder_installed{},g_current_temporal_builder_ready{};
+bool g_current_temporal_builder_attempted{};
+std::mutex g_current_temporal_builder_install_mutex;
+struct RemasteredTemporalSourceTicket {
+    w3vr::factory_clock::BorrowedScope clock;
+    w3vr::temporal_source::Candidate candidate;
+    void* producer{};
+    bool admitted{};
+};
+bool begin_remastered_temporal_source(uintptr_t caller,void* history,float time,const void* position,
+    const void* rotation,float fov,float aspect,float near_plane,float far_plane,float scale,
+    RemasteredTemporalSourceTicket& ticket);
+void finish_remastered_temporal_source(RemasteredTemporalSourceTicket& ticket,void* result);
+bool remastered_temporal_source_matches(const w3vr::engine_camera::TemporalContract* contract,
+    uintptr_t descriptor,const w3vr::factory_clock::BorrowedScope& clock);
+bool current_temporal_builder_prefix_matches(uintptr_t module) {
+    if(!w3vr::factory_clock::windows::module_matches(&w3vr::factory_clock::current,module))return false;
+    __try {return std::memcmp(reinterpret_cast<const void*>(module+0x02291600),
+        w3vr::temporal_source::builder_prefix.data(),w3vr::temporal_source::builder_prefix.size())==0 &&
+        std::memcmp(reinterpret_cast<const void*>(module+0x02291BF4),
+        w3vr::temporal_source::wrapper_call.data(),w3vr::temporal_source::wrapper_call.size())==0;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
 using EngineCameraDirectionFn = void(__fastcall*)(void*, void*, float*);
 EngineCameraDirectionFn g_engine_camera_direction{};
 using EngineTransformToEulerFn =
@@ -37931,10 +37955,17 @@ void* __fastcall hook_engine_temporal_camera_build(
     float near_plane,
     float far_plane,
     float projection_scale) {
+    const uintptr_t native_caller=reinterpret_cast<uintptr_t>(_ReturnAddress());
+    RemasteredTemporalSourceTicket observed;
+    const bool modern_forwarder=g_current_temporal_builder_installed.load(std::memory_order_acquire);
+    if(modern_forwarder)begin_remastered_temporal_source(native_caller,history,time,position,rotation,
+        fov,aspect,near_plane,far_plane,projection_scale,observed);
     void* result = g_engine_temporal_camera_build(
         history, time, position, rotation, fov, aspect,
         near_plane, far_plane, projection_scale);
-    if (engine_native_per_eye_temporal_history_active() &&
+    if(modern_forwarder)finish_remastered_temporal_source(observed,result);
+    if (!modern_forwarder && g_engine_camera_temporal_contract.load(std::memory_order_acquire)==
+            &w3vr::engine_camera::legacy_404 && engine_native_per_eye_temporal_history_active() &&
         std::isfinite(time)) {
         g_engine_temporal_camera_build_time.store(
             time, std::memory_order_relaxed);
@@ -41145,7 +41176,39 @@ void install_engine_world_vector_to_view_ratio_hook() {
 // reused to create a byte-compatible 0xB0 temporal record from the final
 // corrected camera for both the existing DLSS route and Mode-3 TAAU. Logging
 // remains fully dependent on Diagnostic Logging.
+void install_current_temporal_camera_builder_hook() {
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    if(contract!=&w3vr::engine_camera::remastered_1048522)return;
+    const bool current=true;
+    if(g_engine_temporal_camera_build)return;
+    std::scoped_lock install_lock{g_current_temporal_builder_install_mutex};
+    if(g_engine_temporal_camera_build)return;
+    const uintptr_t module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    auto* target=module ? reinterpret_cast<void*>(module+contract->builder_rva) : nullptr;
+    if(current){
+        if(g_current_temporal_builder_attempted || !current_temporal_builder_prefix_matches(module))return;
+        g_current_temporal_builder_attempted=true;
+        // Keep the original modern forwarding route even after a partial failure.
+        // Pointer creation alone never publishes readiness or permits a retry.
+        g_current_temporal_builder_installed.store(true,std::memory_order_release);
+    }
+    const bool created=target && MH_CreateHook(target,
+        reinterpret_cast<void*>(&hook_engine_temporal_camera_build),
+        reinterpret_cast<void**>(&g_engine_temporal_camera_build))==MH_OK;
+    const bool enabled=created && MH_EnableHook(target)==MH_OK;
+    const bool ready=enabled && (!current ||
+        (g_engine_camera_temporal_contract.load(std::memory_order_acquire)==contract &&
+        w3vr::factory_clock::windows::module_matches(&w3vr::factory_clock::current,module)));
+    if(current)g_current_temporal_builder_ready.store(ready,std::memory_order_release);
+    if(current && enabled && !ready)MH_DisableHook(target);
+    if(g_config.runtime_diagnostics)log_line("Native temporal camera builder %s RVA=0x%llX; observed source is not stereo completion",
+        ready ? "hooked" : "hook failed",static_cast<unsigned long long>(contract->builder_rva));
+}
+
 void install_engine_temporal_camera_builder_hook() {
+    if(g_engine_camera_temporal_contract.load(std::memory_order_acquire)==&w3vr::engine_camera::remastered_1048522){
+        install_current_temporal_camera_builder_hook();return;
+    }
     if (!engine_native_per_eye_temporal_history_active() ||
         g_engine_temporal_camera_build != nullptr) {
         return;
@@ -42073,6 +42136,7 @@ struct RemasteredProducerScope {
     uint64_t pair_id{},present{};
     bool factory_reserved{};
     w3vr::frame_preparation::PendingPair pair{};
+    w3vr::temporal_source::Captured temporal_source;
     w3vr::frame_preparation::ScopedProducer<RemasteredProducerScope> binding;
 };
 
@@ -42093,6 +42157,87 @@ bool remastered_scope_current(const RemasteredProducerScope* scope,
     return scope && scope->admitted && scope->contract==contract &&
         w3vr::frame_preparation::selected(contract)==scope->profile && remastered_preparation_ready_for(contract);
 }
+bool read_normal_temporal_source_route(uintptr_t owner,uintptr_t module,uintptr_t history,
+    uintptr_t position,uintptr_t rotation,uintptr_t& director,w3vr::temporal_source::Prefix& prefix) {
+    namespace fc=w3vr::factory_clock;
+    uintptr_t mode{},handle_address{};
+    if(!owner || (owner&7) || !fc::offset(owner,0x120,mode) || !fc::offset(owner,0xF0,handle_address))return false;
+    __try {
+        if(*reinterpret_cast<const uint8_t*>(mode)!=0)return false;
+        const auto handle=*reinterpret_cast<const uintptr_t*>(handle_address);
+        uintptr_t world_address{};if(!handle || (handle&7) || !fc::offset(handle,8,world_address))return false;
+        const auto world=*reinterpret_cast<const uintptr_t*>(world_address);
+        uintptr_t director_address{};if(!world || (world&7) || !fc::offset(world,0x5480,director_address))return false;
+        const auto candidate=*reinterpret_cast<const uintptr_t*>(director_address);
+        uintptr_t expected_history{},expected_position{},expected_rotation{};
+        if(!candidate || (candidate&7) || candidate>UINTPTR_MAX-0x7FB || !fc::offset(candidate,0x6D0,expected_history) ||
+            !fc::offset(candidate,0xE0,expected_position) || !fc::offset(expected_position,0x10,expected_rotation) ||
+            history!=expected_history || position!=expected_position || rotation!=expected_rotation)return false;
+        const auto table=*reinterpret_cast<const uintptr_t*>(candidate);
+        if(table!=module+0x03989EA8 && table!=module+0x03810308)return false;
+        if(*reinterpret_cast<const uint8_t*>(candidate+0x6C0)!=0 ||
+            *reinterpret_cast<const uint8_t*>(candidate+0x7FA)!=0)return false;
+        w3vr::temporal_source::Prefix copied{};
+        std::memcpy(copied.data(),reinterpret_cast<const void*>(position),copied.size());
+        director=candidate;prefix=copied;return true;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+bool read_normal_temporal_record(uintptr_t address,w3vr::engine_camera::TemporalRecord& out) {
+    if(!address || (address&3) || address>UINTPTR_MAX-out.size())return false;
+    __try {w3vr::engine_camera::TemporalRecord copied{};
+        std::memcpy(copied.data(),reinterpret_cast<const void*>(address),copied.size());out=copied;return true;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+bool begin_remastered_temporal_source(uintptr_t caller,void* history,float time,const void* position,
+    const void* rotation,float fov,float aspect,float near_plane,float far_plane,float scale,
+    RemasteredTemporalSourceTicket& ticket) {
+    namespace fc=w3vr::factory_clock;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto* producer=g_remastered_producer_scope;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if(contract!=&w3vr::engine_camera::remastered_1048522 ||
+        !g_current_temporal_builder_ready.load(std::memory_order_acquire) ||
+        !remastered_scope_current(producer,contract) || caller!=module+w3vr::temporal_source::wrapper_return)return false;
+    w3vr::native_caller_context::Snapshot root{};
+    if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
+        module+fc::current.fragment,24},root) || root.rbp<0x80)return false;
+    const uintptr_t descriptor=root.rbp-0x80;
+    if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,descriptor,
+        ticket.clock,fc::CallSite::descriptor_constructor) ||
+        ticket.clock.borrowed_caller().rdi!=reinterpret_cast<uintptr_t>(producer->game))return false;
+    auto& c=ticket.candidate;c.contract=contract;c.descriptor=descriptor;
+    c.owner=reinterpret_cast<uintptr_t>(producer->game);c.thread=GetCurrentThreadId();
+    c.history=reinterpret_cast<uintptr_t>(history);c.position=reinterpret_cast<uintptr_t>(position);
+    c.rotation=reinterpret_cast<uintptr_t>(rotation);c.time=time;c.fov=fov;c.aspect=aspect;
+    c.near_plane=near_plane;c.far_plane=far_plane;c.scale=scale;
+    if(!ticket.clock.sample(c.thread,c.clock) || !read_normal_temporal_source_route(c.owner,module,c.history,
+        c.position,c.rotation,c.director,c.prefix) || !w3vr::temporal_source::accepted(c))return false;
+    ticket.producer=producer;ticket.admitted=true;return true;
+}
+void finish_remastered_temporal_source(RemasteredTemporalSourceTicket& ticket,void* result) {
+    if(!ticket.admitted)return;
+    auto* producer=static_cast<RemasteredProducerScope*>(ticket.producer);auto& c=ticket.candidate;
+    const auto module=ticket.clock.borrowed_caller().module;
+    uintptr_t director{};w3vr::temporal_source::Prefix repeated{};w3vr::engine_camera::TemporalRecord record{};
+    const bool current=producer==g_remastered_producer_scope && remastered_scope_current(producer,c.contract) &&
+        g_current_temporal_builder_ready.load(std::memory_order_acquire) &&
+        w3vr::factory_clock::windows::revalidate(c.contract,ticket.clock) &&
+        read_normal_temporal_source_route(c.owner,module,c.history,c.position,c.rotation,director,repeated) &&
+        director==c.director && repeated==c.prefix && read_normal_temporal_record(c.history,record);
+    producer->temporal_source.capture(c,record,reinterpret_cast<uintptr_t>(result),current);
+}
+bool remastered_temporal_source_matches(const w3vr::engine_camera::TemporalContract* contract,
+    uintptr_t descriptor,const w3vr::factory_clock::BorrowedScope& clock) {
+    auto* producer=g_remastered_producer_scope;w3vr::factory_clock::Sample sample{};
+    w3vr::engine_camera::TemporalRecord previous{};
+    uintptr_t record{};
+    return contract==&w3vr::engine_camera::remastered_1048522 && remastered_scope_current(producer,contract) &&
+        g_current_temporal_builder_ready.load(std::memory_order_acquire) && clock.sample(GetCurrentThreadId(),sample) &&
+        w3vr::factory_clock::offset(descriptor,0x10+0x530,record) && read_normal_temporal_record(record,previous) &&
+        producer->temporal_source.matches(contract,descriptor,reinterpret_cast<uintptr_t>(producer->game),
+            GetCurrentThreadId(),sample,previous,true);
+}
+
 void* allocate_remastered_command_in_captured_queue() {
     namespace cq=w3vr::modern_command_queue;
     const auto* scope=g_remastered_producer_scope;
@@ -42580,7 +42725,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             remastered_pair_pose.tracking.display_time == pair_pose_display_time &&
             right_scene_descriptor != nullptr &&
             (factory_contract != &w3vr::engine_camera::remastered_1048522 ||
-                w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock)) &&
+                (w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock) &&
+                remastered_temporal_source_matches(factory_contract,reinterpret_cast<uintptr_t>(scene_descriptor),normal_factory_clock))) &&
             w3vr::modern_camera_pose::prepare_pair(factory_contract,*right_scene_descriptor,
                 remastered_pair_pose.tracking,
                 {g_config.hmd_position_scale, g_config.hmd_lock_game_pitch}, remastered_pose_pair) &&
@@ -42625,7 +42771,8 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     g_engine_factory_eye = previous_eye;
     if (remastered_factory && duplicate_render && (!primary_camera_sequence ||
         (factory_contract == &w3vr::engine_camera::remastered_1048522 &&
-            !w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock)) ||
+            (!w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock) ||
+            !remastered_temporal_source_matches(factory_contract,reinterpret_cast<uintptr_t>(scene_descriptor),normal_factory_clock))) ||
         g_engine_camera_temporal_contract.load(std::memory_order_acquire)!=factory_contract ||
         !w3vr::modern_camera_pose::prepared_for(remastered_pose_pair,factory_contract,pair_pose_display_time) ||
         g_streamline_capture_generation.load(std::memory_order_acquire) != remastered_pair_generation)) {
