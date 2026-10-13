@@ -1,4 +1,50 @@
 # Adaptação para Remastered — estado da renderização
+## Origem e tempo do histórico ligados à construção nativa — 13 de outubro
+
+O mod passa a observar os dados anteriores no momento em que o jogo os usa
+para construir o histórico. Ler esses dados apenas na fábrica seria tarde:
+o jogo já teria substituído a câmera anterior pela câmera atual.
+
+O fluxo, passo a passo:
+
+1. A função de construção de histórico que já era interceptada continua
+   chamando o original uma vez, com seus nove argumentos e retorno preservados.
+2. Antes dessa chamada, confere a chamada interna exata, o construtor da cena,
+   o objeto do jogo, sua interface de câmera e o relógio. Conserva uma cópia
+   dos dados anteriores e compara os valores recebidos pela construção.
+3. Depois do original, confere o resultado, o tempo gravado e a estabilidade
+   dos dados. O registro conservado serve para conferir essa construção atual;
+   não é reutilizado como histórico de um quadro anterior.
+4. Na fábrica e depois da primeira câmera, exige que o histórico recebido
+   corresponda à construção observada no mesmo objeto, chamada e tempo.
+   Falhas encerram a observação, que não pode ser copiada ou reativada.
+5. A instalação dessa observação na atualização atual tem sua própria
+   conferência e independe de DLSS. Criação parcial não publica prontidão;
+   os originais são conservados e não há nova tentativa implícita.
+
+`modern_temporal_source.h` confere os argumentos, conserva os dados e compara
+os campos definidos do resultado; `modern_factory_clock.h` e seu leitor Windows
+separam explicitamente construtor e fábrica; `dxgi_proxy.cpp` liga essas regras
+à chamada que já existia. Escolhi observar essa origem para não tomar um tempo
+global, vindo de outra câmera ou outro quadro, como prova de continuidade.
+Os campos de preenchimento do registro são preservados e ignorados na comparação.
+
+A DLL compilou e os **117 testes passaram**. O teste específico fez **774
+verificações**, com 449 novas: chamadas distintas, argumentos, mudanças de
+identidade, todos os bytes do registro, recusas permanentes e uma chamada C++
+própria com nove argumentos. Esses dados e resultados foram fabricados; não
+executaram o construtor, o relógio ou a instalação dessa observação no Witcher.
+Os testes Windows próprios anteriores continuam na suíte. Nada foi instalado
+no jogo e o bloqueio global das versões Remastered permanece.
+
+**O VR ainda não funciona.** Essa etapa não constrói os quatro históricos de
+olho, não desenha imagens nem prova vida útil dos objetos ou parada segura da
+DLL. Câmeras alternativas e o caminho nativo de reinício ainda não recebem essa
+prova; sem ela, a duplicação é recusada e a chamada original é encaminhada.
+O próximo passo é conferir esse reinício e construir os quatro históricos com
+dados anteriores próprios e o tempo atual comprovado, antes de validar duas
+imagens novas do jogo por quadro. Depois vêm cabeça, mãos, armas e combate físico.
+
 ## Relógio e interface de câmera do mesmo objeto — 12 de outubro
 
 O observador do relógio agora confere também de onde veio a câmera. O descritor
