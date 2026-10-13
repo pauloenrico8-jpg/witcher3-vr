@@ -52,6 +52,7 @@ add_library(witcher3vr_dxgi SHARED
     src/modern_dlss_native_hooks.cpp
     src/dxgi_proxy.cpp
     src/engine_producer_bridge.asm
+    src/temporal_record_leaf_bridge.asm
     src/dxgi_proxy.def
     src/openxr_eye_geometry.cpp
     src/motion_controllers.cpp
@@ -121,6 +122,13 @@ if(BUILD_TESTING)
 
     # Physical D3D12 probe; runs separately from the game and OpenXR.
     if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        add_executable(w3vr_temporal_record_leaf_tests tests/temporal_record_leaf_bridge_tests.cpp
+            tests/temporal_record_leaf_bridge_fixture.asm src/temporal_record_leaf_bridge.asm)
+        target_include_directories(w3vr_temporal_record_leaf_tests PRIVATE src)
+        target_compile_definitions(w3vr_temporal_record_leaf_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_link_libraries(w3vr_temporal_record_leaf_tests PRIVATE minhook)
+        add_test(NAME temporal_record_leaf_register_preservation COMMAND w3vr_temporal_record_leaf_tests)
+        set_tests_properties(temporal_record_leaf_register_preservation PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(w3vr_engine_producer_bridge_tests tests/engine_producer_bridge_tests.cpp
             tests/engine_producer_bridge_fixture.asm src/engine_producer_bridge.asm)
         target_include_directories(w3vr_engine_producer_bridge_tests PRIVATE src)
