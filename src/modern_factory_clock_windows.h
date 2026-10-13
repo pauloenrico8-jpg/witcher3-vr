@@ -36,28 +36,50 @@ inline bool module_matches(const Profile* profile,std::uintptr_t module) noexcep
         return true;
     }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
-inline bool read_values(const Profile* profile,std::uintptr_t module,std::uintptr_t expected_owner,Values& out) noexcept {
-    std::uintptr_t end{},tick_address{};
+inline bool read_once(const Profile* profile,std::uintptr_t module,std::uintptr_t expected_owner,
+    std::uintptr_t descriptor,Values& out) noexcept {
+    std::uintptr_t end{},tick_address{},viewport_address{},expected_receiver{};
     if(!known(profile) || !offset(module,profile->image_bytes,end) || !expected_owner || (expected_owner&7) ||
-        !offset(expected_owner,0x140,tick_address) || tick_address>UINTPTR_MAX-sizeof(std::int64_t))return false;
+        !descriptor || (descriptor&7) || !offset(expected_owner,0x140,tick_address) ||
+        tick_address>UINTPTR_MAX-sizeof(std::int64_t) || !offset(expected_owner,0x100,viewport_address) ||
+        !offset(expected_owner,0x58,expected_receiver))return false;
     __try {
         Values candidate{};
         std::memcpy(&candidate.owner,reinterpret_cast<const void*>(module+profile->clock_global),sizeof(candidate.owner));
         if(candidate.owner!=expected_owner)return false;
         std::memcpy(&candidate.table,reinterpret_cast<const void*>(candidate.owner),sizeof(candidate.table));
         if(!table_matches(profile,module,candidate.table))return false;
+        std::memcpy(&candidate.camera.descriptor_viewport,reinterpret_cast<const void*>(descriptor),sizeof(std::uintptr_t));
+        std::memcpy(&candidate.camera.owner_viewport,reinterpret_cast<const void*>(viewport_address),sizeof(std::uintptr_t));
+        std::uintptr_t interface_address{};
+        if(!candidate.camera.descriptor_viewport || (candidate.camera.descriptor_viewport&7) ||
+            candidate.camera.descriptor_viewport!=candidate.camera.owner_viewport ||
+            !offset(candidate.camera.descriptor_viewport,8,interface_address) || interface_address>UINTPTR_MAX-8)return false;
+        std::memcpy(&candidate.camera.receiver,reinterpret_cast<const void*>(interface_address),sizeof(std::uintptr_t));
+        if(candidate.camera.receiver!=expected_receiver)return false;
+        std::memcpy(&candidate.camera.table,reinterpret_cast<const void*>(expected_receiver),sizeof(std::uintptr_t));
+        // Verify the exact secondary table BEFORE reading its virtual getter.
+        bool secondary_matches=false;
+        for(std::size_t i=0;i<profile->primary_vtables.size();++i){
+            if(candidate.table==module+profile->primary_vtables[i] &&
+                candidate.camera.table==module+profile->camera_vtables[i])secondary_matches=true;
+        }
+        if(!secondary_matches)return false;
+        std::memcpy(&candidate.camera.getter,reinterpret_cast<const void*>(candidate.camera.table+11*8),sizeof(std::uintptr_t));
+        if(!camera_matches(profile,module,candidate))return false;
         std::memcpy(&candidate.ticks,reinterpret_cast<const void*>(tick_address),sizeof(candidate.ticks));
         std::memcpy(&candidate.scale,reinterpret_cast<const void*>(module+profile->scale_global),sizeof(candidate.scale));
-        Values repeat{};
-        std::memcpy(&repeat.owner,reinterpret_cast<const void*>(module+profile->clock_global),sizeof(repeat.owner));
-        if(repeat.owner!=expected_owner)return false;
-        std::memcpy(&repeat.table,reinterpret_cast<const void*>(repeat.owner),sizeof(repeat.table));
-        std::memcpy(&repeat.ticks,reinterpret_cast<const void*>(tick_address),sizeof(repeat.ticks));
-        std::memcpy(&repeat.scale,reinterpret_cast<const void*>(module+profile->scale_global),sizeof(repeat.scale));
-        if(repeat.owner!=candidate.owner || repeat.table!=candidate.table || repeat.ticks!=candidate.ticks ||
-            repeat.scale!=candidate.scale)return false;
         out=candidate;return true;
     }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+inline bool read_values(const Profile* profile,std::uintptr_t module,std::uintptr_t expected_owner,
+    std::uintptr_t descriptor,Values& out) noexcept {
+    Values candidate{},repeat{};
+    if(!read_once(profile,module,expected_owner,descriptor,candidate) ||
+        !read_once(profile,module,expected_owner,descriptor,repeat) || repeat.owner!=candidate.owner ||
+        repeat.table!=candidate.table || repeat.ticks!=candidate.ticks || repeat.scale!=candidate.scale ||
+        repeat.camera!=candidate.camera)return false;
+    out=candidate;return true;
 }
 inline bool observe(const engine_camera::TemporalContract* contract,std::uintptr_t module,
     std::uintptr_t return_pc,std::uintptr_t descriptor,BorrowedScope& scope) noexcept {
@@ -72,13 +94,13 @@ inline bool observe(const engine_camera::TemporalContract* contract,std::uintptr
     // Reject a different stack argument BEFORE dereferencing a clock owner.
     if(!caller_matches(profile,caller,descriptor,thread)){scope.revoke();return false;}
     Values values{};
-    if(!read_values(profile,module,caller.rdi,values)){scope.revoke();return false;}
+    if(!read_values(profile,module,caller.rdi,descriptor,values)){scope.revoke();return false;}
     return scope.begin(contract,profile,caller,descriptor,values,module_matches(profile,module),thread);
 }
 inline bool revalidate(const engine_camera::TemporalContract* contract,BorrowedScope& scope) noexcept {
     const auto* profile=scope.profile();const auto& caller=scope.borrowed_caller();Values values{};
     if(!profile || selected(contract)!=profile || GetCurrentThreadId()!=caller.thread ||
-        !module_matches(profile,caller.module) || !read_values(profile,caller.module,caller.rdi,values)){
+        !module_matches(profile,caller.module) || !read_values(profile,caller.module,caller.rdi,scope.borrowed_descriptor(),values)){
         scope.revoke();return false;
     }
     return scope.revalidate(contract,values,true,GetCurrentThreadId());
