@@ -34,6 +34,7 @@ extern "C" __declspec(noinline) std::uint64_t lab_callback(void* receiver,void* 
     std::uint64_t values[2]{};std::memcpy(values,descriptor,sizeof(values));
     require(values[0]==oracle->value && values[1]==mode,"original argument bytes changed");
     require(snapshot.rbx==oracle->value,"late SAVE_NONVOL did not restore caller RBX");
+    require(snapshot.rsi==mode && snapshot.rsi!=0x1234123412341234ULL,"actual caller RSI not restored");
     // The worker return starts with NOP: Windows must follow actual unwind
     // records here instead of taking its epilogue shortcut.
     DWORD64 worker_base{};auto* worker_entry=RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(&lab_worker_after_call),&worker_base,nullptr);
@@ -61,7 +62,7 @@ extern "C" __declspec(noinline) std::uint64_t lab_callback(void* receiver,void* 
         if(kind==4)rejected.max_frames=1;
         if(kind==5)rejected.unwind_entry=reinterpret_cast<std::uintptr_t>(&lab_root);
         auto unchanged=sentinel;require(!nested_capture(rejected,unchanged),"wrong caller/module/entry/budget admitted");
-        require(unchanged.pc==sentinel.pc && unchanged.sp==sentinel.sp && unchanged.rdi==sentinel.rdi && unchanged.rbp==sentinel.rbp && unchanged.rbx==sentinel.rbx && unchanged.image_base==sentinel.image_base && unchanged.unwind_entry==sentinel.unwind_entry && unchanged.stack_low==sentinel.stack_low && unchanged.stack_high==sentinel.stack_high && unchanged.traversed==sentinel.traversed,"rejected capture partially published output");
+        require(unchanged.pc==sentinel.pc && unchanged.sp==sentinel.sp && unchanged.rdi==sentinel.rdi && unchanged.rbp==sentinel.rbp && unchanged.rbx==sentinel.rbx && unchanged.image_base==sentinel.image_base && unchanged.unwind_entry==sentinel.unwind_entry && unchanged.stack_low==sentinel.stack_low && unchanged.stack_high==sentinel.stack_high && unchanged.traversed==sentinel.traversed && unchanged.rsi==sentinel.rsi,"rejected capture partially published output");
     }
     return oracle->identity ^ values[0] ^ mode;
 }
@@ -78,7 +79,7 @@ int main(){
     std::array<std::thread,2> readers{std::thread([]{run(0x22);}),std::thread([]{run(0x33);})};
     for(auto& thread:readers)thread.join();
     require(callbacks.load()==9,"unexpected own callback count");
-    std::printf("PASS real Windows chained caller unwinding: %u checks, %u callbacks, 3 threads, exact caller/module/entry, restored RDI/RBP/RBX, 5-record worker chain and late save, local argument address, unchanged returns and rejected-output preservation\n",checks.load(),callbacks.load());
+    std::printf("PASS real Windows chained caller unwinding: %u checks, %u callbacks, 3 threads, exact caller/module/entry, restored RDI/RBP/RBX/RSI, 5-record worker chain and late save, local argument address, unchanged returns and rejected-output preservation\n",checks.load(),callbacks.load());
     std::puts("Frame code, opaque receiver and descriptor are OWN fixtures. Windows context/unwinding/thread stacks are REAL.");
     std::puts("SDK_INIT=false GAME=false HOOKS=false GPU=false OPENXR=false QUEST=false NATIVE_CLOCK_RECEIPT=false VR_FUNCTIONAL=false");
 }

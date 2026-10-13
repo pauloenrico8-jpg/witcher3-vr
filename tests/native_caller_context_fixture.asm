@@ -12,20 +12,24 @@ root_saved_rbp::
 root_saved_rdi::
     push rbx
 root_saved_rbx::
-    sub rsp, 0a0h
+    push rsi
+root_saved_rsi::
+    sub rsp, 0a8h
 root_allocated::
     lea rbp, [rsp + 090h]
 root_frame_set::
 lab_root_fragment::
     mov rdi, rcx
     mov rbx, rdx
+    mov rsi, r8
     mov qword ptr [rbp - 050h], rdx
     mov qword ptr [rbp - 048h], r8
     lea rdx, [rbp - 050h]
     call lab_worker
 lab_root_after_call::
     nop
-    add rsp, 0a0h
+    add rsp, 0a8h
+    pop rsi
     pop rbx
     pop rdi
     pop rbp
@@ -37,10 +41,13 @@ lab_worker proc
 worker_saved_rbp::
     push rdi
 worker_saved_rdi::
-    sub rsp, 028h
+    push rsi
+worker_saved_rsi::
+    sub rsp, 030h
 worker_allocated::
 worker_part1::
     mov rdi, 01122334455667788h
+    mov rsi, 01234123412341234h
 worker_part2::
     mov qword ptr [rsp + 020h], rbx
 worker_late_saved_rbx::
@@ -52,7 +59,8 @@ worker_part4::
 lab_worker_after_call::
     nop
     mov rbx, qword ptr [rsp + 020h]
-    add rsp, 028h
+    add rsp, 030h
+    pop rsi
     pop rdi
     pop rbp
     ret
@@ -61,10 +69,11 @@ lab_worker endp
 .xdata segment readonly
 align 4
 root_unwind:
-    db 01h, root_frame_set-lab_root, 6, 095h
+    db 01h, root_frame_set-lab_root, 7, 095h
     db root_frame_set-lab_root, 03h
     db root_allocated-lab_root, 01h
-    dw 014h
+    dw 015h
+    db root_saved_rsi-lab_root, 060h
     db root_saved_rbx-lab_root, 030h
     db root_saved_rdi-lab_root, 070h
     db root_saved_rbp-lab_root, 050h
@@ -74,11 +83,11 @@ root_fragment_unwind:
     dd imagerel lab_root, imagerel lab_root_fragment, imagerel root_unwind
 align 4
 worker_unwind:
-    db 01h, worker_allocated-lab_worker, 3, 0
-    db worker_allocated-lab_worker, 042h
+    db 01h, worker_allocated-lab_worker, 4, 0
+    db worker_allocated-lab_worker, 052h
+    db worker_saved_rsi-lab_worker, 060h
     db worker_saved_rdi-lab_worker, 070h
     db worker_saved_rbp-lab_worker, 050h
-    dw 0
 align 4
 worker_part1_unwind:
     db 021h, 0, 0, 0
