@@ -1,5 +1,6 @@
 #include "modern_factory_clock.h"
 #include "modern_factory_clock_windows.h"
+#include "modern_temporal_source.h"
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
@@ -15,8 +16,77 @@ constexpr std::uintptr_t viewport=0x300000;
 Values values(std::size_t klass=2){return {owner,module+current.primary_vtables[klass],123456789,1000000.0,
     {viewport,viewport,owner+0x58,module+current.camera_vtables[klass],module+current.camera_getters[klass]}};}
 static_assert(!std::is_copy_constructible_v<BorrowedScope> && !std::is_move_constructible_v<BorrowedScope>);
+static_assert(!std::is_copy_constructible_v<w3vr::temporal_source::Captured> && !std::is_move_constructible_v<w3vr::temporal_source::Captured>);
 static_assert(sizeof(Sample)==24); // scalars only; no game pointers.
+unsigned own_builder_calls{};
+void* own_source_builder(void* dst,float time,const void* position,const void* rotation,
+    float fov,float aspect,float near_plane,float far_plane,float scale){
+    ++own_builder_calls;require(std::isfinite(time) && fov==75 && aspect==1.5f && near_plane==0.1f &&
+        far_plane==1000 && scale==1,"own nine-argument builder received different inputs");
+    auto* bytes=static_cast<std::uint8_t*>(dst);std::memset(bytes,0x41,w3vr::engine_camera::record_bytes);
+    bytes[0]=1;std::memcpy(bytes+4,&time,4);std::memcpy(bytes+8,&fov,4);
+    std::memcpy(bytes+0x10,position,16);std::memcpy(bytes+0x20,rotation,12);return dst;
+}
+void source_receipt_checks(){
+    namespace ts=w3vr::temporal_source;
+    auto ctor=correct();ctor.pc=module+descriptor_constructor_return;
+    require(!caller_matches(&current,ctor,desc,77) && caller_matches(&current,ctor,desc,77,CallSite::descriptor_constructor),"constructor and factory call sites mixed");
+    require(!caller_matches(&current,correct(),desc,77,CallSite::descriptor_constructor) &&
+        !caller_matches(&current,ctor,desc,77,static_cast<CallSite>(99)),"wrong call site accepted");
+    BorrowedScope ctor_scope;require(ctor_scope.begin(contract,&current,ctor,desc,values(),true,77,CallSite::descriptor_constructor),"explicit constructor scope rejected");
+    BorrowedScope default_scope;require(!default_scope.begin(contract,&current,ctor,desc,values(),true,77),"factory default widened to constructor");
+    ts::Candidate c;c.contract=contract;c.descriptor=desc;c.owner=owner;c.director=0x500000;
+    c.history=c.director+0x6D0;c.position=c.director+0xE0;c.rotation=c.position+0x10;c.thread=77;
+    require(ctor_scope.sample(77,c.clock),"constructor clock sample unavailable");
+    c.time=c.clock.time;c.fov=75;c.aspect=1.5f;c.near_plane=0.1f;c.far_plane=1000;c.scale=1;
+    std::array<float,14> input{1,2,3,0,4,5,6,75,0,0,1.5f,1,0.1f,1000};
+    std::memcpy(c.prefix.data(),input.data(),sizeof(input));
+    const std::uint32_t opaque=0xFFFFFFFF;std::memcpy(c.prefix.data()+0xC,&opaque,4);
+    require(ts::accepted(c),"correct previous-input candidate rejected");
+    w3vr::engine_camera::TemporalRecord record{};
+    require(w3vr::engine_camera::build_record(c.prefix,c.time,&own_source_builder,record) && own_builder_calls==1,"own builder was not called once with staged inputs");
+    ts::Captured captured;require(captured.capture(c,record,c.history,true),"observed model result rejected");
+    ts::Prefix prefix{};require(captured.previous_inputs(prefix) && prefix==c.prefix,"previous input bits changed or not copied");
+    require(captured.matches(contract,desc,owner,77,c.clock,record,true),"exact factory record rejected");
+    for(unsigned kind=0;kind<17;++kind){
+        auto bad=c;switch(kind){
+        case 0:bad.contract=nullptr;break;case 1:bad.contract=&w3vr::engine_camera::remastered_500c;break;
+        case 2:bad.descriptor=0;break;case 3:bad.owner=0;break;case 4:bad.director=0;break;
+        case 5:bad.director++;break;case 6:bad.history+=8;break;case 7:bad.position+=4;break;
+        case 8:bad.rotation+=4;break;case 9:bad.thread=0;break;case 10:bad.clock.ticks+=1000000;break;
+        case 11:bad.time=std::nextafter(bad.time,INFINITY);break;case 12:bad.fov++;break;
+        case 13:bad.aspect++;break;case 14:bad.near_plane*=2;break;case 15:bad.far_plane++;break;case 16:bad.scale*=2;break;
+        }
+        require(!ts::accepted(bad),"changed native arguments accepted");
+        ts::Captured rejected;require(!rejected.capture(bad,record,c.history,true),"bad candidate captured");
+        ts::Prefix unchanged{};unchanged.fill(0xA5);
+        require(!rejected.previous_inputs(unchanged) && unchanged[0]==0xA5,"failed capture published partial prefix");
+        require(!rejected.capture(c,record,c.history,true),"rejected capture rearmed in same producer");
+    }
+    for(unsigned kind=0;kind<4;++kind){
+        ts::Captured rejected;auto wrong=record;auto result=c.history;bool live=true;
+        if(kind==0)result++;if(kind==1)live=false;if(kind==2)wrong[0]=0;if(kind==3)wrong[4]^=1;
+        require(!rejected.capture(c,wrong,result,live),"wrong output/return/liveness admitted");
+    }
+    for(std::size_t i=0;i<record.size();++i){
+        ts::Captured checked;require(checked.capture(c,record,c.history,true),"field comparison fixture rejected");
+        auto changed=record;changed[i]^=1;
+        const bool padding=(i>=1 && i<4) || (i>=0xC && i<0x10) || (i>=0x2C && i<0x30);
+        require(checked.matches(contract,desc,owner,77,c.clock,changed,true)==padding,"defined native record field or padding classified incorrectly");
+    }
+    for(unsigned kind=0;kind<6;++kind){
+        ts::Captured checked;require(checked.capture(c,record,c.history,true),"factory identity fixture rejected");
+        auto sample=c.clock;auto d=desc,o=owner;auto tid=77u;bool live=true;std::span<const std::uint8_t> bytes=record;
+        if(kind==0)sample.ticks++;if(kind==1)d+=8;if(kind==2)o+=8;if(kind==3)tid++;if(kind==4)live=false;
+        if(kind==5)bytes=bytes.first(bytes.size()-1);
+        require(!checked.matches(contract,d,o,tid,sample,bytes,live) &&
+            !checked.matches(contract,desc,owner,77,c.clock,record,true),"foreign factory or failed check rearmed receipt");
+    }
+    require(!captured.capture(c,record,c.history,true) && !captured.previous_inputs(prefix),"second same-producer observation silently replaced first");
+    require(own_builder_calls==1,"receipt checks called builder again");
+}
 int main(){
+    source_receipt_checks();
     require(selected(contract)==&current && !selected(nullptr) &&
         !selected(&w3vr::engine_camera::legacy_404) && !selected(&w3vr::engine_camera::remastered_500c),"unexamined caller gained profile");
     auto copied_contract=*contract;require(!selected(&copied_contract),"copied camera contract admitted");
