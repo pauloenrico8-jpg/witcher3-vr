@@ -1,6 +1,7 @@
 #pragma once
 #include "modern_camera_pose.h"
 #include "modern_temporal_source.h"
+#include "modern_camera_history_projection.h"
 #include <bit>
 #include <limits>
 
@@ -159,6 +160,12 @@ inline bool build_records(const Plan& plan,engine_camera::NativeBuilder builder,
             if(!engine_camera::build_record(plan.previous[eye][camera],plan.clock.time,builder,staged[eye][camera]))return false;
             float actual{};std::memcpy(&actual,staged[eye][camera].data()+4,4);
             if(staged[eye][camera][0]!=1 || !temporal_source::same_float(actual,plan.clock.time))return false;
+            // The fresh result is still OWN transient storage. No live camera
+            // is written and the host still does not invoke this helper.
+            engine_camera::TemporalRecord centered{};
+            if(!camera_history_projection::center_fresh_record(plan.inputs.identity.contract,
+                plan.inputs.center[eye][camera],staged[eye][camera],centered))return false;
+            staged[eye][camera]=centered;
         }
     }
     out=staged;return true; // Output publishes only after ALL FOUR results succeed.
