@@ -33,6 +33,7 @@
 #include "modern_factory_clock_windows.h"
 #include "modern_temporal_source.h"
 #include "modern_camera_history.h"
+#include "modern_camera_history_materialization.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -42863,8 +42864,20 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             std::scoped_lock history_lock{g_remastered_camera_history_mutex};
             const bool staged=observed && g_remastered_camera_history.prepare(inputs,source,scope->history_plan);
             if(scope)scope->history_staged=staged;
-            if(!staged){g_remastered_camera_history.clear();remastered_pair_pose_prepared=false;}
-            // Data-only reservation. No NativeBuilder call or camera history write.
+            w3vr::engine_camera::TemporalRecord reference{},invalid{};
+            const auto module=normal_factory_clock.borrowed_caller().module;
+            const bool built_reference=source.kind!=w3vr::temporal_source::Kind::built ||
+                (scope && scope->temporal_source.built_record(reference));
+            const bool attached=staged && built_reference &&
+                read_normal_temporal_record(module+w3vr::temporal_source::reset_source,invalid) &&
+                w3vr::camera_history::materialize(scope->history_plan,source,reference,invalid,remastered_pose_pair) &&
+                w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock) &&
+                remastered_temporal_source_matches(factory_contract,reinterpret_cast<uintptr_t>(scene_descriptor),normal_factory_clock) &&
+                g_engine_camera_temporal_contract.load(std::memory_order_acquire)==factory_contract &&
+                g_streamline_capture_generation.load(std::memory_order_acquire)==remastered_pair_generation;
+            if(!attached){g_remastered_camera_history.clear();if(scope)scope->history_staged=false;remastered_pair_pose_prepared=false;}
+            // OWN scalar construction and private-buffer writes only. Original
+            // NativeBuilder call count and Native/Game globals stay unchanged.
         }
         if (remastered_pair_pose_prepared) {
             primary_scene_descriptor = remastered_pose_pair.descriptors[primary_eye].data();

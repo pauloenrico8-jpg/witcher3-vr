@@ -1,4 +1,50 @@
 # Adaptação para Remastered — estado da renderização
+## Quatro históricos construídos em memória própria — 13 de outubro
+
+Os dados da câmera anterior ajudam o jogo a comparar a imagem atual com a
+anterior. Agora o mod prepara esses dados separadamente para as duas câmeras
+internas de cada olho, em quatro espaços próprios.
+
+O fluxo, passo a passo:
+
+1. `modern_camera_history_math.h` calcula posição, orientação e perspectiva
+   com os valores copiados. As matrizes são tabelas de números que transformam
+   pontos do mundo em pontos da imagem. A fórmula conserva a ordem dos eixos
+   e a profundidade específica desse registro anterior.
+2. Antes de usar a fórmula, compara seu resultado com o registro da chamada
+   original já observado. Posição, lente e tempo precisam ser iguais; os
+   cálculos das matrizes permitem apenas a diferença de arredondamento
+   explicitada no código. Nenhuma chamada extra ao construtor do jogo é feita.
+3. `modern_camera_history_materialization.h` cria uma cópia temporária dos
+   descritores privados dos dois olhos. Reconstrói cada histórico anterior
+   usando o tempo atual e acrescenta o centro de visão correspondente.
+4. Em um reinício, copia o registro inválido original. Uma falha em qualquer
+   câmera conserva ambos os descritores. Só devolve o conjunto completo quando
+   os quatro resultados foram preparados, preservando referências e espaços
+   de preenchimento que não fazem parte dos campos definidos.
+5. `dxgi_proxy.cpp` liga essa preparação ao fluxo da fábrica e confere novamente
+   origem, relógio e geração antes de fornecer as cópias. Uma recusa mantém a
+   entrada normal do jogo e cancela a duplicação correspondente.
+
+Escolhi cálculo próprio porque evita novas chamadas às rotinas matemáticas do
+jogo. A comparação com a chamada original é uma condição de compatibilidade,
+mas ainda precisa ser executada no jogo. Um resultado numericamente compatível
+não comprova a duração dos objetos, a ordem dos desenhos ou imagens corretas.
+
+A DLL compilou e **121 testes passaram em 13,51 segundos**. O teste novo fez
+**126.795 conferências** com matrizes analíticas e dados próprios; a maior parte
+confere byte por byte a preservação dos dois descritores. Inclui profundidade,
+eixos, rotações, quatro históricos, reinício e saídas conservadas em falhas.
+A primeira compilação falhou por um tipo de ponteiro no laço; o tipo foi
+corrigido e a compilação final passou. Não houve execução do jogo, dos callbacks
+do host, de SDK, GPU, OpenXR ou Quest nesta etapa.
+
+**O VR ainda não funciona.** Nada experimental foi instalado; o caminho
+Remastered permanece fechado. A preparação altera somente as cópias privadas.
+Ainda faltam a conferência dos consumidores desses históricos e os recursos,
+a ordem e a duração das operações necessárias para duas imagens novas do jogo
+por quadro. Depois vêm o teste no Quest e mãos, armas e combate por contato.
+
 ## Matriz padrão observada na construção da câmera — 13 de outubro
 
 A matriz padrão é o conjunto de valores que mantém uma transformação sem
