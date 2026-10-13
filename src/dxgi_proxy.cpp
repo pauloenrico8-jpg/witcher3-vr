@@ -58,6 +58,7 @@ static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
 #include "modern_dlss_native_hooks.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
+#include "engine_producer_bridge.h"
 #include "engine_scene_factory.h"
 #include "engine_scene_descriptor.h"
 #include "puredark_afw_bridge.h"
@@ -2458,9 +2459,10 @@ std::atomic<uint64_t> g_engine_gameplay_entry_last_logged_present{UINT64_MAX};
 using EngineSceneEnqueueFn = void(__fastcall*)(void*, void*);
 EngineSceneEnqueueFn g_engine_scene_enqueue{};
 std::atomic<uint64_t> g_engine_scene_enqueue_last_logged_present{UINT64_MAX};
-using RemasteredProducerFn = void(__fastcall*)(void*, float);
-RemasteredProducerFn g_remastered_producer{};
-RemasteredProducerFn g_remastered_effects_tick{};
+using RemasteredEffectsTickFn = void(__fastcall*)(void*, float);
+// Opaque original: the register bridge preserves Native results without a guessed C++ return type.
+void* g_remastered_producer{};
+RemasteredEffectsTickFn g_remastered_effects_tick{};
 w3vr::frame_preparation::PrepareFrame g_remastered_engine_prepare{};
 w3vr::frame_preparation::PrepareFrame g_remastered_effects_apply{};
 w3vr::frame_submission::ConstructCommand g_remastered_command_construct{};
@@ -42124,10 +42126,14 @@ w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(uin
     route.renderer_ready=remastered_command_renderer_ready(module) && remastered_preparation_ready_for(contract);
     return route;
 }
-void __fastcall hook_remastered_producer(void* game,float delta) {
+extern "C" void w3vr_producer_scope_body(w3vr::producer_bridge::Frame* frame) {
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto* game=reinterpret_cast<void*>(static_cast<uintptr_t>(frame->entry_integer[0]));
     RemasteredProducerScope scope{game,contract};
-    g_remastered_producer(game,delta);
+    // Results are saved by assembly BEFORE this scope's destructor can call
+    // Native cleanup and overwrite return registers. Only the outer entry
+    // restores them, after every C++ operation has completed.
+    w3vr_invoke_producer_original(g_remastered_producer,frame);
 }
 void __fastcall hook_remastered_engine_prepare(void* engine,void* frame) {
     namespace prep=w3vr::frame_preparation;
@@ -42207,14 +42213,14 @@ bool install_remastered_preparation_hooks() {
     namespace prep=w3vr::frame_preparation;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     const auto* profile=prep::selected(contract);
-    if(!profile || !remastered_queue_ready_for(contract))return false;
+    if(!profile || !w3vr::producer_bridge::available() || !remastered_queue_ready_for(contract))return false;
     if(g_remastered_preparation_hooks_ready.load(std::memory_order_acquire))return remastered_preparation_ready_for(contract);
     if(g_remastered_preparation_install_attempted.exchange(true,std::memory_order_acq_rel))return false;
     auto* module=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     if(!module)return false;
     struct Hook {void* replacement;void** original;};
     const std::array<Hook,5> hooks{{
-        {reinterpret_cast<void*>(&hook_remastered_producer),reinterpret_cast<void**>(&g_remastered_producer)},
+        {reinterpret_cast<void*>(&w3vr_producer_entry),&g_remastered_producer},
         {reinterpret_cast<void*>(&hook_remastered_engine_prepare),reinterpret_cast<void**>(&g_remastered_engine_prepare)},
         {reinterpret_cast<void*>(&hook_remastered_effects_tick),reinterpret_cast<void**>(&g_remastered_effects_tick)},
         {reinterpret_cast<void*>(&hook_remastered_effects_apply),reinterpret_cast<void**>(&g_remastered_effects_apply)},
