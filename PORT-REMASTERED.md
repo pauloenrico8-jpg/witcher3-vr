@@ -1,4 +1,47 @@
 # Adaptação para Remastered — estado da renderização
+## Relógio e interface de câmera do mesmo objeto — 12 de outubro
+
+O observador do relógio agora confere também de onde veio a câmera. O descritor
+original precisa apontar para a mesma janela de renderização guardada pelo
+objeto que fez a chamada. Essa janela precisa apontar para a interface de
+câmera desse objeto, com a classe e a função de consulta correspondentes.
+
+O fluxo, passo a passo:
+
+1. Recupera o chamador e o descritor original pelo Windows, como antes.
+2. Lê a janela indicada pelo descritor e pelo objeto do relógio; exige igualdade.
+3. Segue a ligação da janela para a interface de câmera. Confere a tabela de
+   funções da interface separada e sua função de consulta. A tabela principal
+   do objeto contém outra função nessa mesma posição e é recusada nessa ligação.
+4. Só então lê contador e escala. Repete toda a leitura e conserva os valores
+   durante a mesma chamada do processador. Uma ligação diferente encerra a
+   observação e não volta a ser aceita nessa chamada.
+5. As conferências que já aconteciam antes do par, antes do preparo das poses e
+   depois da primeira câmera passam a exigir também essas ligações inalteradas.
+
+`modern_factory_clock.h` define as correspondências e recusas;
+`modern_factory_clock_windows.h` faz as leituras protegidas;
+`modern_factory_clock_tests.cpp` confere o comportamento. Escolhi incluir a
+ligação no observador existente para que relógio e câmera não recebam provas
+separadas que poderiam pertencer a objetos diferentes. Nenhuma função da
+interface é chamada, nenhuma referência do jogo é alterada e nenhum histórico
+nativo é escrito por esta etapa.
+
+A DLL compilou e os **117 testes passaram**. O teste do relógio fez **325
+conferências**, incluindo 207 novas. Além dos dados fabricados de classe e
+chamador, executou o leitor protegido do Windows sobre memória própria: ligação
+correta, receptor errado, função trocada e página inacessível. Os casos recusados
+conservaram o resultado de saída intacto. Isso valida o leitor e as recusas em
+um programa próprio; não valida a vida útil ou sincronização dos objetos do jogo.
+Duas leituras iguais também não demonstram que um objeto não foi destruído e
+recriado entre elas.
+
+**O VR ainda não funciona.** Não foram executados Witcher, SDK, OpenXR ou Quest;
+o bloqueio global das versões Remastered permanece e nada foi instalado no jogo.
+Ainda é preciso ligar continuidade e reinicialização das câmeras ao instante
+correto do motor, construir os históricos por olho e comprovar duas imagens
+novas do jogo em cada quadro. Depois vêm cabeça, mãos, armas e combate físico.
+
 ## Resultados do produtor preservados após a observação — 12 de outubro
 
 A função do jogo que prepara a cena estava ligada a uma função C++ declarada
