@@ -3,7 +3,7 @@
 #include <cstdint>
 namespace w3vr::native_caller_context {
 struct Request {std::uintptr_t return_pc{},image_base{},unwind_entry{};unsigned max_frames{24};};
-struct Snapshot {std::uintptr_t pc{},sp{},rdi{},rbp{},rbx{},image_base{},unwind_entry{},stack_low{},stack_high{};unsigned traversed{};};
+struct Snapshot {std::uintptr_t pc{},sp{},rdi{},rbp{},rbx{},image_base{},unwind_entry{},stack_low{},stack_high{};unsigned traversed{};std::uintptr_t rsi{};};
 // Current thread only. No game calls, no register editing/restoration, no
 // guessed private stack offsets and no language-handler execution. Result is
 // a borrowed CPU observation, not a clock/descriptor/object/GPU/unload lease.
@@ -22,7 +22,7 @@ __declspec(noinline) inline bool capture(Request request,Snapshot& result) noexc
             if(context.Rip==request.return_pc){
                 if(base!=request.image_base || base+entry->BeginAddress!=request.unwind_entry)return false;
                 const Snapshot candidate{context.Rip,context.Rsp,context.Rdi,context.Rbp,context.Rbx,base,
-                    base+entry->BeginAddress,low,high,step};
+                    base+entry->BeginAddress,low,high,step,context.Rsi};
                 result=candidate;return true;
             }
             const auto previous_sp=context.Rsp;

@@ -34,6 +34,7 @@
 #include "modern_temporal_source.h"
 #include "modern_camera_history.h"
 #include "modern_camera_history_materialization.h"
+#include "modern_effect_reprojection.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -32401,6 +32402,73 @@ void __fastcall hook_remastered_world_culling(void* manager,void* scene,void* fr
     world::invoke(g_remastered_world_culling,manager,scene,frame,admitted?&replacement:nullptr,
         read_remastered_world_culling_context,apply_remastered_world_culling_context);
 }
+// The five argument slots and synchronous source copies were examined
+// independently. RDX is kept opaque; resource IDs/receivers stay untouched.
+using RemasteredEffectUploadFn=uintptr_t(__fastcall*)(void*,uintptr_t,uintptr_t,uintptr_t,const void*);
+RemasteredEffectUploadFn g_remastered_effect_upload{};
+std::mutex g_remastered_effect_install_mutex{};
+std::atomic<const w3vr::engine_camera::TemporalContract*> g_remastered_effect_installed_contract{};
+std::atomic<bool> g_remastered_effect_ready{};
+bool g_remastered_effect_attempted{};
+uintptr_t __fastcall hook_remastered_effect_upload(void* receiver,uintptr_t argument1,
+    uintptr_t argument2,uintptr_t byte_count,const void* source) {
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    const auto* producer=w3vr::effect_reprojection::producer(contract,caller);
+    EngineFrameTag tag{};
+    alignas(16) std::array<uint8_t,0x110> original_packet{},owned_packet{};
+    std::array<uint8_t,0x5E0> camera_before{},camera_after{};
+    w3vr::effect_reprojection::Snapshot before{},after{};
+    w3vr::native_caller_context::Snapshot caller_context{};
+    const auto frame=g_modern_capture_identity.frame.frame;
+    const bool ready=g_remastered_effect_ready.load(std::memory_order_acquire) &&
+        contract==g_remastered_effect_installed_contract.load(std::memory_order_acquire);
+    const bool route=ready && producer && byte_count==producer->bytes && source && frame && frame<=UINTPTR_MAX-0x600 &&
+        snapshot_modern_noaa_capture_tag(tag) &&
+        w3vr::native_caller_context::capture({module+caller,module,module+producer->fragment,24},caller_context) &&
+        w3vr::effect_reprojection::source_matches(producer,frame+0x10,caller_context.rdi,caller_context.rsi,caller_context.rbx) &&
+        safe_copy_asymmetric_authority(reinterpret_cast<const uint8_t*>(frame+0x20),camera_before.data(),camera_before.size()) &&
+        w3vr::effect_reprojection::read(camera_before,before) &&
+        safe_copy_asymmetric_authority(source,original_packet.data(),producer->bytes) &&
+        w3vr::effect_reprojection::prepare(contract,caller,before,
+            std::span<const uint8_t>(original_packet.data(),producer->bytes),owned_packet) &&
+        safe_copy_asymmetric_authority(reinterpret_cast<const uint8_t*>(frame+0x20),camera_after.data(),camera_after.size()) &&
+        w3vr::effect_reprojection::read(camera_after,after) && before==after &&
+        contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) &&
+        g_remastered_effect_ready.load(std::memory_order_acquire) &&
+        contract==g_remastered_effect_installed_contract.load(std::memory_order_acquire) &&
+        tag.generation==g_streamline_capture_generation.load(std::memory_order_acquire);
+    // Plain stack arrays have no cleanup callbacks after Native. Forward once,
+    // preserve all five slots and the opaque RAX result; no extra Native call.
+    // The Native helper copies this source synchronously in every source route.
+    return g_remastered_effect_upload(receiver,argument1,argument2,byte_count,
+        route ? owned_packet.data() : source);
+}
+bool install_remastered_effect_upload(uint8_t* module,const w3vr::engine_camera::TemporalContract* contract) {
+    std::scoped_lock lock{g_remastered_effect_install_mutex};
+    if(contract!=&w3vr::engine_camera::remastered_1048522 || !module ||
+        contract!=g_engine_camera_temporal_contract.load(std::memory_order_acquire))return false;
+    if(g_remastered_effect_ready.load(std::memory_order_acquire))
+        return contract==g_remastered_effect_installed_contract.load(std::memory_order_acquire);
+    if(g_remastered_effect_attempted)return false;
+    g_remastered_effect_attempted=true;
+    constexpr std::array<uint8_t,15> prefix{0x48,0x89,0x5C,0x24,0x18,0x57,0x48,0x83,0xEC,0x20,0x8B,0x01,0x48,0x8B,0xF9};
+    auto* target=module+0x01EE3940;
+    if(!remastered_render_entry_matches(target,prefix) ||
+        MH_CreateHook(target,reinterpret_cast<void*>(&hook_remastered_effect_upload),
+            reinterpret_cast<void**>(&g_remastered_effect_upload))!=MH_OK)return false;
+    g_remastered_effect_installed_contract.store(contract,std::memory_order_release);
+    const bool enabled=MH_EnableHook(target)==MH_OK;
+    if(!enabled || contract!=g_engine_camera_temporal_contract.load(std::memory_order_acquire)) {
+        if(enabled)MH_DisableHook(target);
+        // Preserve the trampoline, installation identity and sticky failure.
+        // No Remove/null/retry; this does not prove all-call/unload safety.
+        return false;
+    }
+    g_remastered_effect_ready.store(true,std::memory_order_release);return true;
+}
+
 bool install_remastered_render_core_hooks(uint8_t* module,
     const w3vr::engine_camera::TemporalContract* contract,const w3vr::render_core::Profile* profile) {
     const auto* vegetation=w3vr::modern_vegetation_view::selected(contract);
@@ -32470,7 +32538,11 @@ void install_engine_frame_builder_probe() {
         route == w3vr::render_core::InstallRoute::remastered_1048522_bundle;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameBuilderRva : nullptr;
-    if (modern) { install_remastered_render_core_hooks(module,contract,profile); return; }
+    if (modern) {
+        if(install_remastered_render_core_hooks(module,contract,profile))
+            install_remastered_effect_upload(module,contract);
+        return;
+    }
     auto* detour = reinterpret_cast<void*>(&hook_engine_frame_builder);
     if (target != nullptr &&
         MH_CreateHook(target, detour,
@@ -51580,8 +51652,8 @@ void render_openxr_test_frame(
         puredark_afw_gameplay_frame;
     const bool manual_cinema =
         g_force_mono_cinema.load(std::memory_order_relaxed);
-    // The native cutscene camera authority starts Full VR before—and
-    // independently from—the legacy presentation detector. Use that same
+    // The native cutscene camera authority starts Full VR beforeâ€”and
+    // independently fromâ€”the legacy presentation detector. Use that same
     // validated authority to select the late whole-HUD composite.
     const bool automatic_full_vr_cutscene = !manual_cinema &&
         g_config.cinema_full_vr &&
