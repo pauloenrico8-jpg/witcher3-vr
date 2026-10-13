@@ -7,6 +7,50 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Dados anteriores separados para os quatro históricos — 13 de outubro
+
+A preparação passa a guardar quatro conjuntos próprios de dados anteriores:
+um para cada câmera interna do motor em cada olho. São valores copiados;
+nenhum endereço de objeto do jogo é conservado nesse armazenamento.
+
+O fluxo, passo a passo:
+
+1. O par já preparado fornece os quatro conjuntos de posição, orientação e
+   lente. A origem de recentralização e as opções são congeladas junto com o par.
+2. `modern_camera_history.h` conserva apenas os dados de entrada, sem guardar
+   um registro pronto de um quadro antigo. Confere geração, par, origem nativa,
+   lente, recentralização e relógio antes de aceitar a continuidade.
+3. Um reinício nativo ou mudança nesses dados encerra a continuidade dos quatro
+   conjuntos. Um par antigo ou já recusado não pode ser aceito novamente.
+4. A função de reconstrução prepara quatro resultados temporários no tempo
+   atual recebido. Só devolve a saída depois de todos terem sucesso. Falhas de
+   retorno, tempo ou validade conservam a saída anterior. Reinícios não chamam
+   esse construtor. A função foi testada com um construtor C++ próprio.
+5. No fluxo do motor, os valores são reservados antes das fábricas. A reserva
+   só é confirmada como entrada do processador após o despacho do par. Falhas,
+   cancelamento ou fim da chamada abandonam a reserva exata; uma resposta antiga
+   não pode retirar a reserva nova. Esse despacho não comprova imagens ou GPU.
+
+`modern_temporal_source.h` entrega uma cópia dos valores observados;
+`modern_camera_history.h` organiza continuidade, reinício e resultados;
+`dxgi_proxy.cpp` liga a reserva ao fluxo existente. Escolhi guardar entradas
+para reconstruir no tempo atual, preservando dados independentes por olho e
+câmera. As duas câmeras internas continuam pertencendo a uma cena de um olho.
+
+A DLL compilou e **119 testes passaram em 15,50 segundos**. O novo teste fez
+**98 conferências** sobre dados fabricados, incluindo cópias independentes,
+quatro chamadas próprias, falhas em cada resultado, tempo incorreto, reinício,
+reserva alterada e respostas antigas. O teste de pose também usa apenas tipos
+OpenXR e matemática própria; não abriu uma sessão no headset.
+
+**O VR ainda não funciona.** No host do jogo, esta etapa guarda os dados e
+não chama o construtor extra nem escreve os quatro históricos nas câmeras.
+Ainda é necessário comprovar a permissão e vida útil da construção nativa,
+portar suas matrizes e centros de projeção, ligar os históricos e verificar
+recursos e duas imagens novas do jogo por quadro. Nada experimental foi
+instalado e o bloqueio das versões Remastered permanece. Depois vêm Quest,
+cabeça, mãos, armas e dano, bloqueio e aparo por contato físico.
+
 ## Reinício do histórico sem perder os valores da chamada — 13 de outubro
 
 O motor tem um caminho que reinicia o histórico da câmera sem chamar seu
