@@ -1,4 +1,44 @@
 # Adaptação para Remastered — estado da renderização
+## Centro de visão nos quatro históricos próprios — 13 de outubro
+
+Cada olho pode ter um centro de visão diferente, mesmo quando a posição e a
+lente já estão corretas. A reconstrução dos dados anteriores agora conserva
+essa diferença nos quatro resultados temporários, dois por olho.
+
+O fluxo, passo a passo:
+
+1. `modern_camera_history_projection.h` recebe um registro novo, produzido no
+   armazenamento do mod. Confere a versão conhecida e a forma da projeção em
+   perspectiva, que faz objetos distantes parecerem menores.
+2. Acrescenta o deslocamento horizontal e vertical do olho. Altera somente
+   dois valores da projeção; profundidade, orientação, posição, lente, tempo
+   e demais bytes são preservados.
+3. Recusa registros inválidos, valores não finitos, outra versão, projeção
+   incompatível ou um resultado já deslocado. Assim a correção não se acumula.
+4. `modern_camera_history.h` aplica a correção a cada resultado antes de
+   devolver os quatro juntos. Uma falha conserva toda a saída anterior.
+   Reinícios continuam copiando o registro inválido, sem chamar o construtor
+   nem corrigir sua projeção.
+
+Escolhi corrigir apenas o resultado novo em memória própria porque cada olho
+precisa do seu centro e o registro anterior do jogo não deve ser alterado em
+partes. Os testes multiplicam pontos pela projeção e conferem o deslocamento
+após a divisão pela profundidade, além de preservar os bytes restantes.
+
+A DLL compilou e **119 testes passaram em 8,43 segundos**. O teste de histórico
+fez **1.023 conferências** com dados e construtor C++ próprios, incluindo centros
+positivos e negativos, pontos em várias profundidades, recusa de correção
+repetida e falhas em cada um dos quatro resultados. Não executou matrizes
+nativas do jogo, chamadas do host, SDK, GPU ou uma sessão OpenXR no Quest.
+
+**O VR ainda não funciona.** O host continua guardando somente entradas e não
+chama a reconstrução extra nem escreve os quatro históricos nas câmeras do
+jogo. O construtor nativo também consulta estado global inicializado em
+execução: essa dependência e os consumidores normais ainda precisam ser
+verificados antes da ligação. O bloqueio Remastered permanece e nada foi
+instalado. Depois de comprovar duas imagens novas do jogo por quadro vêm os
+testes de cabeça no Quest e a integração de mãos, armas e combate físico.
+
 ## Dados anteriores separados para os quatro históricos — 13 de outubro
 
 A preparação passa a guardar quatro conjuntos próprios de dados anteriores:
