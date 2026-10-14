@@ -1,4 +1,41 @@
 # Adaptação para Remastered — estado da renderização
+## Eventos e encerramento da sessão correta — 13 de outubro
+
+Um aviso de mudança de sessão só pode alterar a sessão a que pertence. O mod
+agora identifica essa origem antes de começar, encerrar ou atualizar a visão.
+
+O fluxo, passo a passo:
+
+1. `openxr_session_events.h` compara o aviso com a sessão atual e recusa sessões,
+   tipos de aviso e estados desconhecidos. O início exige o estado READY; o
+   encerramento exige STOPPING. São os estados definidos pela interface do
+   headset para permitir essas chamadas. [Regra do OpenXR](https://registry.khronos.org/OpenXR/specs/1.1/man/html/xrEndSession.html).
+2. `dxgi_proxy.cpp` usa essa decisão antes de alterar o foco das mãos e a sessão.
+   Avisos de visibilidade também precisam corresponder à sessão, ao formato
+   estéreo e a um dos dois olhos. O código de mudança de espaço já validava a
+   própria sessão e foi preservado.
+3. Depois da chamada de encerramento, conserva o resultado original. Se falhar,
+   mantém o registro de que a sessão começou, mas recusa novos quadros enquanto
+   ela estiver parando. Assim uma falha não vira uma confirmação de encerramento.
+4. Ao receber perda ou saída da sessão, fecha a admissão de novos quadros.
+   Conserva as referências gráficas; não presume que a placa de vídeo terminou
+   nem destrói recursos ainda usados. A destruição completa continua pendente.
+
+Escolhi essas verificações porque o tratamento anterior aceitava avisos de
+qualquer sessão e tentava encerrar também nos estados de perda e saída, nos
+quais essa chamada não está autorizada pela regra da interface.
+
+A DLL compilou e **124 testes passaram em 15,3 segundos**.
+O teste novo fez **112 conferências com avisos e resultados simulados**:
+identidades diferentes, tipos e estados desconhecidos, falhas de encerramento,
+admissão de quadros e máscaras dos olhos. Não executou OpenXR real, callbacks
+do mod no Witcher, SDK, GPU ou Quest. Esses testes verificam a decisão própria.
+
+**O VR ainda não funciona.** Remastered continua fechado; nada experimental
+foi instalado. A política não coordena as threads nem interrompe uma chamada
+que já esteja em execução. Ainda falta impedir a sobreposição indevida entre
+preparação, envio e encerramento e provar dois olhos novos dentro do jogo.
+
 ## Fila gráfica conservada pela sessão — 13 de outubro
 
 A sessão VR escolhe uma fila da placa de vídeo ao ser criada. Uma fila é o
