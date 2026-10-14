@@ -36,6 +36,47 @@ inline bool module_matches(const Profile* profile,std::uintptr_t module) noexcep
         return true;
     }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
+// No descriptor exists during the earlier world-camera update. These are only
+// owner/interface/clock observations; no descriptor binding or lifetime claim.
+struct OwnerObservation {
+    std::uintptr_t owner{},table{},viewport{},receiver{},camera_table{},getter{};
+    std::int64_t ticks{};double scale{};
+    bool operator==(const OwnerObservation&) const=default;
+};
+inline bool read_owner_once(const Profile* profile,std::uintptr_t module,std::uintptr_t owner,
+    OwnerObservation& out) noexcept {
+    std::uintptr_t end{};
+    if(!known(profile) || !offset(module,profile->image_bytes,end) || !owner || (owner&7) ||
+        owner>UINTPTR_MAX-0x148)return false;
+    __try {
+        OwnerObservation v{};
+        v.owner=*reinterpret_cast<const std::uintptr_t*>(module+profile->clock_global);
+        if(v.owner!=owner)return false;v.table=*reinterpret_cast<const std::uintptr_t*>(owner);
+        std::size_t klass=profile->primary_vtables.size();
+        for(std::size_t i=0;i<profile->primary_vtables.size();++i)
+            if(v.table==module+profile->primary_vtables[i])klass=i;
+        if(klass==profile->primary_vtables.size())return false;
+        v.viewport=*reinterpret_cast<const std::uintptr_t*>(owner+0x100);
+        if(!v.viewport || (v.viewport&7) || v.viewport>UINTPTR_MAX-16)return false;
+        v.receiver=*reinterpret_cast<const std::uintptr_t*>(v.viewport+8);
+        if(v.receiver!=owner+0x58)return false;
+        v.camera_table=*reinterpret_cast<const std::uintptr_t*>(v.receiver);
+        if(v.camera_table!=module+profile->camera_vtables[klass])return false;
+        v.getter=*reinterpret_cast<const std::uintptr_t*>(v.camera_table+11*8);
+        if(v.getter!=module+profile->camera_getters[klass])return false;
+        std::memcpy(&v.ticks,reinterpret_cast<const void*>(owner+0x140),sizeof(v.ticks));
+        std::memcpy(&v.scale,reinterpret_cast<const void*>(module+profile->scale_global),sizeof(v.scale));
+        Values clock{};clock.ticks=v.ticks;clock.scale=v.scale;Sample sample{};
+        if(!sample_from(clock,sample))return false;out=v;return true;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+inline bool read_owner(const Profile* profile,std::uintptr_t module,std::uintptr_t owner,
+    OwnerObservation& out,Sample& sample) noexcept {
+    OwnerObservation v{},repeat{};
+    if(!read_owner_once(profile,module,owner,v) || !read_owner_once(profile,module,owner,repeat) || v!=repeat)return false;
+    Values values{};values.ticks=v.ticks;values.scale=v.scale;Sample staged{};
+    if(!sample_from(values,staged))return false;out=v;sample=staged;return true;
+}
 inline bool read_once(const Profile* profile,std::uintptr_t module,std::uintptr_t expected_owner,
     std::uintptr_t descriptor,Values& out) noexcept {
     std::uintptr_t end{},tick_address{},viewport_address{},expected_receiver{};
