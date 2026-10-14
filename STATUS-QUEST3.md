@@ -7,6 +7,47 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+
+## Recursos conservados até a conclusão do envio correto — 14 de outubro
+
+Cada envio da rota VR gerenciada agora conserva os objetos gráficos que utiliza
+e recebe seu próprio sinal de conclusão. Um número avançado em outro sinal não
+pode autorizar reutilizar a memória ainda ocupada pela GPU, que desenha as imagens.
+
+O fluxo, passo a passo:
+
+1. xr_allocator_submissions.h guarda referências à fila, ao dispositivo, à lista,
+   à memória dos comandos, ao destino e à cópia auxiliar conhecida antes do envio.
+   A referência mantém o objeto disponível; não congela seus pixels.
+2. dxgi_proxy.cpp exige a fila conservada pela sessão e os objetos do mesmo
+   dispositivo. Registra o envio antes da chamada gráfica e encaminha a lista
+   original uma vez. Identidades antigas não podem cancelar uma reserva nova.
+3. Depois do sinal original, grava um sinal privado na mesma fila. Os recursos
+   de origem da cópia também passam a depender dessa conclusão privada.
+4. Antes de reutilizar a memória, espera esse sinal exato e confirma sua conclusão.
+   Conserva o evento de espera enquanto a notificação ainda pode chegar. Os objetos
+   do envio só são soltos depois da conclusão e do reinício observado da lista.
+5. Falha de sinal conserva os objetos e fecha a reutilização. A rota gerenciada,
+   inclusive nos menus, não zera o marcador para tentar seguir sem confirmação.
+   Cancelamento antes do envio conserva a gravação até o reinício observado.
+
+Escolhi um sinal exclusivo por envio porque o sinal compartilhado pode avançar
+por outro uso. Conservar apenas o número antigo deixaria a memória parecer livre
+sem demonstrar que a cópia terminou.
+
+A DLL compilou e **128 testes passaram em 9,67 segundos**. O novo teste fez
+**680 conferências** em processo próprio: duas filas DirectX reais, cópia bloqueada,
+avanço antecipado do sinal compartilhado, retenção das origens e do destino,
+conclusão privada e **512 bytes conferidos**. As identidades VR e as falhas de sinal
+são simuladas. Não executou o host no Witcher ou um runtime OpenXR.
+
+**O VR ainda não funciona.** O controle cobre esse caminho próprio sob a
+serialização existente do host, que mantém suas chamadas em ordem. Ainda faltam
+verificar os outros caminhos, a retenção dos handles da sessão, a recuperação de
+imagens pendentes, parada, redimensionamento e descarregamento completo. Conservar
+objetos não comprova que seus pixels permanecem iguais. Remastered continua fechado;
+nada experimental foi instalado no jogo.
+
 ## Cópia auxiliar ligada à imagem e à lista corretas — 14 de outubro
 
 A imagem do headset também é lida por uma cópia auxiliar. Essa operação muda
