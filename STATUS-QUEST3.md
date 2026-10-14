@@ -10,6 +10,39 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+## Reinício do histórico antes da preparação do quadro — 14 de outubro
+
+O jogo também pode descartar seu histórico antes de criar o descritor do quadro.
+A observação desse reinício agora acompanha a mesma preparação antecipada.
+
+1. A ponte existente deixa a cópia original executar uma vez e conserva seus
+   resultados e registros. O observador confere a chamada, a origem inválida,
+   a câmera da cena e os campos copiados; não muda as flags ou referências.
+2. Conserva o resultado inválido no escopo do produtor, ainda pendente. O relógio
+   identifica esse produtor; não representa um tempo autorizado para construir
+   matrizes nem permite recuperar entradas anteriores da câmera.
+3. A fábrica precisa apresentar o descritor real com a mesma interface, relógio
+   e histórico copiado. A captura se liga uma vez. Falha, troca ou nova tentativa
+   invalidam a captura; os cálculos dos olhos não recebem saídas parciais.
+4. Depois dessa ligação, o código informa reinício aos históricos próprios.
+   Mantém a distinção entre histórico válido e reinício. Não chama novamente
+   o construtor nativo e não inventa uma câmera anterior a partir do registro.
+
+Escolhi manter um resultado próprio de reinício porque copiar um registro
+inválido não comprova entradas anteriores nem tempo de construção de matrizes.
+O bloqueio até a ligação evita usar esse resultado em outro quadro.
+
+A DLL compilou e **128 testes passaram em 9,69 segundos**. O teste do relógio
+fez **1.286 verificações**, incluindo 240 novas: reinício pendente, ligação,
+revogação, retornos e origens incompatíveis e campos definidos versus padding.
+Padding são os bytes que o formato deixa sem significado para essa comparação.
+Os registros novos são fabricados; não executaram esse reinício no Witcher,
+callbacks novos do host, SDK, OpenXR ou Quest. A ponte de registros não mudou.
+
+**O VR ainda não funciona.** Remastered continua fechado. Ainda é necessário
+conferir o reinício real e a continuidade completa do produtor, os recursos,
+a parada e dois olhos novos do jogo por quadro. Nada experimental instalado.
+
 ## Histórico capturado antes da preparação do quadro — 14 de outubro
 
 A câmera da cena pode atualizar seu histórico antes de existir o descritor do
