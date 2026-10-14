@@ -8,6 +8,49 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+
+## Imagem pendente recuperada sem mostrar um quadro antigo — 14 de outubro
+
+Uma espera que excede o tempo não significa que o sistema VR perdeu a imagem.
+O OpenXR permite esperar novamente pela mesma aquisição. O protocolo agora
+conserva essa aquisição e conclui sua devolução sem usá-la como imagem nova.
+[Regra de espera](https://registry.khronos.org/OpenXR/specs/1.1/man/html/xrWaitSwapchainImage.html).
+
+O fluxo, passo a passo:
+
+1. openxr_image_protocol.h distingue tempo esgotado de falha grave. Tempo
+   esgotado mantém a imagem pendente; erro grave continua fechando o caminho.
+2. dxgi_proxy.cpp pede uma espera inicial de um milissegundo na rota gerenciada.
+   O sistema VR pode demorar mais que o limite solicitado. A rota antiga conserva
+   sua espera original. A imagem pendente não permite adquirir outra no lugar.
+3. Num quadro seguinte, confere sessão, época da sessão, cadeia de imagens, fila,
+   quantidade de imagens e thread de origem. Thread é o fluxo que executa as
+   chamadas. Uma troca desses dados não autoriza limpar outra aquisição.
+4. Repete a espera sem aguardar deliberadamente. Se ainda exceder o tempo,
+   conserva a aquisição. Se ficar disponível, confere novamente a ligação e
+   devolve a imagem sem gravar comandos nela. A devolução exige a espera correta.
+   [Regra de devolução](https://registry.khronos.org/OpenXR/specs/1.1/man/html/xrReleaseSwapchainImage.html).
+5. O quadro usado na limpeza termina sem camadas de imagem. Não desenha a imagem
+   antiga, não a reapresenta nem permite reutilizar a identidade desse quadro.
+   Os quadros seguintes podem buscar aquisições novas depois da devolução.
+
+Escolhi uma limpeza separada porque apresentar a aquisição do quadro anterior
+como nova quebraria a exigência de duas imagens novas. A recuperação só aceita
+imagem intocada cujo último retorno foi tempo esgotado. Não recupera falha de
+sinal da GPU, gravação parcial ou erro de devolução por tentativa e erro.
+
+A DLL compilou e **128 testes passaram em 9,82 segundos**. O teste do protocolo
+fez **378 conferências**, incluindo quatro quadros completos com os controles
+próprios de imagem e sessão. Confere esperas repetidas, uma devolução, ausência de
+novas aquisições durante a limpeza e fim dos quadros sem camadas. Também recusa
+identidades trocadas, outra thread, reentrada, exceções e falhas graves.
+
+**Essas chamadas OpenXR são simuladas.** Não executou o runtime OpenXR, os
+callbacks do host no Witcher ou o Quest. O VR ainda não funciona e Remastered
+continua fechado. A recuperação cobre a sessão ativa nesse caminho; parada,
+destruição dos handles, redimensionamento e falhas após envio à GPU ainda
+precisam de proteção e validação próprias. Nada experimental foi instalado.
+
 ## Recursos conservados até a conclusão do envio correto — 14 de outubro
 
 Cada envio da rota VR gerenciada agora conserva os objetos gráficos que utiliza
