@@ -51593,6 +51593,38 @@ void render_openxr_test_frame(
     auto frame_lease=managed_frame?modern_xr_frame_cycle().present(g_xr_session,managed_payload):w3vr::xr_frame_cycle::Cycle::Lease{};
     if(managed_frame && !frame_lease)return;
 
+    // A timed-out image belongs to its original acquisition, not the new frame.
+    // Retry that Wait with zero timeout, release it untouched, and end this frame
+    // with zero layers. Never acquire a replacement or display the old image here.
+    bool image_cleanup_frame{};
+    if(managed_frame){
+        auto* protocol=modern_xr_color_image_protocol();
+        if(protocol && protocol->pending()){
+            image_cleanup_frame=true;
+            auto graphics=modern_graphics_snapshot();auto session=modern_xr_session_graphics(graphics);
+            auto& chain=g_xr_eye_swapchains[0];const auto handle=chain.handle;
+            const auto count=chain.images.size();
+            if(session && handle && count && count<UINT32_MAX && protocol->retryable_pending()){
+                const auto queue=reinterpret_cast<uintptr_t>(session->graphics->queue.Get());
+                const w3vr::xr_image::Input owner{managed_payload.ticket.identity(),
+                    reinterpret_cast<uintptr_t>(handle),queue,managed_payload.ticket.generation,static_cast<uint32_t>(count)};
+                auto admitted=[&]{return managed_xr_session() &&
+                    w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state) &&
+                    modern_xr_frame_cycle().current(managed_payload.ticket) &&
+                    modern_graphics_current(graphics) && modern_xr_session_graphics(graphics).get()==session.get() &&
+                    chain.handle==handle && chain.images.size()==count;};
+                XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=0;
+                XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                const auto recovery=protocol->recover_wait_timeout(owner,admitted,
+                    [&]{return pfn_xrWaitSwapchainImage(handle,&wait);},
+                    [&]{return pfn_xrReleaseSwapchainImage(handle,&release);});
+                if(recovery.state!=w3vr::xr_image::RecoveryState::Pending &&
+                    recovery.state!=w3vr::xr_image::RecoveryState::Released)
+                    g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+            }else g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        }
+    }
+
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     XrResult result{XR_SUCCESS};
     bool views_valid{};
@@ -52063,7 +52095,7 @@ void render_openxr_test_frame(
     bool mode3_common_afw_sequenced_available{};
     const bool modern_noaa_scene=modern_noaa_output_requested() && !spatial_panel_active;
     ModernNoAASourceUse* modern_sources=nullptr;
-    bool submitted = views_valid && frame_state.shouldRender &&
+    bool submitted = !image_cleanup_frame && views_valid && frame_state.shouldRender &&
         (!managed_frame || (managed_payload.ticket.generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
             modern_xr_frame_cycle().current(managed_payload.ticket))) &&
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire);
@@ -52283,7 +52315,7 @@ void render_openxr_test_frame(
 
         if (submitted || (managed_frame && acquired)) {
             XrSwapchainImageWaitInfo wait_swapchain_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-            wait_swapchain_info.timeout = XR_INFINITE_DURATION;
+            wait_swapchain_info.timeout = managed_frame?1000000:XR_INFINITE_DURATION;
             const int64_t flight_swapchain_wait_begin =
                 w3vr::pipeline_flight::cpu_begin();
             const auto wait_image_call=[&]{return pfn_xrWaitSwapchainImage(swapchain.handle,&wait_swapchain_info);};
@@ -55284,7 +55316,8 @@ void render_openxr_test_frame(
         }
         if(managed_frame){
             submitted=submitted && image_protocol->layer_allowed(image_ticket);
-            if(image_protocol && image_protocol->pending())g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+            if(image_protocol && image_protocol->pending() && !image_protocol->retryable_pending())
+                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
         }
     }
 
