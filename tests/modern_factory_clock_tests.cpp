@@ -85,6 +85,51 @@ void source_receipt_checks(){
     require(!captured.capture(c,record,c.history,true) && !captured.previous_inputs(prefix),"second same-producer observation silently replaced first");
     require(own_builder_calls==1,"receipt checks called builder again");
 }
+void producer_source_receipt_checks(){
+    namespace ts=w3vr::temporal_source;
+    ts::Candidate c;c.contract=contract;c.owner=owner;c.director=0x500000;
+    c.history=c.director+0x6D0;c.position=c.director+0xE0;c.rotation=c.position+0x10;c.thread=77;
+    c.site=ts::SourceSite::producer_update;c.module=module;c.caller=module+ts::producer_update_return;
+    require(sample_from(values(),c.clock),"early owner clock fixture invalid");
+    c.time=c.clock.time;c.fov=75;c.aspect=1.5f;c.near_plane=0.1f;c.far_plane=1000;c.scale=1;
+    const std::array<float,14> input{1,2,3,0,4,5,6,75,0,0,1.5f,1,0.1f,1000};
+    std::memcpy(c.prefix.data(),input.data(),sizeof(input));
+    w3vr::engine_camera::TemporalRecord record{};const auto count=own_builder_calls;
+    require(w3vr::engine_camera::build_record(c.prefix,c.time,&own_source_builder,record),"own early output fixture failed");
+    ts::Captured captured;require(captured.capture(c,record,c.history,true),"early result not staged before descriptor exists");
+    ts::Prefix prefix{};prefix.fill(0xA5);ts::Observation observation{};observation.kind=ts::Kind::reset;
+    auto unchanged=record;unchanged[0]=0xA5;
+    require(!captured.previous_inputs(prefix)&&prefix[0]==0xA5 && !captured.built_record(unchanged)&&unchanged[0]==0xA5 &&
+        !captured.observation(observation)&&observation.kind==ts::Kind::reset,"unbound source published authority/partial output");
+    require(captured.matches(contract,desc,owner,77,c.clock,record,true),"first real matching descriptor did not bind");
+    require(captured.previous_inputs(prefix)&&prefix==c.prefix && captured.observation(observation)&&observation.kind==ts::Kind::built,
+        "bound source did not publish copied inputs");
+    require(captured.matches(contract,desc,owner,77,c.clock,record,true),"same bound descriptor rejected");
+    require(!captured.matches(contract,desc+8,owner,77,c.clock,record,true) &&
+        !captured.matches(contract,desc,owner,77,c.clock,record,true),"bound source retargeted or rearmed");
+    for(unsigned k=0;k<12;++k){
+        auto bad=c;if(k==0)bad.descriptor=desc;if(k==1)bad.module=0;if(k==2)bad.module++;
+        if(k==3)bad.caller++;if(k==4)bad.caller=module+ts::wrapper_return;if(k==5)bad.site=static_cast<ts::SourceSite>(99);
+        if(k==6)bad.contract=&w3vr::engine_camera::remastered_500c;if(k==7)bad.owner=0;if(k==8)bad.thread=0;
+        if(k==9)bad.position++;if(k==10)bad.time=std::nextafter(bad.time,INFINITY);if(k==11)bad.clock.ticks+=1000000;
+        ts::Captured rejected;require(!ts::accepted(bad)&&!rejected.capture(bad,record,c.history,true),"foreign early source accepted");
+        require(!rejected.capture(c,record,c.history,true),"failed early capture rearmed");
+    }
+    for(unsigned k=0;k<10;++k){
+        ts::Captured fixture;require(fixture.capture(c,record,c.history,true),"early late-bind fixture failed");
+        auto d=desc,o=owner;auto thread=77u;auto sample=c.clock;auto data=record;auto target_contract=contract;bool live=true;
+        if(k==0)d=0;if(k==1)d++;if(k==2)o++;if(k==3)thread++;if(k==4)sample.ticks++;
+        if(k==5)sample.scale*=2;if(k==6)sample.time=std::nextafter(sample.time,INFINITY);if(k==7)data[0]=0;
+        if(k==8)target_contract=&w3vr::engine_camera::remastered_500c;if(k==9)live=false;
+        require(!fixture.matches(target_contract,d,o,thread,sample,data,live) &&
+            !fixture.matches(contract,desc,owner,77,c.clock,record,true),"bad first binding gained a second attempt");
+    }
+    ts::Captured changed_record;require(changed_record.capture(c,record,c.history,true),"record mismatch fixture capture failed");
+    auto changed=record;changed[0x30]^=1;
+    require(!changed_record.matches(contract,desc,owner,77,c.clock,changed,true) &&
+        !changed_record.previous_inputs(prefix),"different computed history admitted");
+    require(own_builder_calls==count+1,"source binding called constructor again");
+}
 void reset_receipt_checks(){
     namespace ts=w3vr::temporal_source;
     ts::ResetCandidate c{contract,module,desc,owner,0x500000,0x5006D0,module+ts::reset_source,77};
@@ -119,6 +164,7 @@ void reset_receipt_checks(){
 }
 int main(){
     source_receipt_checks();
+    producer_source_receipt_checks();
     reset_receipt_checks();
     require(selected(contract)==&current && !selected(nullptr) &&
         !selected(&w3vr::engine_camera::legacy_404) && !selected(&w3vr::engine_camera::remastered_500c),"unexamined caller gained profile");
@@ -207,10 +253,22 @@ int main(){
     store(own_owner,expected.table);store(own_owner+0x140,expected.ticks);store(own_owner+0x100,own_vp);
     store(own_owner+0x58,expected.camera.table);store(expected.camera.table+11*8,expected.camera.getter);
     own_viewport[1]=expected.camera.receiver;own_descriptor[0]=own_vp;
+    clock_route::windows::OwnerObservation owner_read{};Sample owner_sample{};
+    require(clock_route::windows::read_owner(&current,fake_module,own_owner,owner_read,owner_sample) &&
+        owner_read.owner==own_owner && owner_read.viewport==expected.camera.owner_viewport &&
+        owner_read.receiver==expected.camera.receiver && owner_sample.ticks==expected.ticks,
+        "early reader required/invented descriptor instead of own paired owner clock");
+    const auto saved_owner=owner_read;const auto saved_sample=owner_sample;
+    require(!clock_route::windows::read_owner(&current,fake_module,own_owner+8,owner_read,owner_sample) &&
+        owner_read==saved_owner && owner_sample.ticks==saved_sample.ticks,"wrong early owner published partial output");
+    auto unknown_profile=current;
+    require(!clock_route::windows::read_owner(&unknown_profile,fake_module,own_owner,owner_read,owner_sample),"copied early profile accepted");
     Values read{};require(clock_route::windows::read_values(&current,fake_module,own_owner,own_desc,read) &&
         read.camera==expected.camera && read.ticks==expected.ticks,"own protected reader failed exact chain");
     auto output=read;
-    own_viewport[1]=own_owner;require(!clock_route::windows::read_values(&current,fake_module,own_owner,own_desc,output) && output.camera==read.camera,"wrong receiver published partial output");
+    own_viewport[1]=own_owner;
+    require(!clock_route::windows::read_owner(&current,fake_module,own_owner,owner_read,owner_sample)&&owner_read==saved_owner,"early wrong receiver admitted");
+    require(!clock_route::windows::read_values(&current,fake_module,own_owner,own_desc,output) && output.camera==read.camera,"wrong receiver published partial output");
     own_viewport[1]=expected.camera.receiver;own_descriptor[0]=1;
     require(!clock_route::windows::read_values(&current,fake_module,own_owner,own_desc,output) && output.camera==read.camera,"misaligned viewport admitted");
     own_descriptor[0]=own_vp;
@@ -219,6 +277,7 @@ int main(){
     require(!clock_route::windows::read_values(&current,fake_module,own_owner,own_desc,output) && output.camera==read.camera,"unknown secondary table dereferenced");
     store(own_owner+0x58,expected.camera.table);store(expected.camera.table+11*8,std::uintptr_t(0));
     require(!clock_route::windows::read_values(&current,fake_module,own_owner,own_desc,output) && output.camera==read.camera,"replaced getter admitted");
+    require(!clock_route::windows::read_owner(&current,fake_module,own_owner,owner_read,owner_sample)&&owner_read==saved_owner,"early replaced getter admitted");
     require(VirtualFree(arena,0,MEM_RELEASE)!=0,"own reservation not freed");
     BorrowedScope scope;require(scope.begin(contract,&current,correct(),desc,values(),true,77),"final scope rejected");
     Sample s{1,2,3};require(!scope.sample(78,s) && s.time==3,"foreign thread borrowed time");
