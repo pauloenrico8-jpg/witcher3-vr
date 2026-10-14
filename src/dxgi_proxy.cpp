@@ -38,6 +38,7 @@
 #include "modern_prepared_frame.h"
 #include "modern_xr_graphics_binding.h"
 #include "openxr_session_events.h"
+#include "openxr_frame_cycle.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -1392,8 +1393,9 @@ w3vr::motion::HandPoseHistory g_hand_pose_history;
 XrSpace g_xr_space{XR_NULL_HANDLE};
 XrSpace g_xr_view_space{XR_NULL_HANDLE};
 XrSystemId g_xr_system{};
-XrSessionState g_xr_session_state{XR_SESSION_STATE_UNKNOWN};
-bool g_xr_session_running{};
+std::atomic<XrSessionState> g_xr_session_state{XR_SESSION_STATE_UNKNOWN};
+std::atomic<bool> g_xr_session_running{};
+std::mutex g_xr_poll_mutex;
 bool g_xr_first_frame_logged{};
 std::atomic<bool> g_xr_display_period_logged{};
 std::atomic<bool> g_xr_render_frame_prepared{};
@@ -1544,6 +1546,25 @@ w3vr::modern_xr_graphics_binding::Registry* modern_xr_graphics_registry(bool cre
         delete candidate;return current;
     }
     return candidate;
+}
+extern std::atomic<uint32_t> g_streamline_capture_generation;
+// Process-lifetime CPU root; no destruction/COM release from DllMain.
+w3vr::xr_frame_cycle::Cycle& modern_xr_frame_cycle() {
+    static auto* cycle=new w3vr::xr_frame_cycle::Cycle;return *cycle;
+}
+bool managed_xr_session() {
+    auto* registry=modern_xr_graphics_registry();
+    return registry && registry->registered(reinterpret_cast<uintptr_t>(g_xr_instance),
+        reinterpret_cast<uintptr_t>(g_xr_session));
+}
+bool modern_xr_prepared_snapshot(w3vr::xr_frame_cycle::Payload& out) {
+    return managed_xr_session() && modern_xr_frame_cycle().snapshot(g_xr_session,out);
+}
+XrTime modern_xr_prepared_time() {
+    w3vr::xr_frame_cycle::Payload frame;
+    return modern_xr_prepared_snapshot(frame) && frame.renderable() &&
+        frame.ticket.generation==g_streamline_capture_generation.load(std::memory_order_acquire)
+        ?frame.state.predictedDisplayTime:0;
 }
 HRESULT resolve_modern_binding_endpoint(IUnknown*,REFIID,void**) noexcept;
 w3vr::modern_graphics_binding::Registry* modern_graphics_registry(bool create=false){
@@ -42920,14 +42941,16 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const auto aer_identity =
         w3vr::aer::identity_for_render_ordinal(aer_render_ordinal);
     XrTime pair_pose_display_time{};
+    w3vr::xr_frame_cycle::Payload modern_pair_frame;
     if (defer_openxr_frame_to_stereo_pair && duplicate_render) {
         if (modern_noaa_factory) {
             // An unadmitted modern factory never enters the legacy future-pose route.
             if (remastered_scope_current(g_remastered_producer_scope,
                     g_engine_camera_temporal_contract.load(std::memory_order_acquire))) {
                 prepare_openxr_render_frame(1);
-                if (g_xr_render_frame_prepared.load(std::memory_order_acquire))
-                    pair_pose_display_time = g_xr_render_frame_state.predictedDisplayTime;
+                if(modern_xr_prepared_snapshot(modern_pair_frame) && modern_pair_frame.renderable() &&
+                    modern_pair_frame.ticket.generation==g_streamline_capture_generation.load(std::memory_order_acquire))
+                    pair_pose_display_time=modern_pair_frame.state.predictedDisplayTime;
             }
         } else {
         // [FIX:OPENXR-QUANTIZED-PAIR-POSE 1/3] The REDengine pair is normally
@@ -42967,10 +42990,11 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         auto* scope=g_remastered_producer_scope;
         const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
         bool reserved{};
-        if(remastered_scope_current(scope,factory_contract)){
+        if(remastered_scope_current(scope,factory_contract) && modern_pair_frame.renderable() &&
+            modern_pair_frame.ticket.generation==generation && modern_xr_frame_cycle().current(modern_pair_frame.ticket)){
             std::scoped_lock lock{g_modern_prepared_frame_mutex};
             reserved=g_modern_prepared_frame.reserve({pair_pose_display_time,pair_id,generation},
-                g_xr_render_frame_prepared.load(std::memory_order_acquire),g_xr_render_frame_state.predictedDisplayTime,scope->xr_ticket);
+                true,modern_pair_frame.state.predictedDisplayTime,scope->xr_ticket);
         }
         if(!reserved)duplicate_render=false;
     }
@@ -49006,6 +49030,7 @@ void initialize_openxr_probe() {
 }
 
 void poll_openxr_events() {
+    std::lock_guard poll_lock{g_xr_poll_mutex};
     if (g_xr_instance == XR_NULL_HANDLE || pfn_xrPollEvent == nullptr) {
         return;
     }
@@ -49021,7 +49046,7 @@ void poll_openxr_events() {
                 g_motion_controllers.invalidate();
                 g_hand_pose_history.reset();
             }
-            log_line("OpenXR session state changed=%d", static_cast<int>(g_xr_session_state));
+            log_line("OpenXR session state changed=%d", static_cast<int>(g_xr_session_state.load(std::memory_order_acquire)));
 
             if (decision.action == w3vr::session_events::Action::Begin) {
                 reset_native_asymmetric_noaa_state();
@@ -49029,24 +49054,28 @@ void poll_openxr_events() {
                 begin_info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 const auto result = pfn_xrBeginSession(g_xr_session, &begin_info);
                 g_xr_session_running = XR_SUCCEEDED(result);
+                if(managed_xr_session() && result==XR_SUCCESS && !modern_xr_frame_cycle().session_started(g_xr_session))
+                    log_line("OpenXR managed frame admission stayed closed after BeginSession");
                 log_line("OpenXR xrBeginSession result=%s (%d)", xr_result_name(result), result);
             } else if (decision.action == w3vr::session_events::Action::End &&
                        pfn_xrEndSession != nullptr) {
-                const auto result = pfn_xrEndSession(g_xr_session);
-                {
-                    std::scoped_lock lock{g_modern_prepared_frame_mutex};
-                    g_modern_prepared_frame.runtime_stopped(XR_SUCCEEDED(result));
+                if(managed_xr_session())modern_xr_frame_cycle().request_stop(g_xr_session);
+                else {
+                    const auto result=pfn_xrEndSession(g_xr_session);
+                    {std::scoped_lock lock{g_modern_prepared_frame_mutex};
+                        g_modern_prepared_frame.runtime_stopped(XR_SUCCEEDED(result));}
+                    if(XR_SUCCEEDED(result)){
+                        g_xr_render_frame_prepared.store(false,std::memory_order_release);
+                        g_xr_render_views_valid=false;
+                    }
+                    g_xr_session_running=w3vr::session_events::after_end(g_xr_session_running,result);
+                    reset_native_asymmetric_noaa_state();
+                    log_line("OpenXR xrEndSession result=%s (%d)",xr_result_name(result),result);
                 }
-                if (XR_SUCCEEDED(result)) {
-                    g_xr_render_frame_prepared.store(false, std::memory_order_release);
-                    g_xr_render_views_valid = false;
-                }
-                g_xr_session_running = w3vr::session_events::after_end(g_xr_session_running,result);
-                reset_native_asymmetric_noaa_state();
-                log_line("OpenXR xrEndSession result=%s (%d)", xr_result_name(result), result);
             } else if (decision.action == w3vr::session_events::Action::Terminal) {
                 // Admission closes without pretending EndSession succeeded or
                 // releasing GPU/COM resources. Destroy/drain remains separate.
+                if(managed_xr_session())modern_xr_frame_cycle().request_stop(g_xr_session);
                 if(auto* registry=modern_xr_graphics_registry())registry->stop_no_release();
             }
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
@@ -49069,6 +49098,22 @@ void poll_openxr_events() {
         }
 
         event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+    if(managed_xr_session() && g_xr_session_running.load(std::memory_order_acquire) &&
+        g_xr_session_state.load(std::memory_order_acquire)==XR_SESSION_STATE_STOPPING && pfn_xrEndSession) {
+        const auto epoch=modern_xr_frame_cycle().claim_stop(g_xr_session);
+        if(epoch) {
+            const auto result=modern_xr_frame_cycle().stop(g_xr_session,epoch,[&]{return pfn_xrEndSession(g_xr_session);});
+            {std::scoped_lock lock{g_modern_prepared_frame_mutex};
+                g_modern_prepared_frame.runtime_stopped(XR_SUCCEEDED(result));}
+            if(XR_SUCCEEDED(result)){
+                g_xr_render_frame_prepared.store(false,std::memory_order_release);
+                g_xr_render_views_valid=false;
+            }
+            g_xr_session_running=w3vr::session_events::after_end(g_xr_session_running,result);
+            reset_native_asymmetric_noaa_state();
+            log_line("OpenXR drained managed xrEndSession result=%s (%d)",xr_result_name(result),result);
+        }
     }
 }
 
@@ -49321,15 +49366,20 @@ void prepare_openxr_render_frame(uint32_t origin) {
         return;
     }
 
+    const bool managed=managed_xr_session();
+    auto lease=managed?modern_xr_frame_cycle().prepare(g_xr_session,
+        g_streamline_capture_generation.load(std::memory_order_acquire)):w3vr::xr_frame_cycle::Cycle::Lease{};
+    if(managed && !lease)return;
     XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     XrResult result{};
     const int64_t flight_wait_begin = w3vr::pipeline_flight::cpu_begin();
-    result = pfn_xrWaitFrame(g_xr_session, &wait_info, &frame_state);
+    const auto wait_call=[&]{return pfn_xrWaitFrame(g_xr_session,&wait_info,&frame_state);};
+    result=managed?modern_xr_frame_cycle().wait(lease,wait_call):wait_call();
     w3vr::pipeline_flight::cpu_end(
         w3vr::pipeline_flight::Phase::XrWaitFrame,
         flight_wait_begin);
-    if (XR_FAILED(result)) {
+    if (XR_FAILED(result) || (managed && result!=XR_SUCCESS)) {
         log_taau_trace_line("OpenXR pre-render xrWaitFrame result=%s (%d)", xr_result_name(result), result);
         return;
     }
@@ -49342,8 +49392,10 @@ void prepare_openxr_render_frame(uint32_t origin) {
     }
 
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
-    result = pfn_xrBeginFrame(g_xr_session, &begin_info);
-    if (XR_FAILED(result)) {
+    const auto begin_call=[&]{return pfn_xrBeginFrame(g_xr_session,&begin_info);};
+    result=managed?modern_xr_frame_cycle().begin(lease,begin_call):begin_call();
+    const bool discarded=result==XR_FRAME_DISCARDED;
+    if (XR_FAILED(result) || (managed && result!=XR_SUCCESS && !discarded)) {
         log_taau_trace_line("OpenXR pre-render xrBeginFrame result=%s (%d)", xr_result_name(result), result);
         return;
     }
@@ -49368,7 +49420,7 @@ void prepare_openxr_render_frame(uint32_t origin) {
         static_cast<uint32_t>(located_views.size()), &view_count, located_views.data());
 
     g_xr_render_frame_state = frame_state;
-    g_xr_render_views_valid = XR_SUCCEEDED(result) && view_count >= 2;
+    g_xr_render_views_valid = result==XR_SUCCESS && view_count==2 && !discarded;
     g_xr_render_view_state_flags.store(
         g_xr_render_views_valid ? view_state.viewStateFlags : 0,
         std::memory_order_release);
@@ -49382,7 +49434,13 @@ void prepare_openxr_render_frame(uint32_t origin) {
         g_modern_camera_tracking = {};
         g_modern_camera_tracking_generation = 0;
     }
-    g_xr_render_frame_prepared.store(true);
+    if(managed){
+        w3vr::xr_frame_cycle::Payload payload;
+        payload.state=frame_state;payload.views=located_views;
+        payload.flags=g_xr_render_view_state_flags.load(std::memory_order_acquire);
+        payload.views_valid=g_xr_render_views_valid;
+        g_xr_render_frame_prepared.store(modern_xr_frame_cycle().publish(lease,payload),std::memory_order_release);
+    }else g_xr_render_frame_prepared.store(true);
 }
 
 // [FIX:OPENXR-QUANTIZED-PAIR-POSE 2/3] Mode 3 has one immutable pair in
@@ -49391,6 +49449,7 @@ void prepare_openxr_render_frame(uint32_t origin) {
 // This makes the pose time deterministic and leaves Wait/Begin/End exclusively
 // to the pair which is actually ready for publication.
 XrTime locate_openxr_mode3_pair_pose() {
+    if(managed_xr_session())return 0; // Never overwrite the managed frame with a future pose.
     if (!g_config.hmd_freelook || !g_xr_resources_ready ||
         !w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state)) {
         return 0;
@@ -51464,6 +51523,12 @@ void render_openxr_test_frame(
         return;
     }
 
+    const bool managed_frame=managed_xr_session();
+    w3vr::xr_frame_cycle::Payload managed_payload;
+    if(managed_frame && !modern_xr_prepared_snapshot(managed_payload))prepare_openxr_render_frame(3);
+    auto frame_lease=managed_frame?modern_xr_frame_cycle().present(g_xr_session,managed_payload):w3vr::xr_frame_cycle::Cycle::Lease{};
+    if(managed_frame && !frame_lease)return;
+
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     XrResult result{XR_SUCCESS};
     bool views_valid{};
@@ -51474,8 +51539,11 @@ void render_openxr_test_frame(
         trace_reason == PoseTimelineEvent::SubmitReal ||
         trace_reason == PoseTimelineEvent::SubmitRescue;
     const bool frame_was_prepared =
-        g_xr_render_frame_prepared.load(std::memory_order_acquire);
-    if (frame_was_prepared) {
+        managed_frame || g_xr_render_frame_prepared.load(std::memory_order_acquire);
+    if(managed_frame){
+        frame_state=managed_payload.state;publication_views=managed_payload.views;
+        views_valid=managed_payload.renderable();located_view_state_flags=managed_payload.flags;
+    } else if (frame_was_prepared) {
         frame_state = g_xr_render_frame_state;
         views_valid = g_xr_render_views_valid;
         located_view_state_flags = g_xr_render_view_state_flags.load(
@@ -51530,6 +51598,8 @@ void render_openxr_test_frame(
             update_runtime_eye_geometry();
         }
     }
+    const std::vector<XrView> frame_views=managed_frame
+        ?std::vector<XrView>(managed_payload.views.begin(),managed_payload.views.end()):g_xr_views;
     // [DIAG:OPENXR-PUBLICATION-POSE 1/1] Record the runtime view located for
     // this exact xrEndFrame display target. PairFactory already records the
     // immutable view used to render the scene, OverlayLatch records the camera
@@ -51835,7 +51905,7 @@ void render_openxr_test_frame(
     const XrView* current_panel_views =
         isolate_publication_pose && !frame_was_prepared
         ? publication_views.data()
-        : g_xr_views.data();
+        : frame_views.data();
     static bool cinema_projection_anchor_valid{};
     static XrPosef cinema_projection_anchor{};
     if (!cinema_panel) {
@@ -51928,6 +51998,8 @@ void render_openxr_test_frame(
     const bool modern_noaa_scene=modern_noaa_output_requested() && !spatial_panel_active;
     ModernNoAASourceUse* modern_sources=nullptr;
     bool submitted = views_valid && frame_state.shouldRender &&
+        (!managed_frame || (managed_payload.ticket.generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
+            modern_xr_frame_cycle().current(managed_payload.ticket))) &&
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire);
     if(modern_noaa_scene){
         modern_sources=submitted ? acquire_modern_noaa_sources({frame_state.predictedDisplayTime,frame_was_prepared}):nullptr;
@@ -52267,12 +52339,12 @@ void render_openxr_test_frame(
                 int calibrated_eye_shifts_y[2]{};
                 float optical_centers[2] = {0.5f, 0.5f};
                 float vertical_optical_centers[2] = {0.5f, 0.5f};
-                bool optical_centers_valid = g_xr_views.size() >= 2;
-                bool vertical_optical_centers_valid = g_xr_views.size() >= 2;
+                bool optical_centers_valid = frame_views.size() >= 2;
+                bool vertical_optical_centers_valid = frame_views.size() >= 2;
                 if (g_config.openxr_mono_eye_shift_auto) {
                     for (uint32_t eye = 0; eye < 2 && optical_centers_valid; ++eye) {
-                        const float tan_left = tanf(g_xr_views[eye].fov.angleLeft);
-                        const float tan_right = tanf(g_xr_views[eye].fov.angleRight);
+                        const float tan_left = tanf(frame_views[eye].fov.angleLeft);
+                        const float tan_right = tanf(frame_views[eye].fov.angleRight);
                         const float span = tan_right - tan_left;
                         optical_centers_valid = std::isfinite(tan_left) && std::isfinite(tan_right) &&
                             span > 0.01f;
@@ -52285,9 +52357,9 @@ void render_openxr_test_frame(
                     for (uint32_t eye = 0;
                         eye < 2 && vertical_optical_centers_valid; ++eye) {
                         const float tan_up =
-                            tanf(g_xr_views[eye].fov.angleUp);
+                            tanf(frame_views[eye].fov.angleUp);
                         const float tan_down =
-                            tanf(g_xr_views[eye].fov.angleDown);
+                            tanf(frame_views[eye].fov.angleDown);
                         const float span = tan_up - tan_down;
                         vertical_optical_centers_valid =
                             std::isfinite(tan_up) &&
@@ -52373,7 +52445,7 @@ void render_openxr_test_frame(
                         projection_width == copy_width &&
                         projection_height == copy_height;
                     for (uint32_t eye = 0; eye < 2; ++eye) {
-                        const XrFovf& target_fov = g_xr_views[eye].fov;
+                        const XrFovf& target_fov = frame_views[eye].fov;
                         const float target_left =
                             tanf(target_fov.angleLeft);
                         const float target_right =
@@ -52589,10 +52661,10 @@ void render_openxr_test_frame(
                         }
                     }
                     if (!g_auto_eye_shift_logged.exchange(true)) {
-                        const XrFovf fov0 = g_xr_views.size() > 0
-                            ? g_xr_views[0].fov : XrFovf{};
-                        const XrFovf fov1 = g_xr_views.size() > 1
-                            ? g_xr_views[1].fov : XrFovf{};
+                        const XrFovf fov0 = frame_views.size() > 0
+                            ? frame_views[0].fov : XrFovf{};
+                        const XrFovf fov1 = frame_views.size() > 1
+                            ? frame_views[1].fov : XrFovf{};
                         log_runtime_stereo_startup(
                             "OpenXR runtime FOV geometry valid_xy=%d,%d "
                             "centers_x=%.6f,%.6f centers_y=%.6f,%.6f "
@@ -53317,9 +53389,9 @@ void render_openxr_test_frame(
                             !copy_loading_mono) {
                             g_stereo_eye_cache_views[eye] = tagged_render_view;
                             g_stereo_eye_cache_view_valid[eye] = true;
-                        } else if (g_config.hmd_freelook && eye < g_xr_views.size() &&
+                        } else if (g_config.hmd_freelook && eye < frame_views.size() &&
                             g_hmd_pose_valid.load()) {
-                            g_stereo_eye_cache_views[eye] = g_xr_views[eye];
+                            g_stereo_eye_cache_views[eye] = frame_views[eye];
                             g_stereo_eye_cache_view_valid[eye] = true;
                         }
                     }
@@ -53776,7 +53848,7 @@ void render_openxr_test_frame(
                     if (asymmetric_optics_requested &&
                         g_hmd_render_fov_valid.load(
                             std::memory_order_acquire) &&
-                        g_xr_views.size() >= 2) {
+                        frame_views.size() >= 2) {
                         const XrFovf content_fov{
                             g_hmd_render_fov_left.load(
                                 std::memory_order_relaxed),
@@ -54038,7 +54110,7 @@ void render_openxr_test_frame(
                     if (symmetric_subimage_requested &&
                         g_hmd_render_fov_valid.load(
                             std::memory_order_acquire) &&
-                        g_xr_views.size() >= 2) {
+                        frame_views.size() >= 2) {
                         const XrFovf content_fov{
                             g_hmd_render_fov_left.load(
                                 std::memory_order_relaxed),
@@ -54451,10 +54523,10 @@ void render_openxr_test_frame(
             }
             XrPosef mono_cyclopean_pose{};
             bool mono_cyclopean_pose_valid{};
-            if (clean_mono_mode(mode) && g_xr_views.size() >= 2) {
+            if (clean_mono_mode(mode) && frame_views.size() >= 2) {
                 const XrView* mono_pose_views = mono_render_views_valid
                     ? mono_render_views
-                    : g_xr_views.data();
+                    : frame_views.data();
                 mono_cyclopean_pose.orientation =
                     mono_pose_views[0].pose.orientation;
                 mono_cyclopean_pose.position = {
@@ -54486,7 +54558,7 @@ void render_openxr_test_frame(
                         g_config.engine_sync_swap_eyes
                     ? 1u - eye
                     : eye;
-                const XrView* render_view = &g_xr_views[render_source_eye];
+                const XrView* render_view = &frame_views[render_source_eye];
                 const char* render_view_origin = "runtime_global";
                 if (direct_stereo) {
                     const auto slot_index = g_streamline_capture_latest_slot[render_source_eye].load();
@@ -54632,13 +54704,13 @@ void render_openxr_test_frame(
                     projection_views[eye].fov = render_view->fov;
                 } else if (full_surface_projection) {
                     projection_views[eye].fov =
-                        clean_mono_mode(mode) && eye < g_xr_views.size()
-                        ? g_xr_views[eye].fov
+                        clean_mono_mode(mode) && eye < frame_views.size()
+                        ? frame_views[eye].fov
                         : render_view->fov;
                 } else {
                     projection_views[eye].fov =
-                        clean_mono_mode(mode) && eye < g_xr_views.size()
-                        ? g_xr_views[eye].fov
+                        clean_mono_mode(mode) && eye < frame_views.size()
+                        ? frame_views[eye].fov
                         : render_view->fov;
                 }
                 projection_views[eye].subImage.swapchain = swapchain.handle;
@@ -55093,7 +55165,7 @@ void render_openxr_test_frame(
         const XrView* anchor_views =
             isolate_publication_pose && !frame_was_prepared
             ? publication_views.data()
-            : g_xr_views.data();
+            : frame_views.data();
         const auto& tracked_orientation =
             anchor_views[0].pose.orientation;
         // [FIX:LEVEL-SPATIAL-PANEL 1/1] Keep panels upright in the LOCAL
@@ -55217,6 +55289,8 @@ void render_openxr_test_frame(
     if(modern_noaa_scene && (!modern_sources || !modern_noaa_sources_current(modern_sources,{frame_state.predictedDisplayTime,frame_was_prepared}) ||
         modern_sources->phase!=w3vr::modern_eye_pair::UsePhase::Pending ||
         !w3vr::modern_eye_pair::finite(modern_sources->fence_value)))submitted=false;
+    if(managed_frame && (!modern_xr_frame_cycle().current(managed_payload.ticket) ||
+        managed_payload.ticket.generation!=g_streamline_capture_generation.load(std::memory_order_acquire)))submitted=false;
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
     end_info.displayTime = frame_state.predictedDisplayTime;
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -55325,7 +55399,8 @@ void render_openxr_test_frame(
         }
     }
     w3vr::minimal_xr_log::write("END_BEGIN", current_present, trace_pair_id, g_xr_fence_value, end_info.layerCount);
-    result = pfn_xrEndFrame(g_xr_session, &end_info);
+    const auto end_call=[&]{return pfn_xrEndFrame(g_xr_session,&end_info);};
+    result=managed_frame?modern_xr_frame_cycle().end(frame_lease,end_call):end_call();
     if(modern_noaa_scene){std::scoped_lock lock{g_modern_prepared_frame_mutex};
         g_modern_prepared_frame.end(frame_state.predictedDisplayTime,XR_SUCCEEDED(result));}
     w3vr::minimal_xr_log::write("END_RETURN", current_present, trace_pair_id, g_xr_fence_value, result);
@@ -56372,9 +56447,13 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             !g_engine_loading_screen_video_active.load(std::memory_order_acquire) &&
             (!g_cinema_mode_active.load(std::memory_order_relaxed) ||
                 (!g_force_mono_cinema.load(std::memory_order_relaxed) && g_config.cinema_full_vr));
+        w3vr::xr_frame_cycle::Payload prepared_payload;
+        const bool managed_ready=modern_xr_prepared_snapshot(prepared_payload);
+        const bool managed_empty=managed_ready && (!prepared_payload.renderable() ||
+            prepared_payload.ticket.generation!=g_streamline_capture_generation.load(std::memory_order_acquire));
         const bool submit_openxr_frame = modern_noaa_scene
-            ? (accepted_new_publication || !g_xr_render_frame_prepared.load(std::memory_order_acquire) ||
-                modern_prepared_frame_cancelled(g_xr_render_frame_state.predictedDisplayTime) ||
+            ? (accepted_new_publication || !managed_ready || managed_empty ||
+                modern_prepared_frame_cancelled(modern_xr_prepared_time()) ||
                 g_modern_noaa_consumer_blocked.load(std::memory_order_acquire))
             : (cinema_detector_due || accepted_new_publication || !g_packed_present_cache_valid || projection_rescue_due);
         if (submit_openxr_frame) {

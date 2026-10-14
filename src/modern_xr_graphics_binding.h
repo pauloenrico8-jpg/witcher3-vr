@@ -57,6 +57,10 @@ public:
         }
         if(!accepting_.load(std::memory_order_acquire))result.reset();return result;
     }
+    bool registered(std::uintptr_t instance,std::uintptr_t session)const {
+        std::lock_guard lock{mutex_};
+        return active_ && active_->instance==instance && active_->session==session;
+    }
     bool current(const Snapshot& snapshot,std::uintptr_t instance,std::uintptr_t session,
         const Graphics& graphics,bool native_verified)const {
         return snapshot && acquire(instance,session,graphics,native_verified).get()==snapshot.get();
