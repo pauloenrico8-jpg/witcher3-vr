@@ -7,16 +7,16 @@ PUBLIC w3vr_temporal_leaf_entry
 w3vr_temporal_leaf_entry PROC FRAME
     pushfq
     .allocstack 8
-    sub rsp,280h
-    .allocstack 280h
+    sub rsp,480h
+    .allocstack 480h
     .endprolog
     mov [rsp+20h],rcx
     mov [rsp+28h],rdx
-    mov rax,[rsp+288h]
+    mov rax,[rsp+488h]
     mov [rsp+30h],rax
     mov qword ptr [rsp+38h],0
     mov qword ptr [rsp+78h],0
-    push qword ptr [rsp+280h]
+    push qword ptr [rsp+480h]
     popfq
     call qword ptr [w3vr_temporal_leaf_original]
     mov [rsp+40h],rax
@@ -42,8 +42,12 @@ w3vr_temporal_leaf_entry PROC FRAME
     vmovdqu ymmword ptr [rsp+220h],ymm13
     vmovdqu ymmword ptr [rsp+240h],ymm14
     vmovdqu ymmword ptr [rsp+260h],ymm15
+    ; Private aligned 512-byte state, outside the C++ observation frame.
+    ; Preserve the post-original environment; do not change its rounding/masks.
+    fxsave64 [rsp+280h]
     lea rcx,[rsp+20h]
     call w3vr_temporal_leaf_after
+    fxrstor64 [rsp+280h]
     vmovdqu ymm0,ymmword ptr [rsp+80h]
     vmovdqu ymm1,ymmword ptr [rsp+0A0h]
     vmovdqu ymm2,ymmword ptr [rsp+0C0h]
@@ -67,7 +71,7 @@ w3vr_temporal_leaf_entry PROC FRAME
     mov r9,[rsp+60h]
     mov r10,[rsp+68h]
     mov r11,[rsp+70h]
-    add rsp,280h
+    add rsp,480h
     popfq
     ret
 w3vr_temporal_leaf_entry ENDP

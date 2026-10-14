@@ -1,5 +1,45 @@
 # Adaptação para Remastered — estado da renderização
 
+## Estado numérico conservado pela observação — 14 de outubro
+
+Um teste próprio encontrou uma diferença: o observador podia mudar o modo de
+arredondamento e as marcas de operações numéricas do processador. Isso foi
+medido num programa separado; não foi uma falha observada no Witcher.
+
+1. A ponte chama a função original uma vez. Depois guarda seus resultados,
+   registros e o estado numérico em uma área alinhada da pilha. Pilha é a memória
+   temporária usada durante essa chamada. O formato entregue ao código C++
+   continua igual; essa área adicional fica privada na ponte.
+2. O observador lê os dados. Quando termina normalmente, a ponte restaura o
+   estado que a função original deixou, incluindo arredondamento, marcas de
+   operações e os registros numéricos x87. x87 é uma parte do processador usada
+   para cálculos. A ponte conserva também as partes superiores dos registros
+   AVX, que guardam vários números juntos. O observador recebe os mesmos modos
+   de cálculo da chamada; a ponte não força outro arredondamento ou máscara.
+3. O controle volta ao chamador. Os metadados da pilha foram ajustados à nova
+   reserva, para o Windows continuar recuperando a chamada de fora corretamente.
+
+Escolhi guardar o estado depois da função original para preservar seus resultados.
+Os testes incluem uma função própria que muda o estado numérico e um observador
+que o altera novamente. Guardar somente a entrada apagaria o resultado original.
+O mecanismo de armazenamento segue o [manual de instruções da Intel](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2a-manual.pdf).
+
+O laboratório simples mediu diferença antes da correção e igualdade depois.
+O teste ampliado também recusou a ponte anterior; a corrigida passou em **2.119
+verificações**, com 96 observações por MinHook real, 96 recuperações de pilha pelo
+Windows, 192 chamadas próprias e três threads. Comparou quatro arredondamentos,
+controles, marcas e dados x87, MXCSR (controle dos cálculos SSE), os sete registros
+inteiros, dezesseis registros AVX e flags aritméticas. Os casos usaram exceções
+numéricas mascaradas; não comprovaram restauração durante exceção que escape do
+observador, todos os estados estendidos da CPU ou parada e descarregamento do jogo.
+
+A DLL compilou e **128 testes passaram em 9.97 segundos**. As funções,
+memória e dados deste teste são próprios; não executaram essa ponte no Witcher,
+SDK, OpenXR ou Quest. **O VR ainda não funciona e Remastered permanece fechado.**
+Nada experimental foi instalado. Continuam necessários a continuidade do
+produtor, a retenção e a ordem dos recursos e duas imagens novas do jogo por
+quadro, antes dos testes no headset e do combate físico.
+
 ## Reinício do histórico antes da preparação do quadro — 14 de outubro
 
 O jogo também pode descartar seu histórico antes de criar o descritor do quadro.
