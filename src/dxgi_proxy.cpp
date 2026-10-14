@@ -39,6 +39,7 @@
 #include "modern_xr_graphics_binding.h"
 #include "openxr_session_events.h"
 #include "openxr_frame_cycle.h"
+#include "openxr_image_protocol.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -1551,6 +1552,10 @@ extern std::atomic<uint32_t> g_streamline_capture_generation;
 // Process-lifetime CPU root; no destruction/COM release from DllMain.
 w3vr::xr_frame_cycle::Cycle& modern_xr_frame_cycle() {
     static auto* cycle=new w3vr::xr_frame_cycle::Cycle;return *cycle;
+}
+w3vr::xr_image::Image* modern_xr_color_image_protocol() {
+    // Numeric process-lifetime state; no runtime/GPU cleanup in DllMain.
+    static auto* image=new(std::nothrow) w3vr::xr_image::Image;return image;
 }
 bool managed_xr_session() {
     auto* registry=modern_xr_graphics_registry();
@@ -52170,6 +52175,19 @@ void render_openxr_test_frame(
         auto& swapchain = g_xr_eye_swapchains[0];
         uint32_t image_index{};
         bool acquired{};
+        const auto image_binding=managed_frame?modern_graphics_snapshot():w3vr::modern_graphics_binding::Snapshot{};
+        const auto image_session=managed_frame?modern_xr_session_graphics(image_binding):w3vr::modern_xr_graphics_binding::Snapshot{};
+        auto* image_protocol=managed_frame?modern_xr_color_image_protocol():nullptr;
+        w3vr::xr_image::Ticket image_ticket;
+        if(managed_frame){
+            submitted=submitted && image_protocol && image_session &&
+                modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
+                swapchain.images.size()>0 && swapchain.images.size()<UINT32_MAX &&
+                image_protocol->begin({modern_target.xr,reinterpret_cast<uintptr_t>(swapchain.handle),
+                    reinterpret_cast<uintptr_t>(image_session->graphics->queue.Get()),managed_payload.ticket.generation,
+                    static_cast<uint32_t>(swapchain.images.size())},image_ticket);
+            if(!submitted)g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        }
         bool command_list_recording{};
         int64_t flight_xr_record_begin{};
         w3vr::pipeline_flight::GpuToken flight_xr_gpu{};
@@ -52211,28 +52229,44 @@ void render_openxr_test_frame(
         }
         XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         if (submitted) {
-            result = pfn_xrAcquireSwapchainImage(
-                swapchain.handle, &acquire_info, &image_index);
-            if (XR_FAILED(result)) {
+            const auto acquire_call=[&](uint32_t& index){return pfn_xrAcquireSwapchainImage(swapchain.handle,&acquire_info,&index);};
+            result=managed_frame?image_protocol->acquire(image_ticket,image_index,acquire_call):acquire_call(image_index);
+            if (XR_FAILED(result) || (managed_frame && !w3vr::xr_image::succeeded(result))) {
                 submitted = false;
             } else {
                 acquired = true;
             }
         }
 
-        if (submitted) {
+        if (submitted || (managed_frame && acquired)) {
             XrSwapchainImageWaitInfo wait_swapchain_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
             wait_swapchain_info.timeout = XR_INFINITE_DURATION;
             const int64_t flight_swapchain_wait_begin =
                 w3vr::pipeline_flight::cpu_begin();
-            result = pfn_xrWaitSwapchainImage(
-                swapchain.handle, &wait_swapchain_info);
+            const auto wait_image_call=[&]{return pfn_xrWaitSwapchainImage(swapchain.handle,&wait_swapchain_info);};
+            result=managed_frame?image_protocol->wait(image_ticket,wait_image_call):wait_image_call();
             w3vr::pipeline_flight::cpu_end(
                 w3vr::pipeline_flight::Phase::XrWaitSwapchain,
                 flight_swapchain_wait_begin);
-            if (XR_FAILED(result)) {
-                submitted = false;
+            if (XR_FAILED(result) || (managed_frame && !w3vr::xr_image::succeeded(result)))submitted=false;
+        }
+        if(managed_frame && submitted){
+            bool layout_ok=image_index<swapchain.images.size() &&
+                static_cast<uint64_t>(image_index)*2+1<swapchain.rtvs.size() &&
+                swapchain.stereo_array && swapchain.width && swapchain.height;
+            if(layout_ok){
+                const auto& image=swapchain.images[image_index];
+                layout_ok=image.type==XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR && !image.next && image.texture &&
+                    modern_graphics_registry()->owns_child(image_binding,image.texture);
+                if(layout_ok){
+                    const auto desc=image.texture->GetDesc();
+                    layout_ok=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.MipLevels==1 &&
+                        desc.DepthOrArraySize==2 && desc.SampleDesc.Count==1 && desc.Width==swapchain.width &&
+                        desc.Height==swapchain.height && desc.Format==swapchain.format;
+                }
             }
+            submitted=layout_ok && modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
+                image_protocol->writable(image_ticket,image_index,layout_ok);
         }
 
         // Open the XR command list only after the complete AFW transaction.
@@ -52263,6 +52297,7 @@ void render_openxr_test_frame(
             }
         }
 
+        if(managed_frame && submitted)submitted=image_protocol->start_recording(image_ticket,image_index,true);
         if (submitted) {
             auto* texture = swapchain.images[image_index].texture;
             if(modern_sources)modern_sources->xr_destination=texture;
@@ -52271,10 +52306,10 @@ void render_openxr_test_frame(
             D3D12_RESOURCE_BARRIER to_rtv{};
             to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             to_rtv.Transition.pResource = texture;
-            to_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            to_rtv.Transition.StateBefore = managed_frame?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_COMMON;
             to_rtv.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
             to_rtv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            g_xr_command_list->ResourceBarrier(1, &to_rtv);
+            if(!managed_frame)g_xr_command_list->ResourceBarrier(1, &to_rtv);
 
             // [FIX:DLSS-SEQUENTIAL 3/4] Mode 3 no longer reads the two latest
             // capture slots directly. update_packed_eye_cache() first promotes
@@ -52346,7 +52381,11 @@ void render_openxr_test_frame(
                 std::swap(to_rtv.Transition.StateBefore, to_rtv.Transition.StateAfter);
                 to_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 to_rtv.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                g_xr_command_list->ResourceBarrier(1, &to_rtv);
+                if(!managed_frame || to_rtv.Transition.StateBefore!=to_rtv.Transition.StateAfter){
+                        if(managed_frame && !image_protocol->transition(image_ticket,
+                            static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
+                        g_xr_command_list->ResourceBarrier(1, &to_rtv);
+                    }
 
                 auto* primary_source = modern_sources ? modern_sources->textures[0].Get()
                     : (direct_stereo ? direct_stereo_sources[0]:game_backbuffer);
@@ -54392,7 +54431,11 @@ void render_openxr_test_frame(
                 }
 
                 std::swap(to_rtv.Transition.StateBefore, to_rtv.Transition.StateAfter);
-                g_xr_command_list->ResourceBarrier(1, &to_rtv);
+                if(!managed_frame || to_rtv.Transition.StateBefore!=to_rtv.Transition.StateAfter){
+                        if(managed_frame && !image_protocol->transition(image_ticket,
+                            static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
+                        g_xr_command_list->ResourceBarrier(1, &to_rtv);
+                    }
 
                 bool fit_projection_ready =
                     projection_direct_copy || projection_black_frame;
@@ -54520,7 +54563,11 @@ void render_openxr_test_frame(
                     std::swap(
                         to_rtv.Transition.StateBefore,
                         to_rtv.Transition.StateAfter);
-                    g_xr_command_list->ResourceBarrier(1, &to_rtv);
+                    if(!managed_frame || to_rtv.Transition.StateBefore!=to_rtv.Transition.StateAfter){
+                        if(managed_frame && !image_protocol->transition(image_ticket,
+                            static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
+                        g_xr_command_list->ResourceBarrier(1, &to_rtv);
+                    }
                 }
             }
 
@@ -55026,7 +55073,7 @@ void render_openxr_test_frame(
             if (SUCCEEDED(close_result)) {
                 ID3D12CommandList* lists[] = {g_xr_command_list};
                 w3vr::minimal_xr_log::write("QUEUE_BEGIN", current_present, trace_pair_id, g_xr_fence_value + 1);
-                auto* submit_queue=modern_sources ? modern_sources->queue.Get():g_command_queue;
+                auto* submit_queue=managed_frame?image_session->graphics->queue.Get():(modern_sources ? modern_sources->queue.Get():g_command_queue);
                 bool execute_admitted=true;
                 if(modern_sources){
                     std::scoped_lock lock{g_streamline_capture_mutex};
@@ -55036,11 +55083,17 @@ void render_openxr_test_frame(
                         modern_xr_session_current(modern_sources->xr_binding,modern_sources->binding) &&
                         g_modern_noaa_source_store.before_execute(modern_sources,submit_queue,1,lists);
                 }
+                if(managed_frame)execute_admitted=execute_admitted &&
+                    modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
+                    modern_xr_session_current(image_session,image_binding) &&
+                    image_protocol->before_execute(image_ticket,reinterpret_cast<uintptr_t>(submit_queue),true,image_protocol->color_ready(image_ticket));
                 if(!execute_admitted){
                     g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
                     submitted=false;
                 }else{
                     submit_queue->ExecuteCommandLists(1, lists);
+                    if(managed_frame && !image_protocol->execution_returned(image_ticket,
+                        reinterpret_cast<uintptr_t>(submit_queue),true,image_protocol->color_ready(image_ticket)))submitted=false;
                     if (fsr_hudless_recorded) {
                         publish_fsr_hudless_xr_color(
                             g_xr_command_allocator_index,
@@ -55069,6 +55122,8 @@ void render_openxr_test_frame(
                     const uint64_t submission = ++g_xr_fence_value;
                     auto* submit_fence=modern_sources ? modern_sources->fence.Get():g_xr_fence;
                     const HRESULT consumer_signal=submit_queue->Signal(submit_fence, submission);
+                    if(managed_frame && !image_protocol->signal(image_ticket,reinterpret_cast<uintptr_t>(submit_queue),
+                        SUCCEEDED(consumer_signal),submission))submitted=false;
                     if (SUCCEEDED(consumer_signal)) {
                         if(modern_sources){
                             std::scoped_lock lock{g_streamline_capture_mutex};
@@ -55133,15 +55188,20 @@ void render_openxr_test_frame(
             puredark_afw_bundle_submitted,
             puredark_afw_bundle_fence);
 
-        if (acquired) {
+        if (acquired && (!managed_frame || image_protocol->releasable(image_ticket))) {
             XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            const auto release_result = pfn_xrReleaseSwapchainImage(swapchain.handle, &release_info);
+            const auto release_call=[&]{return pfn_xrReleaseSwapchainImage(swapchain.handle,&release_info);};
+            const auto release_result=managed_frame?image_protocol->release(image_ticket,release_call):release_call();
             if (XR_FAILED(release_result)) {
                 log_taau_trace_line("OpenXR xrReleaseSwapchainImage stereo-array image=%u result=%s (%d)",
                     image_index,
                     xr_result_name(release_result),
                     release_result);
             }
+        }
+        if(managed_frame){
+            submitted=submitted && image_protocol->layer_allowed(image_ticket);
+            if(image_protocol && image_protocol->pending())g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
         }
     }
 
