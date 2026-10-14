@@ -7,6 +7,51 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Disponibilidade e devolução da imagem VR — 14 de outubro
+
+O caminho moderno ganhou confirmações separadas para receber, esperar, desenhar,
+enviar e devolver uma imagem do headset. O código não considera a aquisição
+sozinha como permissão de desenho.
+
+O fluxo, passo a passo:
+
+1. openxr_image_protocol.h liga a imagem à sessão, ao quadro, à fila gráfica e
+   à cadeia de imagens. Guarda o índice retornado e o resultado original.
+   Uma confirmação antiga ou de outra thread não altera a operação atual.
+2. Depois da aquisição, espera pela disponibilidade. Timeout e falha deixam a
+   imagem pendente, sem desenho nem devolução indevida. Perda de sessão permite
+   apenas a devolução de uma imagem disponibilizada e não publica uma camada.
+3. dxgi_proxy.cpp confere índice, duas posições de desenho, formato, dimensões
+   e origem antes de acessar a textura. No OpenXR com DirectX 12, a espera
+   bem-sucedida entrega a imagem de cor no estado de desenho. Por isso o caminho
+   moderno não inventa uma transição inicial a partir de COMMON.
+   [Regra oficial](https://registry.khronos.org/OpenXR/specs/1.1/man/html/XR_KHR_D3D12_enable-swapchain-image-state.html).
+4. Acompanha as três transições de cor conhecidas do host, exige retorno ao
+   estado de desenho e envia pela fila conservada da sessão. Guarda a confirmação
+   de envio e de seu sinal. Essa confirmação não significa que a GPU terminou.
+5. Só devolve uma imagem disponibilizada, sem execução desconhecida. Uma lista
+   que não chegou a ser enviada pode ser descartada sem presumir alterações
+   executadas. Depois de envio, exige as confirmações correspondentes.
+   A apresentação também exige sucesso na devolução.
+
+Escolhi separar essas confirmações porque o tratamento anterior aceitava
+timeout como disponibilidade, tentava devolver após falha de espera e apenas
+registrava falha de devolução, sem impedir a apresentação.
+
+A DLL compilou e **126 testes passaram em 13,08 segundos**. O novo teste fez
+**148 conferências próprias** sobre índice, disponibilidade, transições de cor,
+fila, sinal, devolução, pendências e retornos antigos. Os handles, retornos e
+confirmações de estado foram **simulados**; não executou OpenXR real, callbacks
+do host no Witcher, SDK, GPU ou Quest. A suíte gráfica própria anterior permanece.
+
+**O VR ainda não funciona.** Remastered continua fechado; nada experimental foi
+instalado. Em falha desconhecida, o código conserva a pendência e fecha novas
+aquisições. A recuperação por encerramento e recriação ainda precisa de prova
+de vida útil e conclusão real; não há recuperação automática por tempo.
+A confirmação de transição cobre os três pontos conhecidos do host, não todos
+os possíveis escritores externos. Este caminho trata imagem de cor; profundidade,
+recursos do motor, encerramento completo e teste real continuam pendentes.
+
 ## Identidade conservada nas imagens dos dois olhos — 14 de outubro
 
 O horário do desenho pode se repetir depois de reiniciar a sessão. Por isso,
