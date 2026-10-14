@@ -42463,7 +42463,8 @@ void finish_remastered_temporal_source(RemasteredTemporalSourceTicket& ticket,vo
 }
 // Exact two-pointer leaf. Observe AFTER Original; assembly restores registers
 // that an ordinary C++ hook is allowed to destroy, including the caller's R8.
-bool read_normal_reset_route(uintptr_t owner,uintptr_t module,uintptr_t history,uintptr_t& director) {
+bool read_normal_reset_route(uintptr_t owner,uintptr_t module,uintptr_t history,uintptr_t& director,
+    w3vr::temporal_source::SourceSite site) {
     namespace fc=w3vr::factory_clock;
     if(!owner || (owner&7) || owner>UINTPTR_MAX-0x121)return false;
     __try {
@@ -42476,36 +42477,56 @@ bool read_normal_reset_route(uintptr_t owner,uintptr_t module,uintptr_t history,
         if(!d || (d&7) || d>UINTPTR_MAX-0x7FB || history!=d+0x6D0)return false;
         const auto table=*reinterpret_cast<const uintptr_t*>(d);
         if((table!=module+0x3989EA8 && table!=module+0x3810308) ||
-            *reinterpret_cast<const uint8_t*>(d+0x6C0)!=0)return false;
+            (site==w3vr::temporal_source::SourceSite::descriptor_getter &&
+                *reinterpret_cast<const uint8_t*>(d+0x6C0)!=0))return false;
         director=d;return true;
     }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 extern "C" void w3vr_temporal_leaf_after(w3vr::temporal_leaf::Frame* frame) {
-    namespace fc=w3vr::factory_clock;
+    namespace fc=w3vr::factory_clock;namespace ts=w3vr::temporal_source;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     auto* producer=g_remastered_producer_scope;
     const uintptr_t module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     if(!frame || contract!=&w3vr::engine_camera::remastered_1048522 ||
         !g_current_temporal_reset_ready.load(std::memory_order_acquire) ||
-        !remastered_scope_current(producer,contract) || frame->caller!=module+w3vr::temporal_source::reset_return ||
-        frame->source!=module+w3vr::temporal_source::reset_source)return;
-    w3vr::native_caller_context::Snapshot root{};
-    if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
-        module+fc::current.fragment,24},root) || root.rbp<0x80)return;
-    const uintptr_t descriptor=root.rbp-0x80;
+        !remastered_scope_current(producer,contract) || frame->source!=module+ts::reset_source)return;
+    const bool early=frame->caller==module+ts::producer_reset_return;
+    if(!early && frame->caller!=module+ts::reset_return)return;
     fc::BorrowedScope clock;
-    if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,descriptor,
-        clock,fc::CallSite::descriptor_constructor) ||
-        clock.borrowed_caller().rdi!=reinterpret_cast<uintptr_t>(producer->game))return;
-    w3vr::temporal_source::ResetCandidate c{contract,module,descriptor,reinterpret_cast<uintptr_t>(producer->game),
-        0,frame->destination,frame->source,GetCurrentThreadId()};
+    fc::windows::OwnerObservation owner_clock{},repeated_owner{};fc::Sample repeated_sample{};
+    ts::ResetCandidate c{contract,module,0,reinterpret_cast<uintptr_t>(producer->game),
+        0,frame->destination,frame->source,GetCurrentThreadId()};c.caller=frame->caller;
+    if(early){
+        c.site=ts::SourceSite::producer_update;
+        if(!fc::windows::module_matches(fc::selected(contract),module))return;
+        __try {
+            if(std::memcmp(reinterpret_cast<const void*>(module+ts::producer_reset_setup_rva),
+                ts::producer_reset_setup_pin.data(),ts::producer_reset_setup_pin.size()))return;
+        }__except(EXCEPTION_EXECUTE_HANDLER){return;}
+        if(!fc::windows::read_owner(fc::selected(contract),module,c.owner,owner_clock,c.clock))return;
+    }else{
+        w3vr::native_caller_context::Snapshot root{};
+        if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
+            module+fc::current.fragment,24},root) || root.rbp<0x80)return;
+        c.descriptor=root.rbp-0x80;
+        if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,c.descriptor,
+            clock,fc::CallSite::descriptor_constructor) || clock.borrowed_caller().rdi!=c.owner ||
+            !clock.sample(c.thread,c.clock))return;
+    }
     w3vr::engine_camera::TemporalRecord canonical{},copied{};uintptr_t repeated{};
-    const bool observed=clock.sample(c.thread,c.clock) && read_normal_reset_route(c.owner,module,c.history,c.director) &&
+    const bool route=read_normal_reset_route(c.owner,module,c.history,c.director,c.site) &&
         read_normal_temporal_record(c.source,canonical) && read_normal_temporal_record(c.history,copied) &&
-        fc::windows::revalidate(contract,clock) && read_normal_reset_route(c.owner,module,c.history,repeated) &&
-        repeated==c.director && producer==g_remastered_producer_scope && remastered_scope_current(producer,contract) &&
-        g_current_temporal_reset_ready.load(std::memory_order_acquire);
-    producer->temporal_source.capture_reset(c,canonical,copied,frame->integer[0],observed);
+        read_normal_reset_route(c.owner,module,c.history,repeated,c.site) && repeated==c.director;
+    const bool clock_current=early
+        ? fc::windows::read_owner(fc::selected(contract),module,c.owner,repeated_owner,repeated_sample) &&
+            repeated_owner==owner_clock
+        : fc::windows::revalidate(contract,clock);
+    const bool observed=route && clock_current && producer==g_remastered_producer_scope &&
+        remastered_scope_current(producer,contract) && g_current_temporal_reset_ready.load(std::memory_order_acquire);
+    const bool captured=producer->temporal_source.capture_reset(c,canonical,copied,frame->integer[0],observed);
+    if(captured && early){producer->temporal_owner_clock=owner_clock;producer->temporal_owner_staged=true;}
+    // Reset clock identifies the CPU producer; it is never a NativeBuilder time.
+    // Assembly already called Original once and restores the exact leaf results.
 }
 bool current_temporal_reset_prefix_matches(uintptr_t module) {
     if(!w3vr::factory_clock::windows::module_matches(&w3vr::factory_clock::current,module))return false;
