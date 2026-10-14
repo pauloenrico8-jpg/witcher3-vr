@@ -54,6 +54,7 @@ void exact_session(Fixture& f){
     require(!session.acquire(1,2,graphics,true) && !session.begin(graphics,1,true,out),"Create-only or retry admitted");
     auto wrong=ticket;wrong.nonce++;require(!session.complete(wrong,true,2,graphics,true),"Foreign completion admitted");
     require(session.complete(ticket,true,2,graphics,true),"Exact completion failed");
+    require(session.registered(1,2) && !session.registered(2,2) && !session.registered(1,3),"Registered identity confused with other session");
     auto fixed=session.acquire(1,2,graphics,true);require(fixed && fixed->graphics.get()==graphics.get(),"Session did not retain creation graph");
     require(!session.complete(ticket,true,2,graphics,true),"Completion callback repeated");
     require(!session.acquire(3,2,graphics,true) && !session.acquire(1,3,graphics,true) &&
@@ -72,6 +73,7 @@ void exact_session(Fixture& f){
     auto foreign=other_session.acquire(1,2,graphics,true);require(!session.current(foreign,1,2,graphics,true),"Copied/equal foreign session snapshot admitted");
     session.stop_no_release();require(!session.current(fixed,1,2,graphics,true) &&
         fixed->graphics->queue.Get()==f.queue.Get(),"Revocation admitted submission or released borrowed snapshot");
+    require(session.registered(1,2),"Revoked managed session escaped to legacy classification");
     require(!session.begin(graphics,1,true,out),"Revoked root retargeted or retried");
 }
 void sticky_failure(Fixture& f){
