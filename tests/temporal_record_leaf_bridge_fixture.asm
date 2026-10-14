@@ -1,8 +1,12 @@
 option casemap:none
 PUBLIC temporal_leaf_fixture
+PUBLIC temporal_leaf_fixture_fp_result
 PUBLIC temporal_leaf_fixture_clobber
 PUBLIC temporal_leaf_fixture_invoke
 PUBLIC temporal_leaf_fixture_after_call
+PUBLIC temporal_leaf_fixture_invoke_fp
+PUBLIC temporal_leaf_fixture_seed_fp
+PUBLIC temporal_leaf_fixture_clobber_fp
 .code
 temporal_leaf_fixture PROC
     REPT 16
@@ -16,6 +20,22 @@ temporal_leaf_fixture PROC
     mov rax,rcx
     ret
 temporal_leaf_fixture ENDP
+; OWN original also changes floating results, without changing arithmetic flags.
+; Saving before the original would incorrectly erase these results.
+temporal_leaf_fixture_fp_result PROC
+    REPT 16
+        nop
+    ENDM
+    vmovdqu xmm0,xmmword ptr [rdx]
+    vmovdqu xmmword ptr [rcx],xmm0
+    mov rax,[rcx+18h]
+    lea rax,[rax+1]
+    mov [rcx+18h],rax
+    fchs
+    cvtsi2ss xmm1,r8
+    mov rax,rcx
+    ret
+temporal_leaf_fixture_fp_result ENDP
 temporal_leaf_fixture_clobber PROC
     xor rax,rax
     xor rcx,rcx
@@ -128,4 +148,55 @@ temporal_leaf_fixture_after_call::
     pop rbx
     ret
 temporal_leaf_fixture_invoke ENDP
+
+; OWN floating environment harness. The called fixture/bridge remains two-pointer.
+; Save the C++ caller's environment, seed another one, capture immediately, restore.
+temporal_leaf_fixture_invoke_fp PROC FRAME
+    push rbx
+    .pushreg rbx
+    push rsi
+    .pushreg rsi
+    push rdi
+    .pushreg rdi
+    push r12
+    .pushreg r12
+    sub rsp,228h
+    .allocstack 228h
+    .endprolog
+    mov rbx,rcx
+    mov rsi,rdx
+    mov rdi,r8
+    mov r12,r9
+    fxsave64 [rsp+20h]
+    fxrstor64 [rdi]
+    mov rcx,rbx
+    mov rdx,rsi
+    call temporal_leaf_fixture_invoke
+    fxsave64 [r12]
+    fxrstor64 [rsp+20h]
+    add rsp,228h
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+temporal_leaf_fixture_invoke_fp ENDP
+; Real x87 values/status/tag state, made entirely by OWN instructions.
+temporal_leaf_fixture_seed_fp PROC
+    fninit
+    fld1
+    fldz
+    fldpi
+    fldln2
+    fcom st(1)
+    ret
+temporal_leaf_fixture_seed_fp ENDP
+; Deliberately damages control, status, tags and x87 data in the observer.
+temporal_leaf_fixture_clobber_fp PROC
+    fninit
+    fld1
+    fldpi
+    faddp st(1),st(0)
+    ret
+temporal_leaf_fixture_clobber_fp ENDP
 END
