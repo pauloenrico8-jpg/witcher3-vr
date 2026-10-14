@@ -1,4 +1,41 @@
 # Adaptação para Remastered — estado da renderização
+
+## Confirmação da GPU antes de reutilizar a memória — 14 de outubro
+
+Corrigi a espera que antecede a reutilização da memória dos comandos gráficos.
+Um evento do Windows pode despertar por outra notificação; isso sozinho não
+comprova que a GPU terminou o trabalho que usa aquela memória.
+
+O fluxo, passo a passo:
+
+1. xr_fence_completion.h recebe o número do envio que precisa terminar. Número
+   zero indica memória sem envio; o marcador de envio desconhecido é recusado.
+2. Consulta o sinal de conclusão da GPU. O valor reservado que indica perda do
+   dispositivo é recusado, mesmo sendo maior que o número esperado.
+   [Regra oficial](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12fence-getcompletedvalue).
+3. Se ainda falta concluir, registra a espera e aguarda o evento. Depois de
+   despertar, consulta novamente o mesmo sinal e exige o número esperado.
+   Timeout, falha e notificação antiga não autorizam reutilizar a memória.
+4. dxgi_proxy.cpp usa esse helper na espera anterior ao Reset do alocador.
+   Alocador é a memória que guarda os comandos que a GPU ainda pode estar lendo.
+   O Reset continua condicionado ao sucesso dessa espera.
+
+Escolhi conferir novamente o sinal porque o retorno do evento é apenas uma
+notificação. A decisão de reutilizar depende da conclusão do envio correto.
+
+A DLL compilou e **127 testes passaram em 13,11 segundos**. O teste novo fez
+**766 conferências**, incluindo duas filas DirectX reais, uma cópia bloqueada
+na GPU, um evento real acionado antes da conclusão e a leitura dos **512 bytes**
+corretos depois da conclusão. A memória foi reutilizada uma vez, após a confirmação.
+Os valores de dispositivo perdido e outros resultados de falha foram simulados.
+Não executou OpenXR real, os callbacks do host no Witcher, SDK ou Quest.
+
+**O VR ainda não funciona.** Esta correção não prova a proteção das interfaces
+na destruição, que todos os envios usam uma única fila, nem a vida útil dos
+recursos do motor. Remastered continua fechado e nada experimental foi instalado.
+A recuperação das imagens pendentes, os estados dos comandos auxiliares e as
+imagens reais de ambos os olhos ainda precisam ser concluídos e verificados.
+
 ## Protocolo de imagem de cor do OpenXR no caminho moderno
 
 openxr_image_protocol.h conserva aquisição, espera bem-sucedida, índice,
