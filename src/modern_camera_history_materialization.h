@@ -11,7 +11,7 @@ inline bool materialize(const Plan& plan,const temporal_source::Observation& sou
     factory_clock::Values values{};values.ticks=plan.clock.ticks;values.scale=plan.clock.scale;
     factory_clock::Sample converted{};
     if(!plan.ticket || !accepted(plan.inputs) || !layout || canonical_invalid[0]!=0 ||
-        static_cast<unsigned>(plan.reset)>static_cast<unsigned>(ResetReason::clock) ||
+        static_cast<unsigned>(plan.reset)>static_cast<unsigned>(ResetReason::session) ||
         !factory_clock::sample_from(values,converted) || !temporal_source::same_float(converted.time,plan.clock.time) ||
         !modern_camera_pose::prepared_for(pair,c,plan.inputs.identity.display_time) ||
         source.clock.ticks!=plan.clock.ticks || source.clock.scale!=plan.clock.scale ||

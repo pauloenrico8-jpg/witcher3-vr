@@ -48,7 +48,7 @@ struct Store {
         if(!r || !r->binding || !modern_eye_pair::finite(r->binding->epoch) || !r->source || !r->destination ||
             !r->command || r->source.Get()==r->destination.Get() ||
             !modern_eye_pair::known(r->key.identity.profile) || !r->key.identity.renderer ||
-            !r->key.identity.frame.frame || !r->key.identity.frame.generation ||
+            !xr_frame::valid(r->key.identity.frame.xr) || !r->key.identity.frame.frame || !r->key.identity.frame.generation ||
             !modern_eye_pair::finite(r->key.identity.frame.pair) || r->key.identity.frame.eye<0 ||
             r->key.identity.frame.eye>1 || !r->key.identity.frame.view_valid ||
             !r->key.identity.frame.normal_factory_lineage || !modern_eye_pair::finite(r->key.recording_epoch) ||

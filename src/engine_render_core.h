@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine_camera_temporal.h"
+#include "xr_frame_identity.h"
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -73,6 +74,7 @@ struct FrameLabel {
     int eye{-1};
     bool view_valid{}, normal_factory_lineage{};
     std::int64_t display_time{}; // Frozen runtime pose time, not CPU/GPU completion.
+    xr_frame::Identity xr{};
 };
 inline bool accepts_frame_identity(std::uintptr_t frame,
     const FrameLabel* label, std::uint32_t current_generation) {
