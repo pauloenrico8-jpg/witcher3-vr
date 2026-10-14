@@ -1,4 +1,34 @@
 # Adaptação para Remastered — estado da renderização
+## Coordenação de quadros nas sessões modernas
+
+openxr_frame_cycle.h serializa a espera separadamente de início/fim e mantém
+um único quadro próprio em andamento. Seus escopos recusam chamadas repetidas,
+outras threads usando a mesma permissão, ordem inválida e novos quadros após
+falha. Os dados publicados são cópias sem ponteiros de extensão. O apresentador
+e a fábrica moderna consultam o conjunto correspondente; o apresentador usa
+uma cópia local das duas visões.
+
+A identidade registrada em modern_xr_graphics_binding.h persiste após revogação
+somente para classificação da sessão. Não equivale a permissão gráfica. A parada
+fecha novas entradas e aguarda, por consultas posteriores sem espera bloqueante,
+a saída dos escopos próprios antes de chamar xrEndSession no estado STOPPING.
+Estado da sessão e registro de início são atômicos; consultas de eventos usam
+uma proteção comum. Erro/retorno inesperado/exceção não rearma.
+
+Validação: DLL compilada; 125/125 CTest em 13,33s; 232 verificações próprias de
+ordem, concorrência, cópias, falhas e descarte. Resultados e objetos OpenXR
+simulados. O teste gráfico próprio agora tem 54 verificações, incluindo duas
+novas sobre identidade registrada; não é integração Game/SDK/Quest.
+
+Limites: número de sessão/quadro ainda não propagado por todos os registros
+NativeGame, histórico, tickets de cópia e sinais GPU. O descarte de um producer
+não torna antigos outputs aceitáveis. Essa etapa não prova todos os callers,
+input/haptic concorrente, efeitos de callbacks do host, shutdown, loader ou
+barreira externa de todas as chamadas. Não altera o gate, não adiciona
+NativeBuilder e não instala código experimental. Próximo passo: vincular a
+identidade completa ao producer e consumidor de imagens, incluindo parada e
+reinício; depois estados/fences/fila da sessão e execução NativeGame.
+
 ## Eventos e encerramento da sessão correta — 13 de outubro
 
 Um aviso de mudança de sessão só pode alterar a sessão a que pertence. O mod

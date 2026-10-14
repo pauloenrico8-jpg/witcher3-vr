@@ -7,6 +7,51 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Preparação e apresentação do mesmo quadro — 14 de outubro
+
+O mod ganhou um coordenador próprio para as sessões modernas que já conservaram
+a ligação gráfica. Ele controla quem prepara e quem apresenta um quadro, para
+que duas chamadas simultâneas não substituam os dados uma da outra.
+
+O fluxo, passo a passo:
+
+1. openxr_frame_cycle.h reserva um quadro com identidade da sessão, número de
+   início da sessão, número exclusivo do quadro e geração das imagens. Uma
+   segunda preparação é recusada enquanto a primeira estiver em andamento ou
+   o quadro estiver aguardando apresentação.
+2. A espera do headset e o início/fim do quadro usam proteções separadas.
+   Nenhuma chamada ao headset acontece segurando a proteção dos dados internos.
+   Escolhi separar essas partes porque uma espera pode depender de um início
+   ainda não executado. [Regra do OpenXR](https://registry.khronos.org/OpenXR/specs/1.1/man/html/xrWaitFrame.html).
+3. Depois de localizar a cabeça, guarda cópias do horário e das duas visões.
+   dxgi_proxy.cpp usa esse conjunto congelado na apresentação e na reserva da
+   fábrica moderna. Só um apresentador recebe o quadro; outro não inicia uma
+   nova espera para substituí-lo. A sessão registrada continua reconhecida
+   mesmo se a permissão gráfica for revogada; não cai no caminho antigo.
+4. Um quadro sem visão válida, sem permissão de desenho ou com resultado de
+   descarte é encerrado sem camadas de imagem. Falhas e exceções fecham a
+   sequência até um encerramento de sessão confirmado. Um resultado positivo
+   inesperado não autoriza a continuação. [Início do quadro](https://registry.khronos.org/OpenXR/specs/1.1/man/html/xrBeginFrame.html).
+5. Ao parar, recusa novas entradas e conserva as chamadas já admitidas até elas
+   saírem. A consulta de eventos tenta encerrar a sessão depois dessa saída,
+   sem ficar esperando enquanto segura uma proteção necessária às chamadas.
+   Uma falha de encerramento não reabre a sessão. [Encerramento da sessão](https://registry.khronos.org/OpenXR/specs/1.1/man/html/xrEndSession.html).
+
+A DLL compilou e **125 testes passaram em 13,33 segundos**. O teste novo fez
+**232 conferências**, incluindo threads reais do programa próprio, preparação
+bloqueada, apresentador simultâneo, parada, reinício, recusas, cópias e exceções.
+Os horários, sessões e retornos da interface VR foram **simulados**. O teste de
+ligação gráfica fez 54 conferências com objetos DirectX próprios e sessão VR
+simulada; duas conferências novas verificam a classificação após revogação.
+
+**O VR ainda não funciona.** Não executou callbacks do host no Witcher, OpenXR
+real, SDK ou Quest. Nada experimental foi instalado; Remastered continua
+fechado. Essa proteção cobre as entradas modernas ligadas ao coordenador.
+Ainda falta levar o número exclusivo da sessão/quadro pelas tarefas do jogo
+até as duas imagens copiadas, testar o caminho real e proteger o restante
+das chamadas, recursos e encerramento. As referências e o contador de chamadas
+não comprovam término da placa de vídeo nem permitem descarregar a DLL.
+
 ## Eventos e encerramento da sessão correta — 13 de outubro
 
 Um aviso de mudança de sessão só pode alterar a sessão a que pertence. O mod
