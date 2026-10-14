@@ -1,4 +1,32 @@
 # Adaptação para Remastered — estado da renderização
+## Protocolo de imagem de cor do OpenXR no caminho moderno
+
+openxr_image_protocol.h conserva aquisição, espera bem-sucedida, índice,
+identidade do quadro, cadeia e fila. Root numérico tem vida do processo; não
+retém recursos NativeGame/GPU nem faz limpeza em DllMain. A disponibilidade
+aceita somente XR_SUCCESS ou XR_SESSION_LOSS_PENDING; perda limita a limpeza.
+Timeout/falha não libera a aquisição nem concede desenho; falha de release
+fecha a camada. Execução é marcada antes da chamada e confirmada depois, com
+sinal exato na fila conservada. Sem execução, espera confirma o estado original.
+
+Host confere bounds de images/RTVs, tipo/ponteiro, dispositivo, dimensões, formato,
+mip, duas slices e amostra única. Wait D3D12 fornece color RT; moderno não grava
+COMMON->RT. Três pontos de transição conhecidos são acompanhados; RT->RT não
+grava barreira. Antes Execute exige RT restaurado, Close e fila correta; antes
+Release exige disponibilidade e confirmações de envio. Resultado original das
+três funções do OpenXR é conservado; cada callback admitido ocorre uma vez.
+
+Validação: DLL compilada,126/126 CTest13,08s,148 conferências CPU próprias.
+Handles/retornos/receipts fabricados, sem execução no host/Game/SDK/Quest.
+Gate4.04 somente, Remastered fechado, nada instalado.
+
+Limites: profundidade não integrada; timeout/erro permanece fechado sem retarget
+ou reset automático. Recuperação/destruição exige protocolo externo de runtime,
+GPU, all-calls e loader. Rastreamento das transições conhecidas não prova todos
+os writers/commands/callers. Sinal enfileirado não é fence concluída. Próximo:
+drain/cancel/stop/resize e proteção real da imagem/fila/allocator/source; execução
+Game só quando port e autorização necessários estiverem completos.
+
 ## Identidade de sessão e quadro nos olhos e históricos
 
 xr_frame_identity.h fornece identidade numérica própria (sessão, início e
