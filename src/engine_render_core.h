@@ -72,6 +72,7 @@ struct FrameLabel {
     std::uint64_t pair{};
     int eye{-1};
     bool view_valid{}, normal_factory_lineage{};
+    std::int64_t display_time{}; // Frozen runtime pose time, not CPU/GPU completion.
 };
 inline bool accepts_frame_identity(std::uintptr_t frame,
     const FrameLabel* label, std::uint32_t current_generation) {

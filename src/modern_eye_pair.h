@@ -23,7 +23,7 @@ inline bool same(const Output& a,const Output& b){
     const auto fields=[](const Output& o){return std::tuple{
         o.identity.profile,o.identity.renderer,o.identity.frame.frame,o.identity.frame.generation,
         o.identity.frame.pair,o.identity.frame.eye,o.identity.frame.view_valid,
-        o.identity.frame.normal_factory_lineage,o.texture,o.command,o.producer,o.fence,o.consumer,
+        o.identity.frame.normal_factory_lineage,o.identity.frame.display_time,o.texture,o.command,o.producer,o.fence,o.consumer,
         o.recording_epoch,o.submitted_epoch,o.serial,o.fence_value,o.source_eye,o.source_eye_valid,
         o.view_valid,o.initialized,o.recording_pending,o.ordered,o.binding_epoch};};
     return fields(a)==fields(b);
@@ -36,6 +36,7 @@ inline bool accepts(const Pair& outputs,const engine_camera::TemporalContract* c
     for(std::uint32_t eye=0;eye<2;++eye){
         const auto& o=outputs[eye];
         if(!modern_eye_capture::admits(o.identity,contract,installed,ready,generation) ||
+            o.identity.frame.display_time<=0 || o.identity.frame.display_time==INT64_MAX ||
             o.identity.frame.eye!=static_cast<int>(eye) || o.source_eye!=eye || !o.source_eye_valid ||
             !o.view_valid || !o.texture || !o.command || !o.producer || !o.fence || o.consumer!=consumer ||
             !finite(o.recording_epoch) || o.recording_epoch!=o.submitted_epoch || !finite(o.serial) ||
@@ -44,10 +45,19 @@ inline bool accepts(const Pair& outputs,const engine_camera::TemporalContract* c
     return outputs[0].identity.renderer==outputs[1].identity.renderer &&
         outputs[0].identity.frame.frame!=outputs[1].identity.frame.frame &&
         outputs[0].identity.frame.pair==outputs[1].identity.frame.pair &&
+        outputs[0].identity.frame.display_time==outputs[1].identity.frame.display_time &&
         outputs[0].identity.frame.pair>last_pair && outputs[0].texture!=outputs[1].texture &&
         outputs[0].serial!=outputs[1].serial;
     // Two different lists are NOT required: one real recording can contain two
     // ordered copies. Their individual serials/physical eyes remain distinct.
+}
+// The caller supplies the actual xrWaitFrame/xrBeginFrame target captured
+// for publication. Do not synthesize it from clock/Present cadence.
+struct Target {std::int64_t display_time{};bool prepared{};};
+inline bool matches_target(const Pair& outputs,Target target) {
+    return target.prepared && target.display_time>0 && target.display_time!=INT64_MAX &&
+        outputs[0].identity.frame.display_time==target.display_time &&
+        outputs[1].identity.frame.display_time==target.display_time;
 }
 struct Route {
     bool mode3{}, noaa{}, dual{}, aer{}, panel{}, delayed_scene{};
@@ -77,6 +87,12 @@ public:
         last_serials_={outputs[0].serial,outputs[1].serial};
         profile_=installed;generation_=generation;last_attempt_=outputs[0].identity.frame.pair;
         active_={outputs,++nonce_};claim=active_;return true;
+    }
+    bool begin_for_frame(const Pair& outputs,const engine_camera::TemporalContract* contract,
+        const render_core::Profile* installed,bool ready,std::uint32_t generation,
+        std::uintptr_t consumer,std::uint64_t binding_epoch,const Route& route,Target target,Claim& claim){
+        return matches_target(outputs,target) && begin(outputs,contract,installed,ready,generation,
+            consumer,binding_epoch,route,claim);
     }
     bool current(const Claim& claim,const engine_camera::TemporalContract* contract,
         const render_core::Profile* installed,bool ready,std::uint32_t generation,std::uintptr_t consumer,std::uint64_t binding_epoch)const{
