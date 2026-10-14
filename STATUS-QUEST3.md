@@ -7,6 +7,51 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Identidade conservada nas imagens dos dois olhos — 14 de outubro
+
+O horário do desenho pode se repetir depois de reiniciar a sessão. Por isso,
+o caminho moderno agora conserva também a sessão, o número de seu início e
+o número exclusivo do quadro.
+
+O fluxo, passo a passo:
+
+1. xr_frame_identity.h guarda esses três números próprios. O coordenador
+   fornece os números do quadro que realmente reservou; eles não são calculados
+   a partir do horário ou do número de apresentações da janela.
+2. dxgi_proxy.cpp leva a mesma identificação para a fábrica, os rótulos das
+   tarefas, as cópias de imagem e o pedido de apresentação. Confere novamente
+   nas entradas conhecidas de câmera e visibilidade, na cópia, na publicação
+   e antes de enviar e encerrar. Uma sessão revogada não ganha outra identidade.
+3. modern_eye_capture.h, modern_backbuffer_source.h e modern_eye_pair.h
+   conservam a identificação copiada. Os dois olhos devem pertencer ao mesmo
+   quadro e coincidir com o pedido do apresentador. Uma imagem de outro início
+   de sessão é recusada mesmo se horário, geração e nome do par coincidirem.
+   Tentativas já aceitas são consumidas uma vez; renomear o par não as renova.
+4. modern_prepared_frame.h compara a identificação completa na reserva e no
+   encerramento. Cancelamento ou retorno antigo não pode retirar a reserva
+   de outro quadro com o mesmo horário.
+5. modern_camera_history.h recomeça os quatro históricos ao mudar de início de
+   sessão. Recusa entradas antigas mesmo com horários maiores; conserva a
+   regra de geração e os números crescentes. O primeiro quadro da nova sessão
+   recebe históricos inválidos próprios, preservando as regras anteriores.
+
+Escolhi levar o identificador inteiro porque comparar apenas o horário deixava
+a possibilidade de confundir uma imagem antiga com o novo quadro após reinício.
+Os números comprovam correspondência dos registros próprios; não retêm objetos
+do jogo nem demonstram pixels desenhados.
+
+A DLL compilou; **125 testes passaram em 14,69 segundos**. Os testes de pares,
+captura e histórico somam 49 conferências novas (totais 598, 59 e 1033,
+respectivamente). Usaram dados e identidades VR **simulados**, incluindo mistura
+entre olhos, reinício com horário igual, retorno antigo e reinício do histórico.
+A suíte conservou o teste gráfico independente com objetos e cópias DirectX
+próprios; seus identificadores de quadro continuam simulados.
+
+**O VR ainda não funciona.** Não executou os callbacks do host no Witcher,
+OpenXR real, SDK ou Quest. Remastered continua fechado e nada experimental foi
+instalado. Ainda faltam estados e conclusão das imagens reais, continuidade do
+produtor, recursos e encerramento completo, além das mãos e combate no jogo.
+
 ## Preparação e apresentação do mesmo quadro — 14 de outubro
 
 O mod ganhou um coordenador próprio para as sessões modernas que já conservaram

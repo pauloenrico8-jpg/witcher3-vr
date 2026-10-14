@@ -1,4 +1,33 @@
 # Adaptação para Remastered — estado da renderização
+## Identidade de sessão e quadro nos olhos e históricos
+
+xr_frame_identity.h fornece identidade numérica própria (sessão, início e
+quadro), copiada do ticket do coordenador. FrameLabel, EngineFrameTag, pedido
+de cópia, SourceStore, publicação e Target conservam a mesma identidade.
+A fábrica moderna liga a reserva e os quatro históricos a esse ticket.
+Core, epílogo e worker de visibilidade No-AA consultam a identidade atual;
+cópia/publicação/Execute/End também recusam quadro antigo. Essa consulta é
+admissão própria e não fornece vida útil de um objeto NativeGame.
+
+Pares exigem igualdade nos dois olhos e no Target. Reserva/consumo queimam
+o quadro admitido mesmo em falha; geração nova ou nome de par maior não
+reabilitam a mesma identidade. Cancelamento e encerramento conferem a
+identidade inteira. Históricos recusam início antigo/mesmo quadro e reiniciam
+os quatro conjuntos em novo início, preservando o watermark e a geração.
+
+Validação: 125/125 CTest, 14,69s; 49 conferências próprias novas; totais dos
+testes de par/captura/histórico 598/59/1033. Sessões/horários/resultados XR e
+registros de Game simulados. A suíte própria DirectX permanece isolada; esses
+números não provam produção de imagens no Witcher, SDK ou Quest. Gate e chamadas
+NativeBuilder preservados; nada instalado.
+
+Pendentes: provar os estados das imagens do OpenXR e seu Acquire/Wait/Release,
+fila conservada e fences antes do uso, falhas/resize/stop e janela entre
+revalidação e chamada real. Transporte numérico não substitui lease/ownership
+do produtor, Native frame, GPU, all-calls/loader/unload. World17 atualizações uma
+vez, sem clone Surface/SDK ou replay de histórico de objetos. Primeiro duas
+imagens Game novas no PC; depois headset, cabeça, mãos e combate físico.
+
 ## Coordenação de quadros nas sessões modernas
 
 openxr_frame_cycle.h serializa a espera separadamente de início/fim e mantém

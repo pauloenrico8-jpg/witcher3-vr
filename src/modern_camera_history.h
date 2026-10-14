@@ -1,5 +1,6 @@
 #pragma once
 #include "modern_camera_pose.h"
+#include "xr_frame_identity.h"
 #include "modern_temporal_source.h"
 #include "modern_camera_history_projection.h"
 #include <bit>
@@ -14,10 +15,11 @@ struct Identity {
     const engine_camera::TemporalContract* contract{}; // Static singleton, not a Game object.
     std::uint64_t generation{},pair{};
     std::int64_t display_time{};
+    xr_frame::Identity xr{};
     bool operator==(const Identity&) const=default;
 };
 inline bool accepted(const Identity& i) noexcept {
-    return i.contract==&engine_camera::remastered_1048522 && i.generation && i.generation!=UINT64_MAX &&
+    return xr_frame::valid(i.xr) && i.contract==&engine_camera::remastered_1048522 && i.generation && i.generation!=UINT64_MAX &&
         i.pair && i.pair!=UINT64_MAX && i.display_time>0;
 }
 struct Inputs {
@@ -70,7 +72,7 @@ inline bool same_lens(const Prefix& a,const Prefix& b) noexcept {
         if(std::memcmp(a.data()+offset,b.data()+offset,4))return false;
     return true;
 }
-enum class ResetReason { none,native_reset,cold,generation,order,source,lens,rig,clock };
+enum class ResetReason { none,native_reset,cold,generation,order,source,lens,rig,clock,session };
 struct Plan {
     std::uint64_t ticket{};
     Inputs inputs{};
@@ -98,8 +100,9 @@ public:
         if(revision_==UINT64_MAX){clear();return false;}
         ++revision_;
         if(!accepted(input.identity)){clear();return false;}
-        if(seen_ && (input.identity.generation<watermark_.generation ||
-            (input.identity.generation==watermark_.generation &&
+        if(seen_ && (!xr_frame::newer(input.identity.xr,watermark_.xr) ||
+            input.identity.generation<watermark_.generation ||
+            (input.identity.xr.epoch==watermark_.xr.epoch && input.identity.generation==watermark_.generation &&
                 (input.identity.pair<=watermark_.pair || input.identity.display_time<=watermark_.display_time)))){
             clear();return false;
         }
@@ -114,6 +117,7 @@ public:
         auto reason=ResetReason::none;
         if(observed.kind==temporal_source::Kind::reset)reason=ResetReason::native_reset;
         else if(!have_)reason=ResetReason::cold;
+        else if(committed_.identity.xr.epoch!=input.identity.xr.epoch || committed_.identity.xr.session!=input.identity.xr.session)reason=ResetReason::session;
         else if(committed_.identity.contract!=input.identity.contract || committed_.identity.generation!=input.identity.generation)reason=ResetReason::generation;
         else if(observed.clock.ticks<clock_.ticks || observed.clock.scale!=clock_.scale)reason=ResetReason::clock;
         else if(observed.previous!=committed_.raw_primary)reason=ResetReason::source;
@@ -149,7 +153,7 @@ inline bool build_records(const Plan& plan,engine_camera::NativeBuilder builder,
     factory_clock::Sample converted{};
     if(!plan.ticket || !accepted(plan.inputs) || !factory_clock::sample_from(values,converted) ||
         !temporal_source::same_float(converted.time,plan.clock.time) ||
-        static_cast<unsigned>(plan.reset)>static_cast<unsigned>(ResetReason::clock))return false;
+        static_cast<unsigned>(plan.reset)>static_cast<unsigned>(ResetReason::session))return false;
     FourRecords staged{};
     if(plan.reset!=ResetReason::none){
         if(canonical_invalid[0]!=0)return false;

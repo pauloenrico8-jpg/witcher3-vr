@@ -1,5 +1,6 @@
 #pragma once
 #include <openxr/openxr.h>
+#include "xr_frame_identity.h"
 #include <array>
 #include <cstdint>
 #include <mutex>
@@ -9,7 +10,8 @@ namespace w3vr::xr_frame_cycle {
 struct Ticket {
     XrSession session{};std::uint64_t epoch{},nonce{};std::uint32_t generation{};
     bool operator==(const Ticket&)const=default;
-    explicit operator bool()const{return session && epoch && nonce && generation;}
+    xr_frame::Identity identity()const{return {reinterpret_cast<std::uintptr_t>(session),epoch,nonce};}
+    explicit operator bool()const{return xr_frame::valid(identity()) && generation;}
 };
 struct Payload {
     Ticket ticket{};XrFrameState state{XR_TYPE_FRAME_STATE};
@@ -44,13 +46,13 @@ public:
     };
     bool session_started(XrSession session) {
         std::lock_guard lock{state_};
-        if(!session || phase_!=Phase::Stopped || in_flight_ || epoch_==UINT64_MAX)return false;
+        if(!session || phase_!=Phase::Stopped || in_flight_ || epoch_>=UINT64_MAX-1)return false;
         session_=session;++epoch_;last_time_=0;active_={};ready_={};
         phase_=Phase::Idle;accepting_=true;stop_requested_=stop_attempted_=stop_called_=false;return true;
     }
     Lease prepare(XrSession session,std::uint32_t generation) {
         std::lock_guard lock{state_};
-        if(!accepting_ || session!=session_ || !generation || phase_!=Phase::Idle || in_flight_ || nonce_==UINT64_MAX)return {};
+        if(!accepting_ || session!=session_ || !generation || phase_!=Phase::Idle || in_flight_ || nonce_>=UINT64_MAX-1)return {};
         active_={session,epoch_,++nonce_,generation};phase_=Phase::Preparing;
         waited_=begun_=discarded_=wait_called_=begin_called_=end_called_=false;++in_flight_;return {this,active_,false};
     }
@@ -91,6 +93,11 @@ public:
     }
     bool current(Ticket t)const {
         std::lock_guard lock{state_};return accepting_ && exact(t) && (phase_==Phase::Ready || phase_==Phase::Presenting);
+    }
+    bool current(xr_frame::Identity id,std::uint32_t generation)const {
+        std::lock_guard lock{state_};
+        return accepting_ && xr_frame::valid(id) && active_.identity()==id &&
+            active_.generation==generation && (phase_==Phase::Ready || phase_==Phase::Presenting);
     }
     template<class Call> XrResult end(Lease& lease,Call&& call) {
         {std::lock_guard lock{state_};if(lease.owner_!=this || lease.thread_!=std::this_thread::get_id() || lease.done_ || !lease.presenting_ || !exact(lease.ticket_) || phase_!=Phase::Presenting || !begun_ || end_called_)return XR_ERROR_CALL_ORDER_INVALID;end_called_=true;}

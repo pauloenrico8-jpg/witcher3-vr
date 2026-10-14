@@ -14,7 +14,7 @@ inline bool admits(const Identity& identity,
     const engine_camera::TemporalContract* contract,
     const render_core::Profile* installed, bool ready, std::uint32_t generation) {
     const auto* selected = render_core::modern_selected(contract);
-    return selected && identity.profile == selected &&
+    return xr_frame::valid(identity.frame.xr) && selected && identity.profile == selected &&
         render_core::ready_for(contract, installed, ready) &&
         render_core::accepts_frame_label(identity.renderer, identity.frame.frame,
             &identity.frame, generation);
@@ -36,6 +36,7 @@ struct Request {
     std::uint32_t generation{};
     std::uint64_t pair{};
     int eye{-1};
+    xr_frame::Identity xr{};
 };
 // Creates an immutable COPY request, never a ready image. Caller must record
 // the real copy now, retain its own textures, publish on actual Execute and
@@ -49,7 +50,7 @@ inline bool prepare(const Identity& identity,
     if (!admits(identity,contract,installed,ready,generation) || !command ||
         !recording_endpoint || !source || !current_backbuffer ||
         !single_subresource || !finished_backbuffer(transition)) return false;
-    result = {command,source,generation,identity.frame.pair,identity.frame.eye};
+    result = {command,source,generation,identity.frame.pair,identity.frame.eye,identity.frame.xr};
     return true;
 }
 } // namespace w3vr::modern_eye_capture

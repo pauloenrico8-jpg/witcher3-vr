@@ -23,7 +23,7 @@ inline bool same(const Output& a,const Output& b){
     const auto fields=[](const Output& o){return std::tuple{
         o.identity.profile,o.identity.renderer,o.identity.frame.frame,o.identity.frame.generation,
         o.identity.frame.pair,o.identity.frame.eye,o.identity.frame.view_valid,
-        o.identity.frame.normal_factory_lineage,o.identity.frame.display_time,o.texture,o.command,o.producer,o.fence,o.consumer,
+        o.identity.frame.normal_factory_lineage,o.identity.frame.display_time,o.identity.frame.xr,o.texture,o.command,o.producer,o.fence,o.consumer,
         o.recording_epoch,o.submitted_epoch,o.serial,o.fence_value,o.source_eye,o.source_eye_valid,
         o.view_valid,o.initialized,o.recording_pending,o.ordered,o.binding_epoch};};
     return fields(a)==fields(b);
@@ -45,6 +45,7 @@ inline bool accepts(const Pair& outputs,const engine_camera::TemporalContract* c
     return outputs[0].identity.renderer==outputs[1].identity.renderer &&
         outputs[0].identity.frame.frame!=outputs[1].identity.frame.frame &&
         outputs[0].identity.frame.pair==outputs[1].identity.frame.pair &&
+        outputs[0].identity.frame.xr==outputs[1].identity.frame.xr &&
         outputs[0].identity.frame.display_time==outputs[1].identity.frame.display_time &&
         outputs[0].identity.frame.pair>last_pair && outputs[0].texture!=outputs[1].texture &&
         outputs[0].serial!=outputs[1].serial;
@@ -53,11 +54,12 @@ inline bool accepts(const Pair& outputs,const engine_camera::TemporalContract* c
 }
 // The caller supplies the actual xrWaitFrame/xrBeginFrame target captured
 // for publication. Do not synthesize it from clock/Present cadence.
-struct Target {std::int64_t display_time{};bool prepared{};};
+struct Target {std::int64_t display_time{};bool prepared{};xr_frame::Identity xr{};};
 inline bool matches_target(const Pair& outputs,Target target) {
-    return target.prepared && target.display_time>0 && target.display_time!=INT64_MAX &&
+    return xr_frame::valid(target.xr) && target.prepared && target.display_time>0 && target.display_time!=INT64_MAX &&
         outputs[0].identity.frame.display_time==target.display_time &&
-        outputs[1].identity.frame.display_time==target.display_time;
+        outputs[1].identity.frame.display_time==target.display_time &&
+        outputs[0].identity.frame.xr==target.xr && outputs[1].identity.frame.xr==target.xr;
 }
 struct Route {
     bool mode3{}, noaa{}, dual{}, aer{}, panel{}, delayed_scene{};
@@ -72,6 +74,7 @@ class Consumption {
     std::uint64_t last_attempt_{},nonce_{};
     std::array<std::uint64_t,2> last_serials_{};
     Claim active_{};
+    xr_frame::Identity attempted_xr_{};
 public:
     // Host serializes this helper with its immutable output snapshot. A failed
     // XR attempt still burns that pair; it cannot become a new application
@@ -81,10 +84,12 @@ public:
         std::uintptr_t consumer,std::uint64_t binding_epoch,const Route& route,Claim& claim){
         if(!strict_scene(route) || !accepts(outputs,contract,installed,ready,generation,consumer,0,binding_epoch) ||
             active_.nonce || nonce_==UINT64_MAX)return false;
-        const bool new_context=profile_!=installed || generation_!=generation;
+        const auto xr=outputs[0].identity.frame.xr;
+        if(xr_frame::valid(attempted_xr_) && !xr_frame::newer(xr,attempted_xr_))return false;
+        const bool new_context=profile_!=installed || generation_!=generation || xr.epoch!=attempted_xr_.epoch;
         if((!new_context && outputs[0].identity.frame.pair<=last_attempt_) ||
             outputs[0].serial<=last_serials_[0] || outputs[1].serial<=last_serials_[1])return false;
-        last_serials_={outputs[0].serial,outputs[1].serial};
+        last_serials_={outputs[0].serial,outputs[1].serial};attempted_xr_=xr;
         profile_=installed;generation_=generation;last_attempt_=outputs[0].identity.frame.pair;
         active_={outputs,++nonce_};claim=active_;return true;
     }

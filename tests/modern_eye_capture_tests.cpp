@@ -8,7 +8,7 @@ namespace core=w3vr::render_core;
 namespace cam=w3vr::engine_camera;
 int checks{};
 void require(bool yes,const char* text){++checks;if(!yes){std::cerr<<text<<'\n';std::exit(1);}}
-cap::Identity live{&core::remastered_1048522,0x1000,{0x2000,7,99,0,true,true}};
+cap::Identity live{&core::remastered_1048522,0x1000,{0x2000,7,99,0,true,true,1000,{0x8000,3,99}}};
 cap::Request sentinel{0xEE,0xFF,88,777,1};
 const cap::Transition render_end{0,4,0,UINT32_MAX};
 bool request(const cap::Identity& identity,cap::Request& out,
@@ -25,6 +25,8 @@ cap::Identity read(){return thread_state;} void apply(const cap::Identity& i){th
 int main(){
  auto out=sentinel;require(request(live,out),"Valid final backbuffer did not yield a copy request");
  require(out.command==0x3000&&out.source==0x4000&&out.eye==0&&out.pair==99&&out.generation==7,"Request lost exact eye/list/source");
+ require(out.xr==live.frame.xr,"Copy request lost session/frame provenance");
+ for(unsigned k=0;k<3;++k){auto bad=live;if(k==0)bad.frame.xr.session=0;if(k==1)bad.frame.xr.epoch=0;if(k==2)bad.frame.xr.nonce=0;rejects(bad,"Missing XR identity admitted capture");}
  // Two eyes on the SAME recording list retain their distinct copy tickets.
  std::vector<cap::Request> copies{out};auto right=live;right.frame.eye=1;
  require(request(right,out),"Peer eye rejected");copies.push_back(out);
