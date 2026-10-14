@@ -61,19 +61,27 @@ inline bool record_equal(std::span<const std::uint8_t> a,std::span<const std::ui
 // proof of THIS observed builder result, never a previous-frame record cache.
 // This does not construct histories, own native objects or publish GPU data.
 inline constexpr std::uintptr_t reset_return=0x02384AE4;
+inline constexpr std::uintptr_t producer_reset_return=0x022BE8C1;
+inline constexpr std::uintptr_t producer_reset_setup_rva=0x022BE8AE;
+inline constexpr std::array<std::uint8_t,19> producer_reset_setup_pin{0x48,0x8D,0x8E,0xD0,0x06,0x00,0x00,0x48,0x8D,0x15,0xA4,0x2C,0xE9,0x02,0xE8,0xDF,0x50,0x09,0xFE};
 inline constexpr std::uintptr_t reset_source=0x05151560;
 struct ResetCandidate {
     const engine_camera::TemporalContract* contract{};
     std::uintptr_t module{},descriptor{},owner{},director{},history{},source{};
     std::uint32_t thread{};
     factory_clock::Sample clock{}; // Producer identity only, NOT NativeBuilder time admission.
+    SourceSite site{SourceSite::descriptor_getter};
+    std::uintptr_t caller{};
 };
 inline bool accepted(const ResetCandidate& c) noexcept {
     std::uintptr_t history{},source{};
     factory_clock::Values v{};v.ticks=c.clock.ticks;v.scale=c.clock.scale;
     factory_clock::Sample s{};
+    const bool getter=c.site==SourceSite::descriptor_getter && c.descriptor && !(c.descriptor&7);
+    const bool update=c.site==SourceSite::producer_update && !c.descriptor && c.module &&
+        c.module<=UINTPTR_MAX-producer_reset_return && c.caller==c.module+producer_reset_return;
     return c.contract==&engine_camera::remastered_1048522 && c.module && !(c.module&0xFFF) &&
-        c.descriptor && !(c.descriptor&7) && c.owner && !(c.owner&7) && c.director && !(c.director&7) &&
+        (getter || update) && c.owner && !(c.owner&7) && c.director && !(c.director&7) &&
         c.thread && c.director<=UINTPTR_MAX-0x7FB && c.module<=UINTPTR_MAX-reset_source-engine_camera::record_bytes &&
         factory_clock::offset(c.director,0x6D0,history) && c.history==history &&
         factory_clock::offset(c.module,reset_source,source) && c.source==source &&
@@ -110,7 +118,8 @@ public:
             !record_equal(canonical,copied))return false;
         candidate_.contract=c.contract;candidate_.descriptor=c.descriptor;candidate_.owner=c.owner;
         candidate_.thread=c.thread;candidate_.clock=c.clock;candidate_.time=c.clock.time;
-        record_=copied;valid_=true;reset_=true;bound_=true;return true;
+        candidate_.site=c.site;candidate_.module=c.module;candidate_.caller=c.caller;
+        record_=copied;valid_=true;reset_=true;bound_=c.site==SourceSite::descriptor_getter;return true;
     }
     bool reset_observed() const noexcept {return valid_ && reset_;}
     bool matches(const engine_camera::TemporalContract* contract,std::uintptr_t descriptor,
