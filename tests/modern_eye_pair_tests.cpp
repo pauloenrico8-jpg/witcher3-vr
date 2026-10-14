@@ -11,7 +11,7 @@ void require(bool value,const char* why){++checks;if(!value){std::cerr<<why<<'\n
 pair::Pair fixture(const core::Profile* profile,std::uint32_t generation=9,std::uint64_t id=100,std::uint64_t serial=50){
     pair::Pair p{};
     for(int eye=0;eye<2;++eye){auto& o=p[eye];
-        o.identity={profile,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),generation,id,eye,true,true,1000}};
+        o.identity={profile,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),generation,id,eye,true,true,1000,{0x8000,3,serial}}};
         o.texture=0x3000+eye*0x100;o.command=0x4000;o.producer=0x5000;o.fence=0x6000;o.consumer=0x7000;
         o.recording_epoch=8;o.submitted_epoch=8;o.serial=serial+eye;o.fence_value=20;o.binding_epoch=7;
         o.source_eye=eye;o.source_eye_valid=true;o.view_valid=true;o.initialized=true;o.ordered=true;
@@ -125,38 +125,69 @@ void runtime_target(const core::Profile* profile){
     for(const auto target:std::array<pair::Target,5>{{{0,true},{-1,true},{INT64_MAX,true},{1001,true},{1000,false}}}){
         auto out=sentinel;require(!consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,target,out),"Another/unprepared XR frame consumed native pair");require(out.nonce==777 && pair::same(out.outputs,sentinel.outputs),"Rejected target changed claim");
     }
-    require(consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,{1000,true},claim),"Exact prepared runtime target rejected");
+    require(consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,{1000,true,{0x8000,3,50}},claim),"Exact prepared runtime target rejected");
     auto changed=claim;changed.outputs[0].identity.frame.display_time=1001;require(!consume.current(changed,contract(profile),profile,true,9,0x7000,7) && !consume.finish(changed,true,true),"Changing frozen time retained authority");
     require(!pair::matches_target(claim.outputs,{1001,true}),"New XR target reused old pair");
-    require(consume.finish(claim,true,true),"Exact frame did not finish");auto out=sentinel;require(!consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,{1000,true},out),"Consumed pair replayed in same target");
+    require(consume.finish(claim,true,true),"Exact frame did not finish");auto out=sentinel;require(!consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,{1000,true,{0x8000,3,50}},out),"Consumed pair replayed in same target");
+}
+void xr_provenance(const core::Profile* profile){
+    auto good=fixture(profile);pair::Consumption consume;pair::Claim claim{};
+    const pair::Target target{1000,true,good[0].identity.frame.xr};
+    for(unsigned k=0;k<5;++k){auto bad=good;
+        if(k==0)bad[0].identity.frame.xr.session=0;
+        if(k==1)bad[0].identity.frame.xr.epoch=0;
+        if(k==2)bad[1].identity.frame.xr.session++;
+        if(k==3)bad[1].identity.frame.xr.epoch++;
+        if(k==4)bad[1].identity.frame.xr.nonce++;
+        require(!accepts(bad,profile),"Mixed XR eye identity admitted");
+    }
+    for(unsigned k=0;k<3;++k){auto bad=target;if(k==0)bad.xr.session++;if(k==1)bad.xr.epoch++;if(k==2)bad.xr.nonce++;
+        require(!pair::matches_target(good,bad),"Same time concealed another XR frame");
+    }
+    require(consume.begin_for_frame(good,contract(profile),profile,true,9,0x7000,7,strict,target,claim),"Known XR frame rejected");
+    require(!consume.finish(claim,false,false),"Failed frame reported success");
+    auto repeat=fixture(profile,9,101,60);repeat[0].identity.frame.xr=repeat[1].identity.frame.xr=target.xr;
+    require(!consume.begin(repeat,contract(profile),profile,true,9,0x7000,7,strict,claim),"New pair/copy labels replayed same XR frame");
+    auto restart=fixture(profile,9,1,70);for(auto& o:restart)o.identity.frame.xr.epoch++;
+    auto new_target=target;new_target.xr=restart[0].identity.frame.xr;
+    require(!pair::matches_target(good,new_target),"Old eye accepted after same-time restart");
+    require(consume.begin_for_frame(restart,contract(profile),profile,true,9,0x7000,7,strict,new_target,claim),"New session frame rejected");
+    require(consume.finish(claim,true,true),"Restart frame did not finish");
+    auto stale=fixture(profile,9,200,80);
+    require(!consume.begin(stale,contract(profile),profile,true,9,0x7000,7,strict,claim),"Old epoch gained authority with new serial");
 }
 void prepared_owner(){
-    namespace f=w3vr::prepared_frame;f::Binding binding;f::Ticket ticket{},sentinel{{99,88,77},66};
-    auto out=sentinel;require(!binding.reserve({1000,100,9},false,1000,out) && out.nonce==66,"Unbegun XR frame gained owner");
-    require(!binding.reserve({1000,100,9},true,1001,out),"Predicted target became actual runtime frame");
-    require(binding.reserve({1000,100,9},true,1000,ticket),"Actual runtime frame not reserved");
+    namespace f=w3vr::prepared_frame;const w3vr::xr_frame::Identity xr_id{0x8000,3,50};f::Binding binding;f::Ticket ticket{},sentinel{{99,88,77,xr_id},66};
+    auto out=sentinel;require(!binding.reserve({1000,100,9,xr_id},false,1000,xr_id,out) && out.nonce==66,"Unbegun XR frame gained owner");
+    require(!binding.reserve({1000,100,9,xr_id},true,1001,xr_id,out),"Predicted target became actual runtime frame");
+    require(binding.reserve({1000,100,9,xr_id},true,1000,xr_id,ticket),"Actual runtime frame not reserved");
     require(!binding.allows(ticket.identity),"CPU reservation became rendered pair");
-    require(!binding.reserve({1000,101,9},true,1000,out),"Another producer stole prepared frame");
+    require(!binding.reserve({1000,101,9,xr_id},true,1000,xr_id,out),"Another producer stole prepared frame");
     auto stale=ticket;stale.nonce++;require(!binding.cancel(stale),"Foreign cancellation revoked current frame");
-    require(binding.cancel(ticket) && binding.cancelled_for(1000,9),"Exact cancellation not observable");
-    require(!binding.cancelled_for(1001,9) && !binding.dispatched(ticket),"Cancelled frame rearmed or revoked other target");
-    require(!binding.end(1000,false) && !binding.reserve({1001,101,9},true,1001,out),"Failed EndFrame released owned window");
-    require(!binding.end(1001,true) && binding.end(1000,true),"Different target ended ownership");
-    f::Ticket next{};require(binding.reserve({1001,101,10},true,1001,next),"Next actual target not admitted");
+    require(binding.cancel(ticket) && binding.cancelled_for(1000,9,xr_id),"Exact cancellation not observable");
+    require(!binding.cancelled_for(1001,9,xr_id) && !binding.dispatched(ticket),"Cancelled frame rearmed or revoked other target");
+    require(!binding.end(1000,xr_id,false) && !binding.reserve({1001,101,9,xr_id},true,1001,xr_id,out),"Failed EndFrame released owned window");
+    require(!binding.end(1001,xr_id,true) && binding.end(1000,xr_id,true),"Different target ended ownership");
+    const w3vr::xr_frame::Identity xr_next{0x8000,3,51};
+    f::Ticket next{};require(binding.reserve({1001,101,10,xr_next},true,1001,xr_next,next),"Next actual target not admitted");
     require(!binding.cancel(ticket) && binding.dispatched(next) && binding.allows(next.identity),"Old ticket removed new dispatched owner");
     require(!binding.cancel(next),"Dispatched producer destructor cancelled legitimate images");
-    require(binding.cancelled_for(1001,11),"Resize mismatch did not close old prepared frame");
-    require(!binding.allows({1001,101,11}) && binding.end(1001,true),"Changed generation adopted old images");
+    require(binding.cancelled_for(1001,11,xr_next),"Resize mismatch did not close old prepared frame");
+    require(!binding.allows({1001,101,11,xr_next}) && binding.end(1001,xr_next,true),"Changed generation adopted old images");
+    const w3vr::xr_frame::Identity xr_stopped{0x8000,3,52},xr_restart{0x8000,4,53};
     f::Ticket stopped{}, restarted{};
-    require(binding.reserve({1002,102,10},true,1002,stopped),"Session frame not reserved");
-    require(!binding.runtime_stopped(false) && !binding.reserve({1003,103,10},true,1003,out),"Failed session stop released frame");
-    require(binding.runtime_stopped(true) && binding.reserve({1003,103,10},true,1003,restarted),"Successful session stop did not reopen admission");
+    require(binding.reserve({1002,102,10,xr_stopped},true,1002,xr_stopped,stopped),"Session frame not reserved");
+    require(!binding.runtime_stopped(false) && !binding.reserve({1003,103,10,xr_restart},true,1003,xr_restart,out),"Failed session stop released frame");
+    require(binding.runtime_stopped(true) && binding.reserve({1003,103,10,xr_restart},true,1003,xr_restart,restarted),"Successful session stop did not reopen admission");
     require(restarted.nonce>stopped.nonce && !binding.cancel(stopped) && !binding.dispatched(stopped),"Old session callback retained authority");
     require(binding.dispatched(restarted) && binding.allows(restarted.identity),"Restarted session owner not admitted");
+    auto wrong=xr_restart;wrong.epoch++;
+    require(!binding.end(1003,wrong,true)&&!binding.cancelled_for(1003,10,wrong),"Same time foreign epoch ended/cancelled owner");
+    auto changed=restarted.identity;changed.xr=wrong;require(!binding.allows(changed),"Changed epoch retained dispatched authority");
 }
 int main(){prepared_owner();runtime_target(&core::remastered_500c);runtime_target(&core::remastered_1048522);
     for(const auto* profile:{&core::remastered_500c,&core::remastered_1048522}){
-        profiles_and_receipts(profile);consume_once_and_failure(profile);
+        profiles_and_receipts(profile);consume_once_and_failure(profile);xr_provenance(profile);
     }
     retirement();
     std::cout<<checks<<" CPU checks: two version profiles, concrete output receipts, one-use presentation and retirement predicates. "

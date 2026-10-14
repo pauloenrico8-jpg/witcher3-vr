@@ -34,7 +34,7 @@ int main(){
         check(!c.snapshot(session(),out)&&out.state.predictedDisplayTime==500,"rejected output");
         check(!c.session_started(XR_NULL_HANDLE)&&c.session_started(session()),"initial session");
         check(!c.session_started(session())&&!c.prepare(session(2),7)&&!c.prepare(session(),0),"unknown/repeated identity");
-        auto t=prepare(c);check(c.snapshot(session(),out)&&out.ticket==t,"snapshot");
+        auto t=prepare(c);check(c.snapshot(session(),out)&&out.ticket==t&&c.current(t.identity(),7)&&!c.current(t.identity(),8),"snapshot and generation");
         out.views[0].pose.position.x=20;xr::Payload copy;check(c.snapshot(session(),copy)&&copy.views[0].pose.position.x==-0.03f,"copied views");
         check(!c.prepare(session(),7),"ready overwritten");
         {auto l=c.present(session(),copy);check(bool(l)&&copy.ticket==t,"exact present");
@@ -42,7 +42,7 @@ int main(){
             auto wrong=t;++wrong.epoch;check(!c.current(wrong)&&c.current(t),"epoch");
             check(c.end(l,[&]{check(c.current(t),"callback state mutex");return XR_SUCCESS;})==XR_SUCCESS,"end");
             check(c.end(l,[]{check(false,"repeat end callback");return XR_SUCCESS;})==XR_ERROR_CALL_ORDER_INVALID,"repeat end");}
-        check(!c.current(t),"old ticket");
+        check(!c.current(t)&&!c.current(t.identity(),7),"old ticket");
         auto next=prepare(c,payload(110));check(next.nonce>t.nonce,"nonce");
         stop(c);check(c.session_started(session()),"restart");
         auto restarted=prepare(c,payload(100));check(restarted.epoch>next.epoch&&restarted.nonce>next.nonce&&!c.current(next),"restart ABA");stop(c);

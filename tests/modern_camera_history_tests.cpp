@@ -17,7 +17,7 @@ h::Prefix prefix(float marker){
     const std::uint32_t opaque=0x7FAABCDE;std::memcpy(p.data()+0xC,&opaque,4);return p;
 }
 h::Inputs inputs(std::uint64_t pair){
-    h::Inputs i{};i.identity={contract,7,pair,static_cast<std::int64_t>(pair*100)};
+    h::Inputs i{};i.identity={contract,7,pair,static_cast<std::int64_t>(pair*100),{0x8000,3,pair}};
     i.raw_primary=prefix(static_cast<float>(pair));
     for(unsigned e=0;e<2;++e)for(unsigned c=0;c<2;++c){i.current[e][c]=prefix(static_cast<float>(pair*100+e*10+c));i.center[e][c]={.1f*e,.2f*c};}
     return i;
@@ -54,13 +54,13 @@ void snapshot_checks(){
     t.views[0].pose={{0,0,0,1},{-.032f,0,0}};t.views[1].pose={{0,0,0,1},{.032f,0,0}};
     pose::PreparedPair prepared;
     require(pose::prepare_pair(contract,raw,t,{},prepared),"own pose pair fixture rejected");
-    h::Inputs value{};require(h::snapshot(prepared,raw,t,{}, {contract,7,1,100},value),"four-prefix snapshot failed");
+    h::Inputs value{};require(h::snapshot(prepared,raw,t,{}, {contract,7,1,100,{0x8000,3,1}},value),"four-prefix snapshot failed");
     for(unsigned e=0;e<2;++e)for(unsigned c=0;c<2;++c)
         require(!std::memcmp(value.current[e][c].data(),prepared.descriptors[e].data()+layout->descriptor_cameras[c],h::Prefix{}.size()),"eye/camera prefix exchanged");
     const auto saved=value;raw.assign(raw.size(),0xFF);for(auto& d:prepared.descriptors)d.assign(d.size(),0xEE);
     require(value==saved,"snapshot retained source buffers");
     h::Inputs unchanged=inputs(9);const auto before=unchanged;
-    require(!h::snapshot(prepared,raw,t,{}, {contract,7,2,200},unchanged) && unchanged==before,"failed extraction published partial values");
+    require(!h::snapshot(prepared,raw,t,{}, {contract,7,2,200,{0x8000,3,2}},unchanged) && unchanged==before,"failed extraction published partial values");
 }
 void continuation_checks(){
     auto first=inputs(1),second=inputs(2);h::Bank bank;h::Plan p1,p2;
@@ -167,4 +167,18 @@ void projection_checks(){
         else center[kind-5]=std::numeric_limits<float>::quiet_NaN();
         auto out=fresh;require(!hp::center_fresh_record(contract,center,broken,out) && out==fresh,"invalid/reset/orthographic/nonfinite center accepted");}
 }
-int main(){projection_checks();observation_checks();snapshot_checks();continuation_checks();discontinuity_checks();std::printf("PASS four camera input histories: %u checks; owned snapshots, atomic pairs, four own constructor results and failures, perspective centers/NDC/depth, reset and stale callbacks.\n",checks);std::puts("GAME=false NATIVE_BUILDER_ADMISSION=false SDK_INIT=false GPU=false OPENXR_RUNTIME=false QUEST=false VR_FUNCTIONAL=false");}
+void session_history(){
+    auto a=inputs(10);h::Bank b;h::Plan first,next;
+    require(b.prepare(a,observed(prefix(0)),first)&&b.commit_cpu(first,a.identity,true),"Session history seed");
+    auto restarted=inputs(1);restarted.identity.xr={0x8000,4,11};
+    require(b.prepare(restarted,observed(a.raw_primary),next)&&next.reset==h::ResetReason::session,"Restart borrowed old camera inputs");
+    for(auto& eye:next.previous)for(auto& camera:eye)require(camera==h::Prefix{},"Restart retained previous eye");
+    require(!b.commit_cpu(first,a.identity,true)&&b.commit_cpu(next,restarted.identity,true),"Old history callback replaced restart");
+    auto stale=inputs(12);h::Plan sentinel;sentinel.ticket=999;
+    require(!b.prepare(stale,observed(restarted.raw_primary),sentinel)&&sentinel.ticket==999,"Old session reentered with larger time");
+    auto foreign=inputs(13);foreign.identity.xr={0x9000,4,13};
+    require(!b.prepare(foreign,observed(restarted.raw_primary),sentinel),"Foreign session adopted same epoch");
+    auto current=inputs(2);current.identity.xr={0x8000,4,14};
+    require(b.prepare(current,observed(restarted.raw_primary),next)&&next.reset==h::ResetReason::cold,"Rejection did not clear previous inputs");
+}
+int main(){session_history();projection_checks();observation_checks();snapshot_checks();continuation_checks();discontinuity_checks();std::printf("PASS four camera input histories: %u checks; owned snapshots, atomic pairs, four own constructor results and failures, perspective centers/NDC/depth, reset and stale callbacks.\n",checks);std::puts("GAME=false NATIVE_BUILDER_ADMISSION=false SDK_INIT=false GPU=false OPENXR_RUNTIME=false QUEST=false VR_FUNCTIONAL=false");}

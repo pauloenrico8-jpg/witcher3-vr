@@ -41,7 +41,7 @@ void math_checks(){Record out{};out.fill(0xA5);auto p=prefix();
  for(unsigned kind=0;kind<6;++kind){auto bad=p;if(kind==0)put(bad.data()+0x1C,180);if(kind==1)put(bad.data()+0x28,0);if(kind==2)put(bad.data()+0x2C,-1);if(kind==3)put(bad.data()+0x34,1);if(kind==4)put(bad.data(),INFINITY);if(kind==5)put(bad.data()+0x10,NAN);auto saved=out;require(!m::build(c,bad,3,out)&&out==saved,"invalid matrix input modified output");}
 }
 struct Setup {h::Plan plan;w3vr::temporal_source::Observation observed;w3vr::modern_camera_pose::PreparedPair pair;Record reference=fixture(),invalid{};};
-Setup setup(){Setup s;s.plan.ticket=7;s.plan.inputs.identity={c,5,9,500};s.plan.reset=h::ResetReason::none;s.plan.clock={3000000,1000000,3};s.observed.kind=w3vr::temporal_source::Kind::built;s.observed.clock=s.plan.clock;s.observed.previous=prefix();
+Setup setup(){Setup s;s.plan.ticket=7;s.plan.inputs.identity={c,5,9,500,{0x8000,3,9}};s.plan.reset=h::ResetReason::none;s.plan.clock={3000000,1000000,3};s.observed.kind=w3vr::temporal_source::Kind::built;s.observed.clock=s.plan.clock;s.observed.previous=prefix();
  s.pair.contract=c;s.pair.display_time=500;const auto* layout=w3vr::engine_camera_layout::selected(c);s.invalid.fill(0x31);s.invalid[0]=0;
  for(unsigned e=0;e<2;++e){s.pair.descriptors[e].assign(0xF750,0xA5);std::uint32_t count=0;std::memcpy(s.pair.descriptors[e].data()+0xECA0,&count,4);
   for(unsigned camera=0;camera<2;++camera){s.plan.inputs.current[e][camera]=prefix(static_cast<float>(10+e*2+camera));s.plan.previous[e][camera]=prefix(static_cast<float>(1+e*2+camera));s.plan.inputs.center[e][camera]={.1f*e,.2f*camera};

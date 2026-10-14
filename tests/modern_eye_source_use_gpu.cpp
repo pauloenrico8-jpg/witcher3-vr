@@ -571,7 +571,7 @@ void source_lifetime_case(ID3D12Device* device,IDXGIFactory6* factory,unsigned m
             auto r=std::make_unique<TrackedSource>();r->destroyed=&destroyed;r->binding=snapshot;
             r->source=acquired.resource;r->destination=destinations[eye];r->command=recording.command;
             r->key={{&w3vr::render_core::remastered_1048522,0x1000,
-                {static_cast<std::uintptr_t>(0x2000+eye*0x100),9,100,static_cast<int>(eye),true,true}},8,50+eye,eye};
+                {static_cast<std::uintptr_t>(0x2000+eye*0x100),9,100,static_cast<int>(eye),true,true,1000,{0x8000,3,50}}},8,50+eye,eye};
             auto* registered=retained.adopt(std::move(r));require(registered!=nullptr,"source-only adoption");
             retained.mark_recorded(registered);
             D3D12_RESOURCE_BARRIER to_write{};to_write.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -716,7 +716,7 @@ void read_only_source_case(ID3D12Device* device,IDXGIFactory6* factory){
         source::Store retained{};std::mutex mutex;unsigned destroyed{};
         for(UINT eye=0;eye<2;++eye){auto r=std::make_unique<TrackedSource>();r->destroyed=&destroyed;
             r->binding=snapshot;r->source=inputs[eye];r->destination=destinations[eye];r->command=recording.command;
-            r->key={{&w3vr::render_core::remastered_1048522,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),9,101,static_cast<int>(eye),true,true}},8,60+eye,eye};
+            r->key={{&w3vr::render_core::remastered_1048522,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),9,101,static_cast<int>(eye),true,true,1010,{0x8000,3,60}}},8,60+eye,eye};
             auto* owned=retained.adopt(std::move(r));require(owned!=nullptr,"read-only source registration");retained.mark_recorded(owned);
             D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=inputs[eye].Get();
             b.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
