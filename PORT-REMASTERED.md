@@ -1,5 +1,49 @@
 # Adaptação para Remastered — estado da renderização
 
+## Cópia auxiliar ligada à imagem e à lista corretas — 14 de outubro
+
+A imagem do headset também é lida por uma cópia auxiliar. Essa operação muda
+seu estado para leitura da cópia e depois precisa restaurar o estado de desenho.
+O protocolo agora acompanha esse caminho junto com a identidade do quadro.
+
+O fluxo, passo a passo:
+
+1. openxr_image_protocol.h guarda a lista de comandos, a textura, sua identidade
+   comum e o índice da imagem. Chamadas com outro quadro, lista, textura ou índice
+   não alteram a gravação legítima.
+2. dxgi_proxy.cpp confere a identidade da textura e da lista na cópia auxiliar.
+   Compara a identidade comum dos objetos e recusa destino desconhecido ou o
+   mesmo objeto como origem e destino. Duas interfaces podem representar o mesmo
+   objeto; comparar essa identidade evita confundi-las com duas texturas.
+   [Regra COM](https://learn.microsoft.com/en-us/windows/win32/api/unknwn/nf-unknwn-iunknown-queryinterface(refiid_void)).
+3. O helper marca a imagem como fonte de cópia, grava as barreiras e a cópia uma
+   vez e confirma a volta ao estado de desenho. Durante essa operação, envio e
+   devolução ficam fechados. Uma exceção deixa a gravação recusada.
+4. Antes de enviar, exige a mesma gravação, o estado de desenho restaurado e a
+   fila da sessão. A volta a esse estado é exigida pelo OpenXR com DirectX 12.
+   [Regra OpenXR](https://registry.khronos.org/OpenXR/specs/1.1/man/html/XR_KHR_D3D12_enable-swapchain-image-state.html).
+
+Escolhi conservar a identidade completa porque uma confirmação de estado sem
+imagem e lista poderia ser aplicada ao trabalho errado. A comparação de objetos
+conserva referências temporárias durante as chamadas; não comprova a vida útil
+completa dos recursos na GPU ou durante a destruição da sessão.
+
+A DLL compilou e **127 testes passaram em 13,21 segundos**. O teste do protocolo
+fez **225 conferências com identificadores e resultados simulados**. O teste
+DirectX próprio fez **1.308 conferências**, incluindo a nova cópia real de uma
+textura com duas camadas, uma vermelha e outra verde, com **512 bytes de imagem**
+conferidos depois da conclusão da GPU. Recusou duas interfaces do mesmo objeto
+sem executar a cópia. O teste usa o mesmo helper da DLL; os handles e os retornos
+OpenXR continuam simulados. Não executou o host no Witcher, SDK ou Quest.
+
+**O VR ainda não funciona.** Essa prova usa texturas artificiais num programa
+separado. Ainda faltam imagens reais do jogo, proteção completa na parada e no
+redimensionamento, retenção dos recursos e recuperação das imagens pendentes.
+A identidade comum não detecta sobreposição física de recursos diferentes que
+compartilhem memória. A nova cópia usa destino próprio de alocação independente;
+outros escritores e aliases continuam pendentes. Remastered permanece fechado;
+nada experimental foi instalado.
+
 ## Confirmação da GPU antes de reutilizar a memória — 14 de outubro
 
 Corrigi a espera que antecede a reutilização da memória dos comandos gráficos.

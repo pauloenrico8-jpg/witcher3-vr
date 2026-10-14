@@ -2,8 +2,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <stdexcept>
 namespace x=w3vr::xr_image;
 unsigned checks{};
+x::Recording binding(unsigned index=1){return {0x5000,0x6000,0x6100,index};}
 void check(bool v,const char* why){++checks;if(!v){std::cerr<<why<<'\n';std::exit(1);}}
 x::Input input(unsigned nonce=1){return {{0x1000,2,nonce},0x2000,0x3000,7,3};}
 x::Ticket acquire_wait(x::Image& image,XrResult acquire=XR_SUCCESS,XrResult wait=XR_SUCCESS,uint32_t index=1){
@@ -24,14 +26,14 @@ int main(){
         check(image.wait(t,[&]{++waits;return XR_SUCCESS;})==XR_SUCCESS,"wait once");
         check(image.wait(t,[]()->XrResult{check(false,"duplicate wait callback");return XR_SUCCESS;})==XR_ERROR_CALL_ORDER_INVALID,"duplicate wait");
         check(image.writable(t,index,true)&&!image.writable(t,3,true)&&!image.writable(t,index,false),"index/layout");
-        check(image.start_recording(t,index,true)&&!image.start_recording(t,index,true),"record once");
-        check(image.transition(t,4,0x400)&&!image.color_ready(t),"copy destination state");
-        check(!image.before_execute(t,0x3000,true,true),"copy dest sent to runtime");
-        check(image.transition(t,0x400,4)&&image.color_ready(t),"color restored");
-        check(!image.before_execute(t,0x3001,true,true)&&!image.before_execute(t,0x3000,false,true),"wrong queue/open list");
-        check(image.before_execute(t,0x3000,true,true)&&!image.before_execute(t,0x3000,true,true),"execute claim");
+        check(image.start_recording(t,binding(index),true)&&!image.start_recording(t,binding(index),true),"record once");
+        check(image.transition(t,binding(),4,0x400)&&!image.color_ready(t,binding()),"copy destination state");
+        check(!image.before_execute(t,binding(),0x3000,true),"copy dest sent to runtime");
+        check(image.transition(t,binding(),0x400,4)&&image.color_ready(t,binding()),"color restored");
+        check(!image.before_execute(t,binding(),0x3001,true)&&!image.before_execute(t,binding(),0x3000,false),"wrong queue/open list");
+        check(image.before_execute(t,binding(),0x3000,true)&&!image.before_execute(t,binding(),0x3000,true),"execute claim");
         check(!image.releasable(t),"execute in flight released");
-        check(image.execution_returned(t,0x3000,true,true)&&!image.releasable(t),"returned execute without signal");
+        check(image.execution_returned(t,binding(),0x3000,true)&&!image.releasable(t),"returned execute without signal");
         check(image.signal(t,0x3000,true,9)&&image.releasable(t),"exact queue signal");
         check(image.release(t,[&]{++releases;return XR_SUCCESS;})==XR_SUCCESS&&image.layer_allowed(t)&&!image.pending(),"release/layer");
         check(image.release(t,[]()->XrResult{check(false,"duplicate release callback");return XR_SUCCESS;})==XR_ERROR_CALL_ORDER_INVALID,"duplicate release");
@@ -58,7 +60,7 @@ int main(){
     }
     for(bool record:{false,true}){
         x::Image image;auto t=acquire_wait(image);
-        if(record)check(image.start_recording(t,1,true),"nonexecuted recording");
+        if(record)check(image.start_recording(t,binding(1),true),"nonexecuted recording");
         check(image.releasable(t)&&image.release(t,[]{return XR_SUCCESS;})==XR_SUCCESS&&!image.layer_allowed(t),"no execute cleanup");
     }
     for(auto result:{XR_ERROR_RUNTIME_FAILURE,XR_TIMEOUT_EXPIRED}){
@@ -66,14 +68,14 @@ int main(){
         check(image.pending()&&!image.layer_allowed(t),"failed release published image");x::Ticket next;check(!image.begin(input(2),next),"failed release rearmed");
     }
     for(unsigned bad=0;bad<4;++bad){
-        x::Image image;auto t=acquire_wait(image);check(image.start_recording(t,1,true)&&image.before_execute(t,0x3000,true,true),"signal setup");
-        check(image.execution_returned(t,0x3000,true,true),"signal execute");
+        x::Image image;auto t=acquire_wait(image);check(image.start_recording(t,binding(1),true)&&image.before_execute(t,binding(),0x3000,true),"signal setup");
+        check(image.execution_returned(t,binding(),0x3000,true),"signal execute");
         check(!image.signal(t,bad==3?0x3001:0x3000,bad!=0,bad==1?0:bad==2?UINT64_MAX:9),"bad signal admitted");
         check(!image.releasable(t)&&image.pending(),"unknown GPU execution released");x::Ticket next;check(!image.begin(input(2),next),"bad signal rearmed");
     }
     {
-        x::Image image;auto t=acquire_wait(image);check(image.start_recording(t,1,true),"bad state setup");
-        check(!image.transition(t,0,4)&&!image.releasable(t),"fictional COMMON accepted");
+        x::Image image;auto t=acquire_wait(image);check(image.start_recording(t,binding(1),true),"bad state setup");
+        check(!image.transition(t,binding(),0,4)&&!image.releasable(t),"fictional COMMON accepted");
     }
     for(unsigned changed=0;changed<4;++changed){
         x::Image image;auto t=acquire_wait(image);auto bad=t;
@@ -91,6 +93,43 @@ int main(){
         x::Image image;x::Ticket t;check(image.begin(input(),t),"failed acquire setup");uint32_t index=17;
         check(image.acquire(t,index,[](uint32_t& out){out=999;return XR_ERROR_RUNTIME_FAILURE;})==XR_ERROR_RUNTIME_FAILURE&&index==999,"failed acquire output changed");
         check(!image.pending()&&!image.releasable(t),"failed acquire retained invented image");
+    }
+    for(unsigned changed=0;changed<4;++changed){
+        x::Image image;auto t=acquire_wait(image);auto good=binding(),bad=good;
+        if(changed==0)bad.command++;if(changed==1)bad.resource++;
+        if(changed==2)bad.resource_identity++;if(changed==3)bad.index++;
+        check(image.start_recording(t,good,true),"mixed recording setup");
+        unsigned calls{};auto call=[&]{++calls;};
+        check(!image.copy_source(t,bad,0x7100,call,call,call)&&calls==0,"mixed helper callbacks ran");
+        check(!image.transition(t,bad,4,0x800)&&image.color_ready(t,good),"foreign transition burned actual recording");
+        check(!image.before_execute(t,bad,0x3000,true)&&image.recording_matches(t,good),"foreign list executed");
+        check(image.copy_source(t,good,0x7100,call,call,call)&&calls==3,"exact helper after refused foreign callback");
+        check(image.color_ready(t,good),"helper did not restore color RT");
+    }
+    for(unsigned missing=0;missing<3;++missing){
+        x::Image image;auto t=acquire_wait(image);auto bad=binding();
+        if(missing==0)bad.command=0;if(missing==1)bad.resource=0;if(missing==2)bad.resource_identity=0;
+        check(!image.start_recording(t,bad,true)&&image.start_recording(t,binding(),true),"unknown recording got admission");
+    }
+    {
+        x::Image image;auto t=acquire_wait(image);const auto b=binding();unsigned calls{};
+        check(image.start_recording(t,b,true),"source copy setup");auto call=[&]{++calls;};
+        check(!image.copy_source(t,b,0,call,call,call)&&calls==0,"unknown destination copied");
+        check(!image.copy_source(t,b,b.resource_identity,call,call,call)&&calls==0,"canonical alias copied");
+        auto wrong=t;wrong.input.frame.nonce++;
+        check(!image.copy_source(wrong,b,0x7100,call,call,call)&&calls==0,"stale helper ran");
+        check(image.copy_source(t,b,0x7100,[&]{++calls;check(!image.color_ready(t,b)&&
+            !image.before_execute(t,b,0x3000,true)&&!image.releasable(t),"copy-source submitted or released early");},call,call)&&calls==3,"copy helper order");
+        check(image.before_execute(t,b,0x3000,true),"execute restored helper");
+        check(!image.copy_source(t,b,0x7100,call,call,call)&&calls==3,"helper recorded after execute");
+    }
+    for(unsigned failure=0;failure<3;++failure){
+        x::Image image;auto t=acquire_wait(image);const auto b=binding();unsigned calls{};
+        check(image.start_recording(t,b,true),"exception setup");
+        auto part=[&]{if(calls++==failure)throw std::runtime_error("own callback fault");};bool caught{};
+        try{image.copy_source(t,b,0x7100,part,part,part);}catch(const std::runtime_error&){caught=true;}
+        check(caught&&calls==failure+1&&!image.color_ready(t,b)&&!image.before_execute(t,b,0x3000,true),"partial copy restored readiness");
+        check(!image.releasable(t)&&image.pending(),"partial exception returned runtime image");
     }
     std::cout<<checks<<" CPU checks of own image acquisition, wait, color transitions, exact queue signal, release, pending quarantine and stale callbacks. Handles/results/state receipts fabricated; no OpenXR runtime, SDK, Witcher, GPU or Quest executed.\n";
 }

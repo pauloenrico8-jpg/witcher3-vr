@@ -12,14 +12,19 @@ struct Input {
     bool operator==(const Input&)const=default;
 };
 struct Ticket {Input input{};std::uint64_t nonce{};};
+// Borrowed numeric identity of one recording, not a COM/GPU/runtime lease.
+struct Recording {
+    std::uintptr_t command{},resource{},resource_identity{};std::uint32_t index{};
+    bool operator==(const Recording&)const=default;
+};
 inline bool succeeded(XrResult r){return r==XR_SUCCESS || r==XR_SESSION_LOSS_PENDING;}
 class Image {
-    Ticket active_{};xr_frame::Identity previous_{};std::uint64_t nonce_{};
+    Ticket active_{};Recording binding_{};xr_frame::Identity previous_{};std::uint64_t nonce_{};
     std::uintptr_t bound_session_{},bound_chain_{},bound_queue_{};
     std::thread::id thread_{};
     std::uint32_t index_{UINT32_MAX},state_{};std::uint64_t fence_value_{};
     bool acquire_called_{},acquired_{},wait_called_{},available_{},loss_{},
-         recording_{},execute_called_{},executed_{},signalled_{},release_called_{},released_{},failed_{};
+         recording_{},copy_active_{},execute_called_{},executed_{},signalled_{},release_called_{},released_{},failed_{};
     bool exact(Ticket t)const{
         return t.nonce && t.nonce==active_.nonce && t.input==active_.input &&
             thread_==std::this_thread::get_id();
@@ -33,8 +38,8 @@ public:
             (bound_session_ && (input.frame.session!=bound_session_ || input.chain!=bound_chain_ || input.queue!=bound_queue_)))return false;
         bound_session_=input.frame.session;bound_chain_=input.chain;bound_queue_=input.queue;
         previous_=input.frame;active_={input,++nonce_};thread_=std::this_thread::get_id();
-        index_=UINT32_MAX;state_=0;fence_value_=0;
-        acquire_called_=acquired_=wait_called_=available_=loss_=recording_=execute_called_=executed_=signalled_=release_called_=released_=false;
+        index_=UINT32_MAX;state_=0;fence_value_=0;binding_={};
+        acquire_called_=acquired_=wait_called_=available_=loss_=recording_=copy_active_=execute_called_=executed_=signalled_=release_called_=released_=false;
         out=active_;return true;
     }
     template<class Call> XrResult acquire(Ticket ticket,std::uint32_t& out,Call&& call){
@@ -56,21 +61,44 @@ public:
         return exact(t) && available_ && !failed_ && !loss_ && !release_called_ &&
             index==index_ && index<input_count(t) && layout_ok;
     }
-    bool start_recording(Ticket t,std::uint32_t index,bool layout_ok){
-        if(!writable(t,index,layout_ok) || recording_)return false;recording_=true;return true;
+    bool start_recording(Ticket t,Recording binding,bool layout_ok){
+        if(!writable(t,binding.index,layout_ok) || recording_ || !binding.command ||
+            !binding.resource || !binding.resource_identity)return false;
+        binding_=binding;recording_=true;return true;
     }
-    bool transition(Ticket t,std::uint32_t before,std::uint32_t after){
-        if(!exact(t) || !recording_ || execute_called_ || failed_ || before!=state_ ||
-            (after!=4 && after!=0x400)){if(exact(t))failed_=true;return false;}
+    bool recording_matches(Ticket t,Recording binding)const {
+        return exact(t) && recording_ && !failed_ && !release_called_ && binding==binding_;
+    }
+    bool transition(Ticket t,Recording binding,std::uint32_t before,std::uint32_t after){
+        if(!recording_matches(t,binding))return false; // a foreign callback cannot revoke this recording
+        if(copy_active_ || execute_called_ || before!=state_ || (after!=4 && after!=0x400 && after!=0x800)){
+            failed_=true;return false;
+        }
         state_=after;return true;
     }
-    bool color_ready(Ticket t)const{return exact(t) && available_ && !failed_ && state_==4;}
-    bool before_execute(Ticket t,std::uintptr_t queue,bool closed,bool color_rt){
-        if(!exact(t) || !recording_ || execute_called_ || failed_ || queue!=t.input.queue || !closed || !color_rt || state_!=4)return false;
+    bool color_ready(Ticket t,Recording binding)const {
+        return recording_matches(t,binding) && available_ && !copy_active_ && state_==4;
+    }
+    template<class Before,class Copy,class After>
+    bool copy_source(Ticket t,Recording binding,std::uintptr_t destination_identity,
+                     Before&& before,Copy&& copy,After&& after){
+        if(!color_ready(t,binding) || execute_called_ || !destination_identity ||
+            destination_identity==binding.resource_identity)return false;
+        if(!transition(t,binding,4,0x800))return false;
+        copy_active_=true;
+        try {
+            before();copy();after(); // exact own helper batches/copy, no replay
+        } catch(...) { copy_active_=false;failed_=true;throw; } // partial recording never gains readiness
+        copy_active_=false;
+        const bool restored=transition(t,binding,0x800,4);
+        if(!restored)failed_=true;return restored;
+    }
+    bool before_execute(Ticket t,Recording binding,std::uintptr_t queue,bool closed){
+        if(!color_ready(t,binding) || execute_called_ || queue!=t.input.queue || !closed)return false;
         execute_called_=true;return true;
     }
-    bool execution_returned(Ticket t,std::uintptr_t queue,bool closed,bool color_rt){
-        if(!exact(t) || !recording_ || !execute_called_ || executed_ || failed_ || queue!=t.input.queue || !closed || !color_rt || state_!=4)return false;
+    bool execution_returned(Ticket t,Recording binding,std::uintptr_t queue,bool closed){
+        if(!color_ready(t,binding) || !execute_called_ || executed_ || queue!=t.input.queue || !closed)return false;
         executed_=true;return true;
     }
     bool signal(Ticket t,std::uintptr_t queue,bool success,std::uint64_t value){
@@ -81,7 +109,7 @@ public:
     bool releasable(Ticket t)const{
         // No write: successful Wait already guarantees color RT + session queue.
         // Recorded write: exact closed recording submitted/restored on that queue.
-        return exact(t) && available_ && !failed_ && !release_called_ &&
+        return exact(t) && available_ && !failed_ && !copy_active_ && !release_called_ &&
             (!execute_called_ || (executed_ && signalled_ && fence_value_));
     }
     template<class Call> XrResult release(Ticket t,Call&& call){

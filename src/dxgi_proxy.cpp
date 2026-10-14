@@ -47295,12 +47295,22 @@ using Mode3HudProjectionRoute =
 
 bool record_fsr_hudless_xr_color(
     XrEyeSwapchain& swapchain, uint32_t image_index,
-    size_t allocator_slot) {
+    size_t allocator_slot, w3vr::xr_image::Image* image_protocol = nullptr,
+    w3vr::xr_image::Ticket image_ticket = {},
+    w3vr::xr_image::Recording image_recording = {}) {
     if (g_d3d12_device == nullptr || g_xr_command_list == nullptr ||
         image_index >= swapchain.images.size() ||
         allocator_slot >= g_fsr_hudless_xr_slots.size()) return false;
     ID3D12Resource* const source = swapchain.images[image_index].texture;
     if (source == nullptr) return false;
+    auto* const command = g_xr_command_list;
+    auto source_identity = image_protocol ? w3vr::modern_graphics_binding::identity(source)
+        : w3vr::modern_graphics_binding::ComPtr<IUnknown>{};
+    const w3vr::xr_image::Recording actual_recording{
+        reinterpret_cast<uintptr_t>(command),reinterpret_cast<uintptr_t>(source),
+        reinterpret_cast<uintptr_t>(source_identity.Get()),image_index};
+    if(image_protocol && (actual_recording!=image_recording ||
+        !image_protocol->color_ready(image_ticket,actual_recording)))return false;
     const D3D12_RESOURCE_DESC description = source->GetDesc();
     if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         description.DepthOrArraySize != 2) return false;
@@ -47342,15 +47352,23 @@ bool record_fsr_hudless_xr_color(
                 D3D12_RESOURCE_STATE_COPY_SOURCE),
         barrier(slot.resource, D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST)};
-    g_xr_command_list->ResourceBarrier(2, before.data());
-    g_xr_command_list->CopyResource(slot.resource, source);
     const std::array<D3D12_RESOURCE_BARRIER, 2> after{
         barrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_RENDER_TARGET),
         barrier(slot.resource, D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_COMMON)};
-    g_xr_command_list->ResourceBarrier(2, after.data());
-    return true;
+    const auto before_copy=[&]{command->ResourceBarrier(2,before.data());};
+    const auto copy=[&]{command->CopyResource(slot.resource,source);};
+    const auto after_copy=[&]{command->ResourceBarrier(2,after.data());};
+    if(image_protocol){
+        // Canonical IUnknown identities are retained during these callbacks.
+        // The new destination is an own committed resource; this is not a
+        // lifetime proof for runtime images, external aliases or GPU consumers.
+        auto destination_identity=w3vr::modern_graphics_binding::identity(slot.resource);
+        return image_protocol->copy_source(image_ticket,actual_recording,
+            reinterpret_cast<uintptr_t>(destination_identity.Get()),before_copy,copy,after_copy);
+    }
+    before_copy();copy();after_copy();return true;
 }
 
 void publish_fsr_hudless_xr_color(
@@ -52184,6 +52202,8 @@ void render_openxr_test_frame(
         const auto image_session=managed_frame?modern_xr_session_graphics(image_binding):w3vr::modern_xr_graphics_binding::Snapshot{};
         auto* image_protocol=managed_frame?modern_xr_color_image_protocol():nullptr;
         w3vr::xr_image::Ticket image_ticket;
+        w3vr::xr_image::Recording image_recording;
+        w3vr::modern_graphics_binding::ComPtr<IUnknown> image_resource_identity;
         if(managed_frame){
             submitted=submitted && image_protocol && image_session &&
                 modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
@@ -52302,7 +52322,13 @@ void render_openxr_test_frame(
             }
         }
 
-        if(managed_frame && submitted)submitted=image_protocol->start_recording(image_ticket,image_index,true);
+        if(managed_frame && submitted){
+            auto* resource=swapchain.images[image_index].texture;
+            image_resource_identity=w3vr::modern_graphics_binding::identity(resource);
+            image_recording={reinterpret_cast<uintptr_t>(g_xr_command_list),reinterpret_cast<uintptr_t>(resource),
+                reinterpret_cast<uintptr_t>(image_resource_identity.Get()),image_index};
+            submitted=image_protocol->start_recording(image_ticket,image_recording,true);
+        }
         if (submitted) {
             auto* texture = swapchain.images[image_index].texture;
             if(modern_sources)modern_sources->xr_destination=texture;
@@ -52388,7 +52414,8 @@ void render_openxr_test_frame(
                 to_rtv.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
                 if(!managed_frame || to_rtv.Transition.StateBefore!=to_rtv.Transition.StateAfter){
                         if(managed_frame && !image_protocol->transition(image_ticket,
-                            static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
+                            {reinterpret_cast<uintptr_t>(g_xr_command_list),reinterpret_cast<uintptr_t>(to_rtv.Transition.pResource),
+                             image_recording.resource_identity,image_index},static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
                         g_xr_command_list->ResourceBarrier(1, &to_rtv);
                     }
 
@@ -54438,7 +54465,8 @@ void render_openxr_test_frame(
                 std::swap(to_rtv.Transition.StateBefore, to_rtv.Transition.StateAfter);
                 if(!managed_frame || to_rtv.Transition.StateBefore!=to_rtv.Transition.StateAfter){
                         if(managed_frame && !image_protocol->transition(image_ticket,
-                            static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
+                            {reinterpret_cast<uintptr_t>(g_xr_command_list),reinterpret_cast<uintptr_t>(to_rtv.Transition.pResource),
+                             image_recording.resource_identity,image_index},static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
                         g_xr_command_list->ResourceBarrier(1, &to_rtv);
                     }
 
@@ -54570,7 +54598,8 @@ void render_openxr_test_frame(
                         to_rtv.Transition.StateAfter);
                     if(!managed_frame || to_rtv.Transition.StateBefore!=to_rtv.Transition.StateAfter){
                         if(managed_frame && !image_protocol->transition(image_ticket,
-                            static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
+                            {reinterpret_cast<uintptr_t>(g_xr_command_list),reinterpret_cast<uintptr_t>(to_rtv.Transition.pResource),
+                             image_recording.resource_identity,image_index},static_cast<uint32_t>(to_rtv.Transition.StateBefore),static_cast<uint32_t>(to_rtv.Transition.StateAfter)))submitted=false;
                         g_xr_command_list->ResourceBarrier(1, &to_rtv);
                     }
                 }
@@ -55000,7 +55029,8 @@ void render_openxr_test_frame(
             command_list_recording && submitted && hud_composite_ready &&
             (!cinema_panel || cinema_projection_panel_ready) &&
             record_fsr_hudless_xr_color(
-                swapchain, image_index, g_xr_command_allocator_index);
+                swapchain, image_index, g_xr_command_allocator_index,
+                managed_frame?image_protocol:nullptr,image_ticket,image_recording);
         if (command_list_recording && submitted && hud_composite_ready &&
             (!cinema_panel || cinema_projection_panel_ready)) {
             const bool collect_hud_audit =
@@ -55091,14 +55121,16 @@ void render_openxr_test_frame(
                 if(managed_frame)execute_admitted=execute_admitted &&
                     modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
                     modern_xr_session_current(image_session,image_binding) &&
-                    image_protocol->before_execute(image_ticket,reinterpret_cast<uintptr_t>(submit_queue),true,image_protocol->color_ready(image_ticket));
+                    image_recording.command==reinterpret_cast<uintptr_t>(lists[0]) &&
+                    image_recording.resource==reinterpret_cast<uintptr_t>(swapchain.images[image_index].texture) &&
+                    image_protocol->before_execute(image_ticket,image_recording,reinterpret_cast<uintptr_t>(submit_queue),true);
                 if(!execute_admitted){
                     g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
                     submitted=false;
                 }else{
                     submit_queue->ExecuteCommandLists(1, lists);
-                    if(managed_frame && !image_protocol->execution_returned(image_ticket,
-                        reinterpret_cast<uintptr_t>(submit_queue),true,image_protocol->color_ready(image_ticket)))submitted=false;
+                    if(managed_frame && !image_protocol->execution_returned(image_ticket,image_recording,
+                        reinterpret_cast<uintptr_t>(submit_queue),true))submitted=false;
                     if (fsr_hudless_recorded) {
                         publish_fsr_hudless_xr_color(
                             g_xr_command_allocator_index,
