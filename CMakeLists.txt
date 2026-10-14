@@ -84,6 +84,15 @@ set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
+    add_executable(w3vr_xr_fence_completion_tests tests/xr_fence_completion_tests.cpp)
+    target_include_directories(w3vr_xr_fence_completion_tests PRIVATE src)
+    target_compile_definitions(w3vr_xr_fence_completion_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(w3vr_xr_fence_completion_tests PRIVATE dxguid)
+    set_target_properties(w3vr_xr_fence_completion_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/own-xr-fence-tests")
+    add_test(NAME xr_exact_fence_completion COMMAND w3vr_xr_fence_completion_tests)
+    set_tests_properties(xr_exact_fence_completion PROPERTIES TIMEOUT 30
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:w3vr_xr_fence_completion_tests>")
     add_executable(w3vr_openxr_image_protocol_tests tests/openxr_image_protocol_tests.cpp)
     target_include_directories(w3vr_openxr_image_protocol_tests PRIVATE src "${W3VR_OPENXR_DIR}/include")
     add_test(NAME openxr_image_protocol COMMAND w3vr_openxr_image_protocol_tests)
