@@ -84,6 +84,16 @@ set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
+    add_executable(w3vr_modern_xr_graphics_binding_tests tests/modern_xr_graphics_binding_tests.cpp)
+    target_include_directories(w3vr_modern_xr_graphics_binding_tests PRIVATE src)
+    target_compile_definitions(w3vr_modern_xr_graphics_binding_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(w3vr_modern_xr_graphics_binding_tests PRIVATE dxguid user32)
+    # Own system-API test stays away from the mod's dxgi.dll output directory.
+    set_target_properties(w3vr_modern_xr_graphics_binding_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/own-xr-session-tests")
+    add_test(NAME modern_xr_session_graphics COMMAND w3vr_modern_xr_graphics_binding_tests)
+    set_tests_properties(modern_xr_session_graphics PROPERTIES
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:w3vr_modern_xr_graphics_binding_tests>")
     add_executable(w3vr_modern_dlss_ownership_tests
         tests/modern_dlss_ownership_tests.cpp src/modern_dlss_ownership.cpp)
     target_include_directories(w3vr_modern_dlss_ownership_tests PRIVATE src)
