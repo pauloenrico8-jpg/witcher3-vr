@@ -37,6 +37,7 @@
 #include "modern_effect_reprojection.h"
 #include "modern_prepared_frame.h"
 #include "modern_xr_graphics_binding.h"
+#include "openxr_session_events.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -49013,24 +49014,23 @@ void poll_openxr_events() {
     while (pfn_xrPollEvent(g_xr_instance, &event) == XR_SUCCESS) {
         if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
-            g_xr_session_state = changed->state;
+            const auto decision=w3vr::session_events::decide(g_xr_session,*changed,g_xr_session_running);
+            if(!decision.accepted){event={XR_TYPE_EVENT_DATA_BUFFER};continue;}
+            g_xr_session_state = decision.state;
             if (changed->state != XR_SESSION_STATE_FOCUSED) {
                 g_motion_controllers.invalidate();
                 g_hand_pose_history.reset();
             }
             log_line("OpenXR session state changed=%d", static_cast<int>(g_xr_session_state));
 
-            if (g_xr_session_state == XR_SESSION_STATE_READY && !g_xr_session_running) {
+            if (decision.action == w3vr::session_events::Action::Begin) {
                 reset_native_asymmetric_noaa_state();
                 XrSessionBeginInfo begin_info{XR_TYPE_SESSION_BEGIN_INFO};
                 begin_info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 const auto result = pfn_xrBeginSession(g_xr_session, &begin_info);
                 g_xr_session_running = XR_SUCCEEDED(result);
                 log_line("OpenXR xrBeginSession result=%s (%d)", xr_result_name(result), result);
-            } else if ((g_xr_session_state == XR_SESSION_STATE_STOPPING ||
-                        g_xr_session_state == XR_SESSION_STATE_LOSS_PENDING ||
-                        g_xr_session_state == XR_SESSION_STATE_EXITING) &&
-                       g_xr_session_running &&
+            } else if (decision.action == w3vr::session_events::Action::End &&
                        pfn_xrEndSession != nullptr) {
                 const auto result = pfn_xrEndSession(g_xr_session);
                 {
@@ -49041,15 +49041,23 @@ void poll_openxr_events() {
                     g_xr_render_frame_prepared.store(false, std::memory_order_release);
                     g_xr_render_views_valid = false;
                 }
-                g_xr_session_running = false;
+                g_xr_session_running = w3vr::session_events::after_end(g_xr_session_running,result);
                 reset_native_asymmetric_noaa_state();
                 log_line("OpenXR xrEndSession result=%s (%d)", xr_result_name(result), result);
+            } else if (decision.action == w3vr::session_events::Action::Terminal) {
+                // Admission closes without pretending EndSession succeeded or
+                // releasing GPU/COM resources. Destroy/drain remains separate.
+                if(auto* registry=modern_xr_graphics_registry())registry->stop_no_release();
             }
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
             g_motion_controllers.reference_space_change(*changed);
         } else if (event.type ==
                 XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+            const auto* changed=reinterpret_cast<const XrEventDataVisibilityMaskChangedKHR*>(&event);
+            if(!w3vr::session_events::visibility_event(g_xr_session,*changed)) {
+                event={XR_TYPE_EVENT_DATA_BUFFER};continue;
+            }
             // [FIX:VISIBILITY-MASK-FIT 3/7] The runtime may change its lens
             // contour after session creation (for example with a different
             // distortion profile). Rebuild both the camera span and target
@@ -49304,12 +49312,12 @@ void update_motion_controllers(XrTime display_time) {
 
 void prepare_openxr_render_frame(uint32_t origin) {
     if (!g_config.hmd_freelook || g_xr_render_frame_prepared.load() ||
-        !g_xr_resources_ready || !g_xr_session_running) {
+        !g_xr_resources_ready || !w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state)) {
         return;
     }
 
     poll_openxr_events();
-    if (!g_xr_session_running || g_xr_render_frame_prepared.load()) {
+    if (!w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state) || g_xr_render_frame_prepared.load()) {
         return;
     }
 
@@ -49384,12 +49392,12 @@ void prepare_openxr_render_frame(uint32_t origin) {
 // to the pair which is actually ready for publication.
 XrTime locate_openxr_mode3_pair_pose() {
     if (!g_config.hmd_freelook || !g_xr_resources_ready ||
-        !g_xr_session_running) {
+        !w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state)) {
         return 0;
     }
 
     poll_openxr_events();
-    if (!g_xr_session_running) {
+    if (!w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state)) {
         return 0;
     }
 
@@ -51446,13 +51454,13 @@ void render_openxr_test_frame(
     w3vr::minimal_xr_log::write("XR_ENTER", g_present_count.load(std::memory_order_relaxed), trace_pair_id);
     w3vr::pipeline_flight::CpuScope flight_frame_cpu{
         w3vr::pipeline_flight::Phase::XrFrame};
-    if (!g_xr_resources_ready || !g_xr_session_running) {
+    if (!g_xr_resources_ready || !w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state)) {
         poll_openxr_events();
         return;
     }
 
     poll_openxr_events();
-    if (!g_xr_session_running) {
+    if (!w3vr::session_events::frames_allowed(g_xr_session_running,g_xr_session_state)) {
         return;
     }
 
