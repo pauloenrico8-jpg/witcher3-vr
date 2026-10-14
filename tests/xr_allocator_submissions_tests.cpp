@@ -52,8 +52,10 @@ void completed_path(){
     w3vr::modern_eye_source_use::Store sources;
     auto source_use=std::make_unique<w3vr::modern_eye_source_use::Use>();
     source_use->textures[0]=f.upload;source_use->textures[1]=f.output;source_use->queue=f.queue;
-    source_use->fence=f.shared;source_use->recording=f.command;source_use->allocator=f.allocator;source_use->recorded=true;
+    source_use->submission_fence=f.shared;source_use->fence=f.shared;source_use->recording=f.command;source_use->allocator=f.allocator;source_use->recorded=true;
     auto* use=sources.adopt(std::move(source_use));
+    check(sources.submission_matches(use,f.queue.Get(),f.shared.Get())&&
+        !sources.submission_matches(use,f.other.Get(),f.shared.Get()),"shared submission identity before execution");
     auto t=store.prepare(0,f.objects());check(bool(t.anchor)&&store.size()==1,"prepare retains exact objects");
     auto replay=t;replay.nonce++;ID3D12CommandList* lists[]{f.command.Get()};
     check(!store.before_execute(replay,f.queue.Get(),1,lists)&&!store.before_execute(t,f.other.Get(),1,lists)&&
@@ -65,7 +67,10 @@ void completed_path(){
     check(store.after_shared_signal(t,f.queue.Get(),f.shared.Get(),original,5)&&signal_calls==prior+1,"own private signal");
     check(!store.after_shared_signal(t,f.queue.Get(),f.shared.Get(),original,5)&&signal_calls==prior+1,"duplicate private signal");
     const auto receipt=store.receipt(t);check(receipt.fence&&receipt.value==1&&receipt.fence.Get()!=f.shared.Get(),"private source retirement receipt");
-    use->fence=receipt.fence;check(sources.after_signal(use,original,receipt.value),"source private marker");sources.finish_cpu(use);
+    use->fence=receipt.fence;check(sources.after_signal(use,original,receipt.value),"source private marker");
+    check(sources.submission_matches(use,f.queue.Get(),f.shared.Get())&&
+        !sources.submission_matches(use,f.queue.Get(),receipt.fence.Get()),"private retirement invalidated shared submission identity");
+    sources.finish_cpu(use);check(!sources.submission_matches(use,f.queue.Get(),f.shared.Get()),"ended CPU source remained current");
     auto* retained_output=f.output.Get();f.output.Reset();check(retained_output->GetDesc().Width==512,"caller dropped resource ref");
     store.finish_cpu(t);
     check(SUCCEEDED(f.shared->Signal(900))&&f.shared->GetCompletedValue()==900,"advance unrelated shared marker while GPU blocked");
