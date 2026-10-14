@@ -40,6 +40,7 @@
 #include "openxr_session_events.h"
 #include "openxr_frame_cycle.h"
 #include "openxr_image_protocol.h"
+#include "xr_fence_completion.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -46996,13 +46997,17 @@ bool wait_for_xr_command_allocator(size_t index) {
         return false;
     }
     const uint64_t value = g_xr_command_allocator_fences[index];
-    if (value == 0 || g_xr_fence->GetCompletedValue() >= value) {
-        return true;
-    }
-    if (FAILED(g_xr_fence->SetEventOnCompletion(value, g_xr_fence_event))) {
-        return false;
-    }
-    return WaitForSingleObject(g_xr_fence_event, 1000) == WAIT_OBJECT_0;
+    // Capture the exact interface/event used for both observations. The host's
+    // existing Present serialization supplies the caller scope; this helper
+    // does not establish shutdown, external-call or allocator ownership.
+    auto* const fence = g_xr_fence;
+    const HANDLE event = g_xr_fence_event;
+    return w3vr::xr_fence::wait_for_completion(value,
+        [fence] { return fence->GetCompletedValue(); },
+        [fence, event](uint64_t target) {
+            return SUCCEEDED(fence->SetEventOnCompletion(target, event));
+        },
+        [event] { return WaitForSingleObject(event, 1000) == WAIT_OBJECT_0; });
 }
 
 // [FIX:RETAINED-EYE-HUD 4/9] This private pipeline samples only REDengine's
