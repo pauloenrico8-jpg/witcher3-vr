@@ -162,10 +162,57 @@ void reset_receipt_checks(){
     require(!reset.matches(contract,desc,owner,77,altered,copied,true) &&
         !reset.matches(contract,desc,owner,77,c.clock,copied,true),"revoked reset became valid again");
 }
+void producer_reset_receipt_checks(){
+    namespace ts=w3vr::temporal_source;
+    ts::ResetCandidate c{contract,module,0,owner,0x500000,0x5006D0,module+ts::reset_source,77};
+    c.site=ts::SourceSite::producer_update;c.caller=module+ts::producer_reset_return;
+    require(sample_from(values(),c.clock),"own early reset identity unavailable");
+    w3vr::engine_camera::TemporalRecord canonical{};
+    for(std::size_t i=1;i<canonical.size();++i)canonical[i]=static_cast<std::uint8_t>(i*17+3);
+    const auto copied=canonical;const auto before=own_builder_calls;
+    ts::Captured pending;require(pending.capture_reset(c,canonical,copied,c.history,true)&&pending.reset_observed(),"early invalid copy not staged");
+    ts::Observation output{};output.kind=ts::Kind::built;ts::Prefix prefix{};prefix.fill(0xA5);
+    auto record=copied;record[0]=0xA5;
+    require(!pending.observation(output)&&output.kind==ts::Kind::built && !pending.previous_inputs(prefix)&&prefix[0]==0xA5 &&
+        !pending.built_record(record)&&record[0]==0xA5,"pending reset published history or constructor time");
+    require(pending.matches(contract,desc,owner,77,c.clock,copied,true)&&pending.observation(output)&&output.kind==ts::Kind::reset &&
+        output.reset_record==copied,"first real descriptor did not receive exact own invalid values");
+    require(!pending.previous_inputs(prefix)&&!pending.built_record(record),"bound reset promoted itself to previous inputs or valid record");
+    require(!pending.matches(contract,desc+8,owner,77,c.clock,copied,true)&&
+        !pending.matches(contract,desc,owner,77,c.clock,copied,true),"bound reset retargeted or rearmed");
+    for(unsigned k=0;k<14;++k){
+        auto bad=c;if(k==0)bad.descriptor=desc;if(k==1)bad.module=0;if(k==2)bad.module++;
+        if(k==3)bad.caller++;if(k==4)bad.caller=module+ts::reset_return;if(k==5)bad.site=static_cast<ts::SourceSite>(99);
+        if(k==6)bad.source++;if(k==7)bad.history++;if(k==8)bad.owner=0;if(k==9)bad.thread=0;
+        if(k==10)bad.contract=&w3vr::engine_camera::remastered_500c;if(k==11)bad.clock.time=std::nextafter(bad.clock.time,INFINITY);
+        if(k==12)bad.director=UINTPTR_MAX-7;if(k==13)bad.module=UINTPTR_MAX&~std::uintptr_t(0xFFF);
+        ts::Captured rejected;require(!ts::accepted(bad)&&!rejected.capture_reset(bad,canonical,copied,c.history,true),"foreign early reset accepted");
+        require(!rejected.capture_reset(c,canonical,copied,c.history,true),"early reset failed attempt rearmed");
+    }
+    for(unsigned k=0;k<8;++k){
+        ts::Captured fixture;require(fixture.capture_reset(c,canonical,copied,c.history,true),"early reset binding fixture failed");
+        auto d=desc,o=owner;auto tid=77u;auto clock=c.clock;auto changed=copied;bool live=true;
+        if(k==0)d=0;if(k==1)d++;if(k==2)o++;if(k==3)tid++;if(k==4)clock.ticks++;
+        if(k==5)clock.scale*=2;if(k==6)changed[0x10]^=1;if(k==7)live=false;
+        require(!fixture.matches(contract,d,o,tid,clock,changed,live)&&
+            !fixture.matches(contract,desc,owner,77,c.clock,copied,true),"invalid binding got a second opportunity");
+    }
+    ts::Captured changed_valid;auto valid=canonical;valid[0]=1;
+    require(!changed_valid.capture_reset(c,valid,valid,c.history,true),"valid record promoted to canonical reset");
+    ts::Captured bad_return;require(!bad_return.capture_reset(c,canonical,copied,c.history+8,true),"wrong leaf result accepted");
+    for(std::size_t i=0;i<copied.size();++i){
+        ts::Captured fields;auto changed=copied;changed[i]^=1;
+        const bool padding=(i>=1&&i<4)||(i>=0xC&&i<0x10)||(i>=0x2C&&i<0x30);
+        require(fields.capture_reset(c,canonical,changed,c.history,true)==padding,"early invalid field/padding copy wrong");
+        if(padding)require(fields.matches(contract,desc,owner,77,c.clock,changed,true),"native padding required source equality");
+    }
+    require(own_builder_calls==before,"early reset/binding called a constructor");
+}
 int main(){
     source_receipt_checks();
     producer_source_receipt_checks();
     reset_receipt_checks();
+    producer_reset_receipt_checks();
     require(selected(contract)==&current && !selected(nullptr) &&
         !selected(&w3vr::engine_camera::legacy_404) && !selected(&w3vr::engine_camera::remastered_500c),"unexamined caller gained profile");
     auto copied_contract=*contract;require(!selected(&copied_contract),"copied camera contract admitted");
