@@ -36,6 +36,7 @@
 #include "modern_camera_history_materialization.h"
 #include "modern_effect_reprojection.h"
 #include "modern_prepared_frame.h"
+#include "modern_xr_graphics_binding.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -1532,6 +1533,17 @@ IDXGISwapChain* g_game_swapchain{};
 // Process-lifetime root: no automatic COM cleanup from DllMain. Owning
 // snapshots survive registry revocation; this is not an all-call/unload barrier.
 std::atomic<w3vr::modern_graphics_binding::Registry*> g_modern_graphics_registry{};
+std::atomic<w3vr::modern_xr_graphics_binding::Registry*> g_modern_xr_graphics_registry{};
+w3vr::modern_xr_graphics_binding::Registry* modern_xr_graphics_registry(bool create=false) {
+    auto* current=g_modern_xr_graphics_registry.load(std::memory_order_acquire);
+    if(current || !create)return current;
+    auto* candidate=new(std::nothrow) w3vr::modern_xr_graphics_binding::Registry;
+    if(!candidate)return nullptr;
+    if(!g_modern_xr_graphics_registry.compare_exchange_strong(current,candidate,std::memory_order_acq_rel)) {
+        delete candidate;return current;
+    }
+    return candidate;
+}
 HRESULT resolve_modern_binding_endpoint(IUnknown*,REFIID,void**) noexcept;
 w3vr::modern_graphics_binding::Registry* modern_graphics_registry(bool create=false){
     auto* current=g_modern_graphics_registry.load(std::memory_order_acquire);
@@ -1986,6 +1998,7 @@ std::atomic<bool> g_modern_noaa_consumer_blocked{};
 // Process-lifetime POD root. In-flight or failed-signal references are not
 // released by a static destructor in DllMain. This is not an unload barrier.
 struct ModernNoAASourceUse : w3vr::modern_eye_source_use::Use {
+    w3vr::modern_xr_graphics_binding::Snapshot xr_binding;
     w3vr::modern_graphics_binding::Snapshot binding;
     w3vr::modern_eye_pair::Claim claim{};
     bool native_asymmetric{};
@@ -32194,12 +32207,30 @@ bool modern_noaa_output_requested() {
         (w3vr::render_core::modern_selected(g_engine_camera_temporal_contract.load(std::memory_order_acquire)) ||
             g_remastered_core_installed_profile.load(std::memory_order_acquire));
 }
+bool modern_xr_native_graphics(const w3vr::modern_graphics_binding::Snapshot& binding) {
+    using w3vr::command_list_identity::Owner;
+    return binding && modern_graphics_current(binding) &&
+        classify_command_list_owner(binding->device.Get())==Owner::Native &&
+        classify_command_list_owner(binding->queue.Get())==Owner::Native;
+}
+w3vr::modern_xr_graphics_binding::Snapshot modern_xr_session_graphics(
+    const w3vr::modern_graphics_binding::Snapshot& graphics) {
+    auto* registry=modern_xr_graphics_registry();
+    return registry ? registry->acquire(reinterpret_cast<uintptr_t>(g_xr_instance),
+        reinterpret_cast<uintptr_t>(g_xr_session),graphics,modern_xr_native_graphics(graphics)):nullptr;
+}
+bool modern_xr_session_current(const w3vr::modern_xr_graphics_binding::Snapshot& session,
+    const w3vr::modern_graphics_binding::Snapshot& graphics) {
+    auto* registry=modern_xr_graphics_registry();
+    return registry && registry->current(session,reinterpret_cast<uintptr_t>(g_xr_instance),
+        reinterpret_cast<uintptr_t>(g_xr_session),graphics,modern_xr_native_graphics(graphics));
+}
 bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contract) {
     auto binding=modern_graphics_snapshot();
     return modern_noaa_output_requested() && remastered_core_ready_for(contract) &&
         g_modern_backbuffer_hook_receipts.ready() && g_resize_buffers1_ready.load(std::memory_order_acquire) &&
         binding && method<void*>(binding->chain.Get(),39)==g_resize_buffers1_target.load(std::memory_order_acquire) &&
-        modern_graphics_current(binding) &&
+        modern_graphics_current(binding) && modern_xr_session_graphics(binding) &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire) &&
         !mode3_aer_presentation_active() && !g_config.steady_icons;
@@ -32209,6 +32240,8 @@ ModernNoAASourceUse* acquire_modern_noaa_sources(w3vr::modern_eye_pair::Target t
     if(!modern_noaa_output_ready(contract))return nullptr;
     auto binding=modern_graphics_snapshot();if(!binding)return nullptr;
     auto use=std::make_unique<ModernNoAASourceUse>();use->binding=binding;
+    use->xr_binding=modern_xr_session_graphics(binding);
+    if(!use->xr_binding)return nullptr;
     std::scoped_lock lock{g_streamline_capture_mutex};
     collect_modern_noaa_source_uses();
     const auto* profile=g_remastered_core_installed_profile.load(std::memory_order_acquire);
@@ -32240,7 +32273,8 @@ bool modern_noaa_sources_current(const ModernNoAASourceUse* use,w3vr::modern_eye
     return w3vr::modern_eye_pair::matches_target(use->claim.outputs,target) &&
         modern_prepared_frame_allows({target.display_time,use->claim.outputs[0].identity.frame.pair,
             use->claim.outputs[0].identity.frame.generation}) &&
-        modern_noaa_output_ready(contract) && modern_graphics_current(use->binding) && use->fence.Get()==g_xr_fence &&
+        modern_noaa_output_ready(contract) && modern_graphics_current(use->binding) &&
+        modern_xr_session_current(use->xr_binding,use->binding) && use->fence.Get()==g_xr_fence &&
         g_modern_output_consumption.current(use->claim,contract,
             g_remastered_core_installed_profile.load(std::memory_order_acquire),true,
             g_streamline_capture_generation.load(std::memory_order_acquire),reinterpret_cast<uintptr_t>(use->queue.Get()),use->binding->epoch);
@@ -48909,16 +48943,32 @@ void initialize_openxr_probe() {
         XrGraphicsBindingD3D12KHR d3d12_binding{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
         d3d12_binding.device = g_d3d12_device;
         d3d12_binding.queue = g_command_queue;
+        const bool modern_session=modern_noaa_output_requested();
+        w3vr::modern_xr_graphics_binding::Ticket session_ticket;
+        if(modern_session) {
+            auto graphics=modern_graphics_snapshot();auto* registry=modern_xr_graphics_registry(true);
+            if(!registry || !registry->begin(graphics,reinterpret_cast<uintptr_t>(g_xr_instance),
+                    modern_xr_native_graphics(graphics),session_ticket))return;
+            d3d12_binding.device=session_ticket.graphics->device.Get();
+            d3d12_binding.queue=session_ticket.graphics->queue.Get();
+        }
 
         XrSessionCreateInfo session_info{XR_TYPE_SESSION_CREATE_INFO};
         session_info.next = &d3d12_binding;
         session_info.systemId = g_xr_system;
         result = pfn_xrCreateSession(g_xr_instance, &session_info, &g_xr_session);
+        bool session_binding_ready=!modern_session;
+        if(modern_session) {
+            auto current=modern_graphics_snapshot();
+            try {session_binding_ready=modern_xr_graphics_registry()->complete(session_ticket,
+                XR_SUCCEEDED(result),reinterpret_cast<uintptr_t>(g_xr_session),current,
+                modern_xr_native_graphics(current));} catch(...) {session_binding_ready=false;}
+        }
         log_line("OpenXR xrCreateSession(D3D12) result=%s (%d) session=%p",
             xr_result_name(result),
             result,
             g_xr_session);
-        if (XR_FAILED(result)) {
+        if (XR_FAILED(result) || !session_binding_ready) {
             return;
         }
 
@@ -54879,6 +54929,7 @@ void render_openxr_test_frame(
                 if(modern_sources){
                     std::scoped_lock lock{g_streamline_capture_mutex};
                     execute_admitted=modern_graphics_current(modern_sources->binding) &&
+                        modern_xr_session_current(modern_sources->xr_binding,modern_sources->binding) &&
                         g_modern_noaa_source_store.before_execute(modern_sources,submit_queue,1,lists);
                 }
                 if(!execute_admitted){
@@ -56876,6 +56927,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void* reserved) {
         DisableThreadLibraryCalls(module);
     } else if (reason == DLL_PROCESS_DETACH) {
         if(auto* registry=g_modern_graphics_registry.load(std::memory_order_acquire))registry->stop_no_release();
+        if(auto* registry=g_modern_xr_graphics_registry.load(std::memory_order_acquire))registry->stop_no_release();
         // At process termination dependency teardown order is unspecified and
         // the OS reclaims every object. In particular, RenderDoc may already
         // be unloaded while these COM pointers still reference its vtables.
