@@ -1,4 +1,49 @@
 # Adaptação para Remastered — estado da renderização
+## Fila gráfica conservada pela sessão — 13 de outubro
+
+A sessão VR escolhe uma fila da placa de vídeo ao ser criada. Uma fila é o
+caminho pelo qual o programa envia as tarefas de desenho. O mod agora conserva
+essa ligação e confere se a apresentação ainda usa os mesmos objetos.
+
+O fluxo, passo a passo:
+
+1. `modern_xr_graphics_binding.h` guarda referências ao dispositivo, à fila e
+   à cadeia de apresentação já identificados. Essas referências mantêm as
+   interfaces disponíveis; elas não congelam os pixels nem provam desenho pronto.
+2. `dxgi_proxy.cpp` fornece ao OpenXR esses mesmos dispositivos e fila concretos
+   no caminho moderno. Só confirma a ligação depois do resultado original,
+   sessão válida e conferência da origem. Uma falha impede rearmar essa tentativa.
+3. Antes de adquirir imagens, executar a lista de tarefas e encerrar o quadro,
+   confere a sessão e a ligação conservadas. Outra fila é recusada mesmo que use
+   o mesmo dispositivo. Outra sessão, origem desconhecida ou cópia da ligação
+   também não ganha permissão.
+4. Um redimensionamento com os mesmos objetos pode conservar a ligação da
+   sessão. A mudança da fila ou da cadeia exige um protocolo de encerramento;
+   o código não redireciona uma sessão existente silenciosamente. As regras
+   anteriores de geração, cópias e sinais continuam sendo exigidas.
+5. A revogação fecha a admissão e conserva as referências. Isso não substitui
+   a espera pelos sinais da placa de vídeo nem a proteção completa de todas as
+   chamadas durante o encerramento do jogo.
+
+Escolhi conservar a origem da sessão porque o envio vinha consultando a fila
+atual, que pode mudar depois da criação. O OpenXR exige que a imagem devolvida
+esteja disponível na fila definida para a sessão. [Regra oficial do OpenXR](https://registry.khronos.org/OpenXR/specs/1.1/man/html/XR_KHR_D3D12_enable-swapchain-image-state.html).
+
+A DLL compilou e **123 testes passaram em 13,78 segundos**.
+O teste novo fez **52 conferências**, criando um dispositivo, duas filas DirectX
+reais e uma janela própria oculta com apresentação DXGI. Exigiu recusa da outra
+fila, falhas definitivas, sessões diferentes e conservação das referências.
+Esse executável fica separado da DLL do mod e carrega as bibliotecas gráficas
+pelos caminhos oficiais do Windows. Não carregou o mod nem inicializou o SDK.
+Os identificadores e resultados do OpenXR, assim como a autorização de classe
+nativa do helper, são simulados. Não executou callbacks do host, OpenXR real,
+Witcher ou Quest e não desenhou os dois olhos do jogo.
+
+**O VR ainda não funciona.** Remastered continua fechado e nada experimental
+foi instalado. Ainda faltam a coordenação real das chamadas ao OpenXR, estados
+das imagens, ordem GPU e duração dos recursos do jogo. Esses testes não liberam
+a compatibilidade nem substituem duas imagens novas do jogo em cada quadro.
+
 ## Dois olhos vinculados ao quadro preparado — 13 de outubro
 
 O envio das imagens agora exige o mesmo horário que o OpenXR forneceu ao
