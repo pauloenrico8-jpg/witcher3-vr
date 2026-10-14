@@ -7,6 +7,47 @@ Menções à meta nas etapas antigas são registros históricos. O arquivo compi
 desenvolvimento e não foi instalado no jogo.
 
 
+## Dois olhos vinculados ao quadro preparado — 13 de outubro
+
+O envio das imagens agora exige o mesmo horário que o OpenXR forneceu ao
+preparar o quadro. OpenXR é a interface usada para conversar com o headset.
+Isso liga a pose da cabeça e as duas imagens à mesma preparação.
+
+O fluxo, passo a passo:
+
+1. A fábrica normal prepara um quadro e conserva seu horário. As marcas das
+   duas câmeras carregam esse valor durante o desenho e a captura. O caminho
+   moderno exige a preparação real; uma fábrica recusada não ganha outra rota.
+2. `modern_prepared_frame.h` reserva esse quadro para um único par de olhos.
+   Cada reserva recebe um número próprio. Uma chamada antiga não pode cancelar
+   nem concluir a reserva de uma chamada mais recente.
+3. `modern_eye_pair.h` compara os dois horários com o quadro que será enviado.
+   Exige também olhos distintos, mesmo par e geração, cópias e sinais válidos.
+   Confere novamente antes do envio e impede reapresentar um par já consumido.
+4. Se o produtor falhar antes de encaminhar o par, cancela a reserva exata.
+   A apresentação pode encerrar esse quadro com zero imagens. Encaminhar o par
+   pelo processador ainda não significa que a placa de vídeo terminou o desenho.
+5. O término confirmado do quadro libera a reserva. Uma falha conserva a recusa.
+   Um encerramento de sessão confirmado limpa somente essa ligação e os dados
+   emprestados do quadro; os números de reserva continuam avançando. Referências
+   e cópias da placa de vídeo seguem suas regras de retenção próprias.
+
+Escolhi ligar o horário e a reserva porque um par pode ser novo para o jogo e
+mesmo assim pertencer a outra preparação do headset. A reserva também identifica
+um cancelamento concreto, sem deduzir falha pelo tempo que passou.
+
+A DLL compilou e **122 testes passaram em 13,2 segundos**.
+O teste de apresentação fez **566 conferências com dados próprios**, incluindo
+ambas as versões, horários diferentes, cancelamento antigo, falha no término e
+reinício de sessão. Esses testes não executaram callbacks do mod dentro do jogo,
+OpenXR real ou Quest. Eles não comprovam a produção das imagens no Witcher.
+
+**O VR ainda não funciona.** Remastered continua fechado e nada experimental
+foi instalado. Ainda faltam a coordenação real das chamadas ao OpenXR, a fila
+usada pela sessão e a ordem e duração dos recursos do jogo e da placa de vídeo.
+Somente depois de produzir duas imagens novas do jogo por quadro haverá teste
+no Quest, seguido de mãos, armas, dano e bloqueio por contato físico.
+
 ## Centro de visão nos dados enviados aos efeitos — 13 de outubro
 
 Os efeitos recebem uma tabela de números que relaciona a imagem atual à

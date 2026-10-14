@@ -35,6 +35,7 @@
 #include "modern_camera_history.h"
 #include "modern_camera_history_materialization.h"
 #include "modern_effect_reprojection.h"
+#include "modern_prepared_frame.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -1971,6 +1972,16 @@ std::atomic<uint32_t> g_streamline_dual_evaluate_log_count{};
 std::mutex g_streamline_capture_mutex{};
 w3vr::modern_eye_pair::Pair g_modern_packed_outputs{};
 w3vr::modern_eye_pair::Consumption g_modern_output_consumption{};
+std::mutex g_modern_prepared_frame_mutex;
+w3vr::prepared_frame::Binding g_modern_prepared_frame;
+bool modern_prepared_frame_allows(w3vr::prepared_frame::Identity identity){
+    std::scoped_lock lock{g_modern_prepared_frame_mutex};return g_modern_prepared_frame.allows(identity);
+}
+bool modern_prepared_frame_cancelled(XrTime time){
+    std::scoped_lock lock{g_modern_prepared_frame_mutex};
+    return g_modern_prepared_frame.cancelled_for(time,g_streamline_capture_generation.load(std::memory_order_acquire));
+}
+
 std::atomic<bool> g_modern_noaa_consumer_blocked{};
 // Process-lifetime POD root. In-flight or failed-signal references are not
 // released by a static destructor in DllMain. This is not an unload barrier.
@@ -31595,7 +31606,7 @@ void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* s
     }
     const w3vr::render_core::FrameLabel label{
         reinterpret_cast<uintptr_t>(frame), tag.generation, tag.pair_id,
-        static_cast<int>(tag.eye), tag.render_view_valid, tag.modern_camera_lineage_complete};
+        static_cast<int>(tag.eye), tag.render_view_valid, tag.modern_camera_lineage_complete,tag.hmd_pose.tracking.display_time};
     const RemasteredCoreThreadState labelled{
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
         tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,
@@ -31638,7 +31649,7 @@ void __fastcall hook_remastered_normal_epilogue(void* task) {
     }
     const w3vr::render_core::FrameLabel label{record.frame, tag.generation,
         tag.pair_id, static_cast<int>(tag.eye), tag.render_view_valid,
-        tag.modern_camera_lineage_complete};
+        tag.modern_camera_lineage_complete,tag.hmd_pose.tracking.display_time};
     const RemasteredCoreThreadState labelled{
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
         tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,{},
@@ -32193,7 +32204,7 @@ bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contr
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire) &&
         !mode3_aer_presentation_active() && !g_config.steady_icons;
 }
-ModernNoAASourceUse* acquire_modern_noaa_sources() {
+ModernNoAASourceUse* acquire_modern_noaa_sources(w3vr::modern_eye_pair::Target target) {
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     if(!modern_noaa_output_ready(contract))return nullptr;
     auto binding=modern_graphics_snapshot();if(!binding)return nullptr;
@@ -32206,6 +32217,7 @@ ModernNoAASourceUse* acquire_modern_noaa_sources() {
         !modern_graphics_registry()->owns_child(binding,g_xr_fence) ||
         !w3vr::modern_eye_pair::accepts(g_modern_packed_outputs,contract,profile,true,generation,
             reinterpret_cast<uintptr_t>(binding->queue.Get()),0,binding->epoch))return nullptr;
+    if(!modern_prepared_frame_allows({target.display_time,g_modern_packed_outputs[0].identity.frame.pair,generation}))return nullptr;
     use->queue=binding->queue;use->fence=g_xr_fence;
     for(uint32_t eye=0;eye<2;++eye){
         if(g_modern_packed_outputs[eye].texture!=reinterpret_cast<uintptr_t>(g_packed_present_cache[eye]) ||
@@ -32217,15 +32229,18 @@ ModernNoAASourceUse* acquire_modern_noaa_sources() {
     }
     use->native_asymmetric=g_packed_present_cache_native_asymmetric;
     if(!modern_noaa_output_ready(contract) ||
-        !g_modern_output_consumption.begin(g_modern_packed_outputs,contract,profile,true,generation,
-            reinterpret_cast<uintptr_t>(use->queue.Get()),binding->epoch,{true,true,true,false,false,false},use->claim))return nullptr;
+        !g_modern_output_consumption.begin_for_frame(g_modern_packed_outputs,contract,profile,true,generation,
+            reinterpret_cast<uintptr_t>(use->queue.Get()),binding->epoch,{true,true,true,false,false,false},target,use->claim))return nullptr;
     return static_cast<ModernNoAASourceUse*>(g_modern_noaa_source_store.adopt(std::move(use)));
 }
-bool modern_noaa_sources_current(const ModernNoAASourceUse* use) {
+bool modern_noaa_sources_current(const ModernNoAASourceUse* use,w3vr::modern_eye_pair::Target target) {
     if(!use)return false;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     std::scoped_lock lock{g_streamline_capture_mutex};
-    return modern_noaa_output_ready(contract) && modern_graphics_current(use->binding) && use->fence.Get()==g_xr_fence &&
+    return w3vr::modern_eye_pair::matches_target(use->claim.outputs,target) &&
+        modern_prepared_frame_allows({target.display_time,use->claim.outputs[0].identity.frame.pair,
+            use->claim.outputs[0].identity.frame.generation}) &&
+        modern_noaa_output_ready(contract) && modern_graphics_current(use->binding) && use->fence.Get()==g_xr_fence &&
         g_modern_output_consumption.current(use->claim,contract,
             g_remastered_core_installed_profile.load(std::memory_order_acquire),true,
             g_streamline_capture_generation.load(std::memory_order_acquire),reinterpret_cast<uintptr_t>(use->queue.Get()),use->binding->epoch);
@@ -32386,7 +32401,7 @@ void __fastcall hook_remastered_world_culling(void* manager,void* scene,void* fr
         if(it!=g_engine_dual_frame_eyes.end()) {tag=it->second;found=true;}
     }
     const w3vr::render_core::FrameLabel label{reinterpret_cast<uintptr_t>(frame),tag.generation,
-        tag.pair_id,static_cast<int>(tag.eye),tag.render_view_valid,tag.modern_camera_lineage_complete};
+        tag.pair_id,static_cast<int>(tag.eye),tag.render_view_valid,tag.modern_camera_lineage_complete,tag.hmd_pose.tracking.display_time};
     uintptr_t observed{};world::Context replacement{};
     const bool admitted=found && remastered_core_ready_for(contract) &&
         remastered_camera_copy_ready_for(contract) &&
@@ -42217,6 +42232,7 @@ struct RemasteredProducerScope {
         binding(g_remastered_producer_scope,this,admitted){}
     ~RemasteredProducerScope(){
         pair.cancel();
+        if(xr_ticket.nonce && !xr_dispatched){std::scoped_lock lock{g_modern_prepared_frame_mutex};g_modern_prepared_frame.cancel(xr_ticket);}
         if(history_staged){std::scoped_lock history_lock{g_remastered_camera_history_mutex};
             g_remastered_camera_history.cancel(history_plan.ticket);}
     }
@@ -42231,11 +42247,13 @@ struct RemasteredProducerScope {
     w3vr::temporal_source::Captured temporal_source;
     w3vr::camera_history::Plan history_plan{};
     bool history_staged{};
+    w3vr::prepared_frame::Ticket xr_ticket{};bool xr_dispatched{};
     w3vr::frame_preparation::ScopedProducer<RemasteredProducerScope> binding;
 };
 
 void invalidate_remastered_prepared_pair(void* owner, void* primary, void* duplicate) {
     const auto* scope = static_cast<const RemasteredProducerScope*>(owner);
+    if(scope->xr_ticket.nonce){std::scoped_lock lock{g_modern_prepared_frame_mutex};g_modern_prepared_frame.cancel(scope->xr_ticket);}
     if(scope->history_staged){std::scoped_lock history_lock{g_remastered_camera_history_mutex};
         g_remastered_camera_history.cancel(scope->history_plan.ticket);}
     {
@@ -42529,6 +42547,9 @@ void* __fastcall hook_remastered_command_construct(void* command,void* frame,voi
         const bool matched=read_remastered_preparation_context(module,contract,scope->game,current) &&
             current==scope->context && result==command && remastered_primary_command_matches(current.command_queue,command,frame);
         const auto completion=scope->pair.at_native_command(frame,remastered_prepared_command_route(module,contract,scope->profile),matched);
+        if(scope->xr_ticket.nonce && completion==prep::PendingPair::Completion::dispatched){
+            std::scoped_lock lock{g_modern_prepared_frame_mutex};scope->xr_dispatched=g_modern_prepared_frame.dispatched(scope->xr_ticket);
+        }
         if(scope->history_staged){
             const auto identity=scope->history_plan.inputs.identity;
             const bool matching=remastered_scope_current(scope,contract) && identity.contract==contract &&
@@ -42620,10 +42641,12 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // [FIX:MODE3-AER-PRESENTATION V12032 4/7] AER does not bind one runtime
     // frame to the whole Mode-3 pair. V12033's false flag restores that exact
     // original pair-bound lifecycle for the Stereo launcher family.
-    const bool defer_openxr_frame_to_stereo_pair =
-        mode3_stereo_transport_active() &&
+    const bool modern_noaa_factory=w3vr::render_core::modern_selected(clock_entry_contract) &&
+        g_config.openxr_mode==3 && g_config.temporal_backend==TemporalBackend::None;
+    const bool defer_openxr_frame_to_stereo_pair = modern_noaa_factory ||
+        (mode3_stereo_transport_active() &&
         g_engine_dual_render_active.load(std::memory_order_acquire) &&
-        !mode3_aer_presentation_active();
+        !mode3_aer_presentation_active());
     if (!defer_openxr_frame_to_stereo_pair) {
         prepare_openxr_render_frame(1);
     }
@@ -42863,6 +42886,15 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         w3vr::aer::identity_for_render_ordinal(aer_render_ordinal);
     XrTime pair_pose_display_time{};
     if (defer_openxr_frame_to_stereo_pair && duplicate_render) {
+        if (modern_noaa_factory) {
+            // An unadmitted modern factory never enters the legacy future-pose route.
+            if (remastered_scope_current(g_remastered_producer_scope,
+                    g_engine_camera_temporal_contract.load(std::memory_order_acquire))) {
+                prepare_openxr_render_frame(1);
+                if (g_xr_render_frame_prepared.load(std::memory_order_acquire))
+                    pair_pose_display_time = g_xr_render_frame_state.predictedDisplayTime;
+            }
+        } else {
         // [FIX:OPENXR-QUANTIZED-PAIR-POSE 1/3] The REDengine pair is normally
         // accepted one OpenXR cycle after the pair which is currently being
         // published. Locate its pose at that exact quantized future display
@@ -42874,6 +42906,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             prepare_openxr_render_frame(1);
             pair_pose_display_time =
                 g_xr_render_frame_state.predictedDisplayTime;
+        }
         }
     }
     const uint64_t pair_id = tag_aer_frame
@@ -42895,6 +42928,17 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         }
     }
 
+    if(modern_noaa_factory && duplicate_render){
+        auto* scope=g_remastered_producer_scope;
+        const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+        bool reserved{};
+        if(remastered_scope_current(scope,factory_contract)){
+            std::scoped_lock lock{g_modern_prepared_frame_mutex};
+            reserved=g_modern_prepared_frame.reserve({pair_pose_display_time,pair_id,generation},
+                g_xr_render_frame_prepared.load(std::memory_order_acquire),g_xr_render_frame_state.predictedDisplayTime,scope->xr_ticket);
+        }
+        if(!reserved)duplicate_render=false;
+    }
     const int previous_eye = g_engine_factory_eye;
     const int primary_eye = tag_aer_frame
         ? static_cast<int>(aer_identity.eye)
@@ -48939,6 +48983,14 @@ void poll_openxr_events() {
                        g_xr_session_running &&
                        pfn_xrEndSession != nullptr) {
                 const auto result = pfn_xrEndSession(g_xr_session);
+                {
+                    std::scoped_lock lock{g_modern_prepared_frame_mutex};
+                    g_modern_prepared_frame.runtime_stopped(XR_SUCCEEDED(result));
+                }
+                if (XR_SUCCEEDED(result)) {
+                    g_xr_render_frame_prepared.store(false, std::memory_order_release);
+                    g_xr_render_views_valid = false;
+                }
                 g_xr_session_running = false;
                 reset_native_asymmetric_noaa_state();
                 log_line("OpenXR xrEndSession result=%s (%d)", xr_result_name(result), result);
@@ -51820,7 +51872,7 @@ void render_openxr_test_frame(
     bool submitted = views_valid && frame_state.shouldRender &&
         !g_modern_noaa_consumer_blocked.load(std::memory_order_acquire);
     if(modern_noaa_scene){
-        modern_sources=submitted ? acquire_modern_noaa_sources():nullptr;
+        modern_sources=submitted ? acquire_modern_noaa_sources({frame_state.predictedDisplayTime,frame_was_prepared}):nullptr;
         submitted=submitted && modern_sources!=nullptr;
     }
     const bool packed_native_asymmetric=modern_sources ? modern_sources->native_asymmetric:g_packed_present_cache_native_asymmetric;
@@ -55103,7 +55155,7 @@ void render_openxr_test_frame(
     const XrCompositionLayerBaseHeader* menu_layers[] = {
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_layer)};
 
-    if(modern_noaa_scene && (!modern_sources || !modern_noaa_sources_current(modern_sources) ||
+    if(modern_noaa_scene && (!modern_sources || !modern_noaa_sources_current(modern_sources,{frame_state.predictedDisplayTime,frame_was_prepared}) ||
         modern_sources->phase!=w3vr::modern_eye_pair::UsePhase::Pending ||
         !w3vr::modern_eye_pair::finite(modern_sources->fence_value)))submitted=false;
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
@@ -55215,6 +55267,8 @@ void render_openxr_test_frame(
     }
     w3vr::minimal_xr_log::write("END_BEGIN", current_present, trace_pair_id, g_xr_fence_value, end_info.layerCount);
     result = pfn_xrEndFrame(g_xr_session, &end_info);
+    if(modern_noaa_scene){std::scoped_lock lock{g_modern_prepared_frame_mutex};
+        g_modern_prepared_frame.end(frame_state.predictedDisplayTime,XR_SUCCEEDED(result));}
     w3vr::minimal_xr_log::write("END_RETURN", current_present, trace_pair_id, g_xr_fence_value, result);
     w3vr::pipeline_flight::cpu_end(
         w3vr::pipeline_flight::Phase::XrEndFrame,
@@ -56260,7 +56314,9 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             (!g_cinema_mode_active.load(std::memory_order_relaxed) ||
                 (!g_force_mono_cinema.load(std::memory_order_relaxed) && g_config.cinema_full_vr));
         const bool submit_openxr_frame = modern_noaa_scene
-            ? (accepted_new_publication || !g_xr_render_frame_prepared.load(std::memory_order_acquire))
+            ? (accepted_new_publication || !g_xr_render_frame_prepared.load(std::memory_order_acquire) ||
+                modern_prepared_frame_cancelled(g_xr_render_frame_state.predictedDisplayTime) ||
+                g_modern_noaa_consumer_blocked.load(std::memory_order_acquire))
             : (cinema_detector_due || accepted_new_publication || !g_packed_present_cache_valid || projection_rescue_due);
         if (submit_openxr_frame) {
             if (projection_rescue_due && !accepted_new_publication &&
