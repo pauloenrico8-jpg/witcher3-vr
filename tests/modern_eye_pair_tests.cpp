@@ -1,4 +1,5 @@
 #include "modern_eye_pair.h"
+#include "modern_prepared_frame.h"
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -10,7 +11,7 @@ void require(bool value,const char* why){++checks;if(!value){std::cerr<<why<<'\n
 pair::Pair fixture(const core::Profile* profile,std::uint32_t generation=9,std::uint64_t id=100,std::uint64_t serial=50){
     pair::Pair p{};
     for(int eye=0;eye<2;++eye){auto& o=p[eye];
-        o.identity={profile,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),generation,id,eye,true,true}};
+        o.identity={profile,0x1000,{static_cast<std::uintptr_t>(0x2000+eye*0x100),generation,id,eye,true,true,1000}};
         o.texture=0x3000+eye*0x100;o.command=0x4000;o.producer=0x5000;o.fence=0x6000;o.consumer=0x7000;
         o.recording_epoch=8;o.submitted_epoch=8;o.serial=serial+eye;o.fence_value=20;o.binding_epoch=7;
         o.source_eye=eye;o.source_eye_valid=true;o.view_valid=true;o.initialized=true;o.ordered=true;
@@ -42,7 +43,7 @@ void profiles_and_receipts(const core::Profile* profile){
         !pair::accepts(good,contract(profile),profile,true,9,0x7000,0,UINT64_MAX) &&
         !pair::accepts(good,contract(profile),profile,true,9,0x7000,0,8),"Changed/unknown owned binding accepted");
     require(!accepts(good,profile,100) && !accepts(good,profile,101),"Old/equal pair promoted");
-    for(int eye=0;eye<2;++eye)for(int fault=0;fault<34;++fault){
+    for(int eye=0;eye<2;++eye)for(int fault=0;fault<38;++fault){
         auto p=good;auto& o=p[eye];
         switch(fault){
         case 0:o.identity.profile=nullptr;break;case 1:o.identity.profile=foreign;break;
@@ -59,6 +60,7 @@ void profiles_and_receipts(const core::Profile* profile){
         case 25:o.fence_value=UINT64_MAX;break;case 26:o.source_eye=1-eye;break;
         case 27:o.source_eye_valid=false;break;case 28:o.view_valid=false;break;
         case 29:o.initialized=false;break;case 30:o.recording_pending=true;break;
+        case 34:o.identity.frame.display_time=0;break;case 35:o.identity.frame.display_time=-1;break;case 36:o.identity.frame.display_time=INT64_MAX;break;case 37:o.identity.frame.display_time=1001;break;
         case 31:o.binding_epoch=0;break;case 32:o.binding_epoch=UINT64_MAX;break;case 33:o.binding_epoch=8;break;
         }
         require(!accepts(p,profile),"Incomplete/foreign eye, recording or timeline accepted");
@@ -118,7 +120,41 @@ void retirement(){
             "CPU-active, recording, failed-signal or device-lost use retired incorrectly");
     }
 }
-int main(){
+void runtime_target(const core::Profile* profile){
+    auto outputs=fixture(profile);pair::Consumption consume;pair::Claim claim{},sentinel{outputs,777};
+    for(const auto target:std::array<pair::Target,5>{{{0,true},{-1,true},{INT64_MAX,true},{1001,true},{1000,false}}}){
+        auto out=sentinel;require(!consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,target,out),"Another/unprepared XR frame consumed native pair");require(out.nonce==777 && pair::same(out.outputs,sentinel.outputs),"Rejected target changed claim");
+    }
+    require(consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,{1000,true},claim),"Exact prepared runtime target rejected");
+    auto changed=claim;changed.outputs[0].identity.frame.display_time=1001;require(!consume.current(changed,contract(profile),profile,true,9,0x7000,7) && !consume.finish(changed,true,true),"Changing frozen time retained authority");
+    require(!pair::matches_target(claim.outputs,{1001,true}),"New XR target reused old pair");
+    require(consume.finish(claim,true,true),"Exact frame did not finish");auto out=sentinel;require(!consume.begin_for_frame(outputs,contract(profile),profile,true,9,0x7000,7,strict,{1000,true},out),"Consumed pair replayed in same target");
+}
+void prepared_owner(){
+    namespace f=w3vr::prepared_frame;f::Binding binding;f::Ticket ticket{},sentinel{{99,88,77},66};
+    auto out=sentinel;require(!binding.reserve({1000,100,9},false,1000,out) && out.nonce==66,"Unbegun XR frame gained owner");
+    require(!binding.reserve({1000,100,9},true,1001,out),"Predicted target became actual runtime frame");
+    require(binding.reserve({1000,100,9},true,1000,ticket),"Actual runtime frame not reserved");
+    require(!binding.allows(ticket.identity),"CPU reservation became rendered pair");
+    require(!binding.reserve({1000,101,9},true,1000,out),"Another producer stole prepared frame");
+    auto stale=ticket;stale.nonce++;require(!binding.cancel(stale),"Foreign cancellation revoked current frame");
+    require(binding.cancel(ticket) && binding.cancelled_for(1000,9),"Exact cancellation not observable");
+    require(!binding.cancelled_for(1001,9) && !binding.dispatched(ticket),"Cancelled frame rearmed or revoked other target");
+    require(!binding.end(1000,false) && !binding.reserve({1001,101,9},true,1001,out),"Failed EndFrame released owned window");
+    require(!binding.end(1001,true) && binding.end(1000,true),"Different target ended ownership");
+    f::Ticket next{};require(binding.reserve({1001,101,10},true,1001,next),"Next actual target not admitted");
+    require(!binding.cancel(ticket) && binding.dispatched(next) && binding.allows(next.identity),"Old ticket removed new dispatched owner");
+    require(!binding.cancel(next),"Dispatched producer destructor cancelled legitimate images");
+    require(binding.cancelled_for(1001,11),"Resize mismatch did not close old prepared frame");
+    require(!binding.allows({1001,101,11}) && binding.end(1001,true),"Changed generation adopted old images");
+    f::Ticket stopped{}, restarted{};
+    require(binding.reserve({1002,102,10},true,1002,stopped),"Session frame not reserved");
+    require(!binding.runtime_stopped(false) && !binding.reserve({1003,103,10},true,1003,out),"Failed session stop released frame");
+    require(binding.runtime_stopped(true) && binding.reserve({1003,103,10},true,1003,restarted),"Successful session stop did not reopen admission");
+    require(restarted.nonce>stopped.nonce && !binding.cancel(stopped) && !binding.dispatched(stopped),"Old session callback retained authority");
+    require(binding.dispatched(restarted) && binding.allows(restarted.identity),"Restarted session owner not admitted");
+}
+int main(){prepared_owner();runtime_target(&core::remastered_500c);runtime_target(&core::remastered_1048522);
     for(const auto* profile:{&core::remastered_500c,&core::remastered_1048522}){
         profiles_and_receipts(profile);consume_once_and_failure(profile);
     }
