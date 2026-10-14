@@ -41,6 +41,7 @@
 #include "openxr_frame_cycle.h"
 #include "openxr_image_protocol.h"
 #include "xr_fence_completion.h"
+#include "xr_allocator_submissions.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -1557,6 +1558,13 @@ w3vr::xr_frame_cycle::Cycle& modern_xr_frame_cycle() {
 w3vr::xr_image::Image* modern_xr_color_image_protocol() {
     // Numeric process-lifetime state; no runtime/GPU cleanup in DllMain.
     static auto* image=new(std::nothrow) w3vr::xr_image::Image;return image;
+}
+w3vr::xr_allocator::Store* modern_xr_allocator_submissions(bool create=false) {
+    static std::atomic<w3vr::xr_allocator::Store*> root{};
+    auto* current=root.load(std::memory_order_acquire);if(current || !create)return current;
+    auto* candidate=new(std::nothrow) w3vr::xr_allocator::Store;if(!candidate)return nullptr;
+    if(!root.compare_exchange_strong(current,candidate,std::memory_order_acq_rel)){delete candidate;return current;}
+    return candidate; // process lifetime; no unresolved COM/event cleanup in DllMain
 }
 bool managed_xr_session() {
     auto* registry=modern_xr_graphics_registry();
@@ -46989,12 +46997,20 @@ void wait_for_xr_gpu() {
 // used this allocator, instead of signalling a fresh value and draining
 // everything the game has queued. Frames the GPU already finished with cost
 // nothing here.
-bool wait_for_xr_command_allocator(size_t index) {
+bool wait_for_xr_command_allocator(size_t index,bool managed=false) {
     w3vr::pipeline_flight::CpuScope flight_cpu{
         w3vr::pipeline_flight::Phase::XrAllocatorWait};
     if (g_xr_fence == nullptr || g_xr_fence_event == nullptr ||
         index >= kXrCommandAllocatorCount) {
         return false;
+    }
+    auto* submissions=modern_xr_allocator_submissions(managed);
+    if(submissions && submissions->established() && !managed)return false; // never escape a retained modern use into legacy reuse
+    if(managed){
+        if(!submissions)return false;
+        if(submissions->known_slot(index))return submissions->wait(index,g_xr_command_allocators[index],1000);
+        if(g_xr_command_allocator_fences[index]!=0)return false; // no proof for a prior unobserved submission
+        return true;
     }
     const uint64_t value = g_xr_command_allocator_fences[index];
     // Capture the exact interface/event used for both observations. The host's
@@ -52203,6 +52219,8 @@ void render_openxr_test_frame(
         auto* image_protocol=managed_frame?modern_xr_color_image_protocol():nullptr;
         w3vr::xr_image::Ticket image_ticket;
         w3vr::xr_image::Recording image_recording;
+        w3vr::xr_allocator::Ticket allocator_submission;
+        auto* allocator_submissions=modern_xr_allocator_submissions(managed_frame);
         w3vr::modern_graphics_binding::ComPtr<IUnknown> image_resource_identity;
         if(managed_frame){
             submitted=submitted && image_protocol && image_session &&
@@ -52300,15 +52318,18 @@ void render_openxr_test_frame(
                 (g_xr_command_allocator_index + 1) % kXrCommandAllocatorCount;
             auto* xr_command_allocator =
                 g_xr_command_allocators[g_xr_command_allocator_index];
+            HRESULT xr_reset_result=E_FAIL;
             if (xr_command_allocator == nullptr ||
-                !wait_for_xr_command_allocator(g_xr_command_allocator_index) ||
+                !wait_for_xr_command_allocator(g_xr_command_allocator_index,managed_frame) ||
                 FAILED(xr_command_allocator->Reset()) ||
-                FAILED(g_xr_command_list->Reset(
+                FAILED(xr_reset_result=g_xr_command_list->Reset(
                     xr_command_allocator, nullptr))) {
                 submitted = false;
             } else {
                 discard_modern_noaa_xr_recordings(g_xr_command_list);
                 command_list_recording = true;
+                if(managed_frame && (!allocator_submissions ||
+                    !allocator_submissions->observe_reset(g_xr_command_list,xr_reset_result)))submitted=false;
                 if(modern_sources){
                     std::scoped_lock lock{g_streamline_capture_mutex};
                     modern_sources->recording=g_xr_command_list;
@@ -55110,7 +55131,24 @@ void render_openxr_test_frame(
                 w3vr::minimal_xr_log::write("QUEUE_BEGIN", current_present, trace_pair_id, g_xr_fence_value + 1);
                 auto* submit_queue=managed_frame?image_session->graphics->queue.Get():(modern_sources ? modern_sources->queue.Get():g_command_queue);
                 bool execute_admitted=true;
-                if(modern_sources){
+                auto* submit_fence=modern_sources ? modern_sources->fence.Get():g_xr_fence;
+                const uint64_t planned_submission=g_xr_fence_value<UINT64_MAX-1?g_xr_fence_value+1:0;
+                if(managed_frame){
+                    if(!allocator_submissions || !submitted)execute_admitted=false;
+                    else{
+                    w3vr::xr_allocator::Objects objects;
+                    objects.frame=modern_target.xr;objects.generation=managed_payload.ticket.generation;
+                    objects.shared_value=planned_submission;objects.device=image_session->graphics->device;
+                    objects.queue=submit_queue;objects.shared_fence=submit_fence;
+                    objects.allocator=g_xr_command_allocators[g_xr_command_allocator_index];
+                    objects.command=g_xr_command_list;objects.destination=swapchain.images[image_index].texture;
+                    if(fsr_hudless_recorded){std::scoped_lock lock{g_fsr_hudless_xr_mutex};
+                        objects.auxiliary=g_fsr_hudless_xr_slots[g_xr_command_allocator_index].resource;}
+                    allocator_submission=allocator_submissions->prepare(g_xr_command_allocator_index,std::move(objects));
+                    execute_admitted=bool(allocator_submission.anchor);
+                    }
+                }
+                if(modern_sources && execute_admitted){
                     std::scoped_lock lock{g_streamline_capture_mutex};
                     execute_admitted=modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
                         w3vr::modern_eye_pair::matches_target(modern_sources->claim.outputs,modern_target) &&
@@ -55124,6 +55162,8 @@ void render_openxr_test_frame(
                     image_recording.command==reinterpret_cast<uintptr_t>(lists[0]) &&
                     image_recording.resource==reinterpret_cast<uintptr_t>(swapchain.images[image_index].texture) &&
                     image_protocol->before_execute(image_ticket,image_recording,reinterpret_cast<uintptr_t>(submit_queue),true);
+                if(managed_frame && execute_admitted)execute_admitted=allocator_submissions->before_execute(
+                    allocator_submission,submit_queue,1,lists);
                 if(!execute_admitted){
                     g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
                     submitted=false;
@@ -55157,14 +55197,18 @@ void render_openxr_test_frame(
                     // to it waits for exactly this value and nothing else, so the
                     // CPU keeps running while earlier frames finish on the GPU.
                     const uint64_t submission = ++g_xr_fence_value;
-                    auto* submit_fence=modern_sources ? modern_sources->fence.Get():g_xr_fence;
                     const HRESULT consumer_signal=submit_queue->Signal(submit_fence, submission);
+                    const bool allocator_signal_ready=!managed_frame || allocator_submissions->after_shared_signal(
+                        allocator_submission,submit_queue,submit_fence,consumer_signal,submission);
                     if(managed_frame && !image_protocol->signal(image_ticket,reinterpret_cast<uintptr_t>(submit_queue),
-                        SUCCEEDED(consumer_signal),submission))submitted=false;
-                    if (SUCCEEDED(consumer_signal)) {
+                        consumer_signal==S_OK && allocator_signal_ready,submission))submitted=false;
+                    if (SUCCEEDED(consumer_signal) && allocator_signal_ready) {
                         if(modern_sources){
                             std::scoped_lock lock{g_streamline_capture_mutex};
-                            if(!g_modern_noaa_source_store.after_signal(modern_sources,consumer_signal,submission)){
+                            const auto private_receipt=managed_frame?allocator_submissions->receipt(allocator_submission):w3vr::xr_allocator::Receipt{};
+                            if(managed_frame)modern_sources->fence=private_receipt.fence;
+                            const auto retirement_value=managed_frame?private_receipt.value:submission;
+                            if(!g_modern_noaa_source_store.after_signal(modern_sources,consumer_signal,retirement_value)){
                                 g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
                                 submitted=false;
                             }
@@ -55188,7 +55232,7 @@ void render_openxr_test_frame(
                     } else {
                         // Without a usable fence value the next reuse of this
                         // allocator must not assume the GPU is done with it.
-                        if(modern_noaa_output_requested()){
+                        if(managed_frame || modern_noaa_output_requested()){
                             g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
                             g_xr_command_allocator_fences[g_xr_command_allocator_index]=UINT64_MAX;
                             submitted=false;
@@ -55207,6 +55251,8 @@ void render_openxr_test_frame(
                     image_index, static_cast<unsigned>(close_result));
             }
         }
+
+        if(managed_frame && allocator_submissions)allocator_submissions->finish_cpu(allocator_submission);
 
         // [V12016:AFW-PRODUCER-PUBLICATION 7/8] The immutable input bundle
         // stays reserved until the XR command list that sampled its depth/MV
