@@ -7,6 +7,8 @@ namespace w3vr::temporal_leaf {
 // OWN post-call observation frame, not a declaration of a Native C++ ABI.
 // The examined two-pointer leaf has no stack inputs. Its caller relies on
 // surviving R8. Preserve every volatile GPR, all AVX lanes and incoming flags.
+// The bridge also saves/restores post-original MXCSR and x87 state privately;
+// that aligned FX image is not exposed as, or appended to, this C++ frame.
 struct alignas(16) Frame {
     std::uintptr_t destination{},source{},caller{},reserved{};
     std::array<std::uint64_t,7> integer{}; // RAX,RCX,RDX,R8,R9,R10,R11
