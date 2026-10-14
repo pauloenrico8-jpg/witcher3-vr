@@ -2,6 +2,37 @@
 
 
 
+
+## Sinal do envio separado da conclusão dos recursos — 14 de outubro
+
+Corrigi uma comparação que recusaria a apresentação depois de um envio válido.
+O código conserva os recursos com um sinal privado da GPU, mas ainda comparava
+esse campo com o sinal compartilhado usado no envio original. São dois papéis.
+
+O fluxo, passo a passo:
+
+1. modern_eye_source_use.h conserva o sinal original do envio em um campo próprio.
+   O campo usado para liberar os recursos pode receber o sinal privado.
+2. dxgi_proxy.cpp envia os comandos com o sinal original e usa a mesma identidade
+   ao conferir se o quadro ainda pertence à sessão correta.
+3. A liberação continua exigindo a conclusão do sinal privado. Trocar o sinal de
+   liberação não muda a identidade do envio nem dispensa a espera da GPU.
+
+Escolhi guardar as duas referências porque a identidade do envio precisa ficar
+estável enquanto a proteção dos recursos acompanha sua conclusão específica.
+O mesmo helper confere essa identidade no host e no teste próprio.
+
+A DLL compilou e **128 testes passaram em 15,44 segundos**. O teste gráfico próprio
+fez **683 conferências**, incluindo a nova comparação antes e depois da troca
+para o sinal privado. Confere duas filas DirectX reais, retenção das interfaces,
+cópia bloqueada, conclusão privada e 512 bytes corretos. As identidades VR e os
+retornos de sinais falhos são simulados; não executou o host no Witcher, SDK,
+OpenXR real ou Quest.
+
+**O VR ainda não funciona.** Remastered continua fechado e nada experimental foi
+instalado no jogo. A prova vale para o caminho próprio testado; não comprova toda
+a ordem do jogo, imagens do headset ou proteção completa na parada.
+
 ## Imagem pendente recuperada sem mostrar um quadro antigo — 14 de outubro
 
 Uma espera que excede o tempo não significa que o sistema VR perdeu a imagem.
