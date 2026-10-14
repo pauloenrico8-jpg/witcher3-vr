@@ -10,6 +10,40 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+## Histórico capturado antes da preparação do quadro — 14 de outubro
+
+A câmera da cena pode atualizar seu histórico antes de existir o descritor do
+quadro. A captura anterior dependia desse descritor e perderia essa atualização.
+O fluxo agora conserva o resultado observado e confere a ligação depois.
+
+1. O host observa a rota de atualização no mesmo escopo do produtor. Escopo é o
+   trecho de execução que ainda está preparando aquele quadro. Confere versão,
+   chamada, câmera, interface e relógio; não cria um descritor fictício.
+2. Deixa a chamada original executar uma vez e reconfere as entradas, o relógio
+   e o resultado. Conserva uma cópia temporária dos valores nesse escopo.
+3. O histórico permanece pendente. Nenhuma entrada de histórico é entregue aos
+   cálculos dos olhos enquanto o descritor real não tiver sido conferido.
+4. Na fábrica do quadro, exige a mesma interface, o mesmo relógio e os mesmos
+   campos definidos do resultado. Liga a captura a esse descritor uma vez.
+   Descritor diferente, falha ou segunda captura invalidam o resultado.
+
+Escolhi essa ligação em duas etapas porque a atualização acontece antes da
+preparação do desenho. Copiar valores evita depender do endereço do histórico
+original nos cálculos posteriores; as referências usadas para conferir a origem
+continuam emprestadas somente no escopo CPU e não comprovam vida útil do motor.
+
+A DLL compilou e **128 testes passaram em 15,65 segundos**. O teste do relógio
+fez **1.046 verificações**, incluindo 61 novas: histórico pendente, primeira
+ligação, troca de descritor, dados incompatíveis, revogação e leitura protegida
+em memória própria do Windows. Os registros desses testes são fabricados.
+O diagnóstico separado da câmera real motivou a correção, mas esta integração
+nova do host ainda não foi executada no Witcher, SDK, OpenXR ou Quest.
+
+**O VR ainda não funciona.** Remastered continua fechado. A rota antecipada de
+reinício do histórico ainda precisa ser integrada; dois olhos novos por quadro,
+recursos, continuação do produtor e parada também continuam pendentes.
+A DLL de desenvolvimento permanece fora da instalação do jogo.
+
 ## Sinal do envio separado da conclusão dos recursos — 14 de outubro
 
 Corrigi uma comparação que recusaria a apresentação depois de um envio válido.

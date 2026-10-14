@@ -2576,6 +2576,7 @@ std::mutex g_current_temporal_reset_install_mutex;
 void install_current_temporal_reset_hook();
 struct RemasteredTemporalSourceTicket {
     w3vr::factory_clock::BorrowedScope clock;
+    w3vr::factory_clock::windows::OwnerObservation owner_clock{};
     w3vr::temporal_source::Candidate candidate;
     w3vr::camera_defaults::Words defaults{}; // OWN copied module values, no object lifetime.
     void* producer{};
@@ -42328,6 +42329,8 @@ struct RemasteredProducerScope {
     bool factory_reserved{};
     w3vr::frame_preparation::PendingPair pair{};
     w3vr::temporal_source::Captured temporal_source;
+    w3vr::factory_clock::windows::OwnerObservation temporal_owner_clock{};
+    bool temporal_owner_staged{};
     w3vr::camera_history::Plan history_plan{};
     bool history_staged{};
     w3vr::prepared_frame::Ticket xr_ticket{};bool xr_dispatched{};
@@ -42357,7 +42360,8 @@ bool remastered_scope_current(const RemasteredProducerScope* scope,
         (!scope->xr_ticket.nonce || modern_xr_frame_current(scope->xr_frame.identity(),scope->xr_frame.generation));
 }
 bool read_normal_temporal_source_route(uintptr_t owner,uintptr_t module,uintptr_t history,
-    uintptr_t position,uintptr_t rotation,uintptr_t& director,w3vr::temporal_source::Prefix& prefix) {
+    uintptr_t position,uintptr_t rotation,uintptr_t& director,w3vr::temporal_source::Prefix& prefix,
+    w3vr::temporal_source::SourceSite site) {
     namespace fc=w3vr::factory_clock;
     uintptr_t mode{},handle_address{};
     if(!owner || (owner&7) || !fc::offset(owner,0x120,mode) || !fc::offset(owner,0xF0,handle_address))return false;
@@ -42374,7 +42378,9 @@ bool read_normal_temporal_source_route(uintptr_t owner,uintptr_t module,uintptr_
             history!=expected_history || position!=expected_position || rotation!=expected_rotation)return false;
         const auto table=*reinterpret_cast<const uintptr_t*>(candidate);
         if(table!=module+0x03989EA8 && table!=module+0x03810308)return false;
-        if(*reinterpret_cast<const uint8_t*>(candidate+0x6C0)!=0 ||
+        // The early update rebuilds history independently of the getter cache bit.
+        if((site==w3vr::temporal_source::SourceSite::descriptor_getter &&
+            *reinterpret_cast<const uint8_t*>(candidate+0x6C0)!=0) ||
             *reinterpret_cast<const uint8_t*>(candidate+0x7FA)!=0)return false;
         w3vr::temporal_source::Prefix copied{};
         std::memcpy(copied.data(),reinterpret_cast<const void*>(position),copied.size());
@@ -42394,23 +42400,37 @@ bool begin_remastered_temporal_source(uintptr_t caller,void* history,float time,
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     auto* producer=g_remastered_producer_scope;
     const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    namespace ts=w3vr::temporal_source;
     if(contract!=&w3vr::engine_camera::remastered_1048522 ||
         !g_current_temporal_builder_ready.load(std::memory_order_acquire) ||
-        !remastered_scope_current(producer,contract) || caller!=module+w3vr::temporal_source::wrapper_return)return false;
-    w3vr::native_caller_context::Snapshot root{};
-    if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
-        module+fc::current.fragment,24},root) || root.rbp<0x80)return false;
-    const uintptr_t descriptor=root.rbp-0x80;
-    if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,descriptor,
-        ticket.clock,fc::CallSite::descriptor_constructor) ||
-        ticket.clock.borrowed_caller().rdi!=reinterpret_cast<uintptr_t>(producer->game))return false;
-    auto& c=ticket.candidate;c.contract=contract;c.descriptor=descriptor;
+        !remastered_scope_current(producer,contract))return false;
+    const bool early=caller==module+ts::producer_update_return;
+    if(!early && caller!=module+ts::wrapper_return)return false;
+    auto& c=ticket.candidate;c.contract=contract;c.module=module;c.caller=caller;
     c.owner=reinterpret_cast<uintptr_t>(producer->game);c.thread=GetCurrentThreadId();
+    if(early){
+        c.site=ts::SourceSite::producer_update;
+        if(!fc::windows::module_matches(fc::selected(contract),module))return false;
+        __try {
+            if(std::memcmp(reinterpret_cast<const void*>(module+ts::producer_arguments_rva),
+                ts::producer_arguments_pin.data(),ts::producer_arguments_pin.size()))return false;
+        }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+        if(!fc::windows::read_owner(fc::selected(contract),module,c.owner,ticket.owner_clock,c.clock))return false;
+        // Descriptor remains zero. The real factory must bind it later.
+    }else{
+        w3vr::native_caller_context::Snapshot root{};
+        if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
+            module+fc::current.fragment,24},root) || root.rbp<0x80)return false;
+        c.descriptor=root.rbp-0x80;
+        if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,c.descriptor,
+            ticket.clock,fc::CallSite::descriptor_constructor) ||
+            ticket.clock.borrowed_caller().rdi!=c.owner || !ticket.clock.sample(c.thread,c.clock))return false;
+    }
     c.history=reinterpret_cast<uintptr_t>(history);c.position=reinterpret_cast<uintptr_t>(position);
     c.rotation=reinterpret_cast<uintptr_t>(rotation);c.time=time;c.fov=fov;c.aspect=aspect;
     c.near_plane=near_plane;c.far_plane=far_plane;c.scale=scale;
-    if(!ticket.clock.sample(c.thread,c.clock) || !read_normal_temporal_source_route(c.owner,module,c.history,
-        c.position,c.rotation,c.director,c.prefix) || !w3vr::temporal_source::accepted(c) ||
+    if(!read_normal_temporal_source_route(c.owner,module,c.history,
+        c.position,c.rotation,c.director,c.prefix,c.site) || !w3vr::temporal_source::accepted(c) ||
         !w3vr::camera_defaults::read(contract,w3vr::camera_defaults::selected(contract),module,
             &w3vr::camera_defaults::guarded_read,ticket.defaults))return false;
     ticket.producer=producer;ticket.admitted=true;return true;
@@ -42418,17 +42438,28 @@ bool begin_remastered_temporal_source(uintptr_t caller,void* history,float time,
 void finish_remastered_temporal_source(RemasteredTemporalSourceTicket& ticket,void* result) {
     if(!ticket.admitted)return;
     auto* producer=static_cast<RemasteredProducerScope*>(ticket.producer);auto& c=ticket.candidate;
-    const auto module=ticket.clock.borrowed_caller().module;
+    const auto module=c.module;
+    w3vr::factory_clock::windows::OwnerObservation owner_clock{};
+    w3vr::factory_clock::Sample owner_sample{};
+    const bool clock_current=c.site==w3vr::temporal_source::SourceSite::producer_update
+        ? w3vr::factory_clock::windows::read_owner(w3vr::factory_clock::selected(c.contract),module,c.owner,
+            owner_clock,owner_sample) && owner_clock==ticket.owner_clock &&
+            owner_sample.ticks==c.clock.ticks && owner_sample.scale==c.clock.scale &&
+            w3vr::temporal_source::same_float(owner_sample.time,c.clock.time)
+        : w3vr::factory_clock::windows::revalidate(c.contract,ticket.clock);
     w3vr::camera_defaults::Words defaults{};
     uintptr_t director{};w3vr::temporal_source::Prefix repeated{};w3vr::engine_camera::TemporalRecord record{};
     const bool current=producer==g_remastered_producer_scope && remastered_scope_current(producer,c.contract) &&
         g_current_temporal_builder_ready.load(std::memory_order_acquire) &&
-        w3vr::factory_clock::windows::revalidate(c.contract,ticket.clock) &&
-        read_normal_temporal_source_route(c.owner,module,c.history,c.position,c.rotation,director,repeated) &&
+        clock_current &&
+        read_normal_temporal_source_route(c.owner,module,c.history,c.position,c.rotation,director,repeated,c.site) &&
         director==c.director && repeated==c.prefix && read_normal_temporal_record(c.history,record) &&
         w3vr::camera_defaults::read(c.contract,w3vr::camera_defaults::selected(c.contract),module,
             &w3vr::camera_defaults::guarded_read,defaults) && defaults==ticket.defaults;
-    producer->temporal_source.capture(c,record,reinterpret_cast<uintptr_t>(result),current);
+    const bool captured=producer->temporal_source.capture(c,record,reinterpret_cast<uintptr_t>(result),current);
+    if(captured && c.site==w3vr::temporal_source::SourceSite::producer_update){
+        producer->temporal_owner_clock=ticket.owner_clock;producer->temporal_owner_staged=true;
+    }
 }
 // Exact two-pointer leaf. Observe AFTER Original; assembly restores registers
 // that an ordinary C++ hook is allowed to destroy, including the caller's R8.
@@ -42507,18 +42538,25 @@ void install_current_temporal_reset_hook() {
 
 bool remastered_temporal_source_matches(const w3vr::engine_camera::TemporalContract* contract,
     uintptr_t descriptor,const w3vr::factory_clock::BorrowedScope& clock) {
-    auto* producer=g_remastered_producer_scope;w3vr::factory_clock::Sample sample{};
+    auto* producer=g_remastered_producer_scope;if(!producer)return false;
+    w3vr::factory_clock::Sample sample{},owner_sample{};
+    w3vr::factory_clock::windows::OwnerObservation owner_clock{};
     w3vr::camera_defaults::Words defaults{};
     w3vr::engine_camera::TemporalRecord previous{};
-    uintptr_t record{};
-    return contract==&w3vr::engine_camera::remastered_1048522 && remastered_scope_current(producer,contract) &&
+    uintptr_t record{};const auto module=clock.borrowed_caller().module;
+    const bool ready=contract==&w3vr::engine_camera::remastered_1048522 && remastered_scope_current(producer,contract) &&
         (producer->temporal_source.reset_observed() ? g_current_temporal_reset_ready.load(std::memory_order_acquire) :
         g_current_temporal_builder_ready.load(std::memory_order_acquire)) && clock.sample(GetCurrentThreadId(),sample) &&
+        (!producer->temporal_owner_staged ||
+            (w3vr::factory_clock::windows::read_owner(w3vr::factory_clock::selected(contract),module,
+                reinterpret_cast<uintptr_t>(producer->game),owner_clock,owner_sample) &&
+             owner_clock==producer->temporal_owner_clock)) &&
         w3vr::factory_clock::offset(descriptor,0x10+0x530,record) && read_normal_temporal_record(record,previous) &&
-        producer->temporal_source.matches(contract,descriptor,reinterpret_cast<uintptr_t>(producer->game),
-            GetCurrentThreadId(),sample,previous,
-            w3vr::camera_defaults::read(contract,w3vr::camera_defaults::selected(contract),
-                clock.borrowed_caller().module,&w3vr::camera_defaults::guarded_read,defaults));
+        w3vr::camera_defaults::read(contract,w3vr::camera_defaults::selected(contract),module,
+            &w3vr::camera_defaults::guarded_read,defaults);
+    if(!ready){producer->temporal_source.revoke();return false;}
+    return producer->temporal_source.matches(contract,descriptor,reinterpret_cast<uintptr_t>(producer->game),
+        GetCurrentThreadId(),sample,previous,true);
 }
 
 void* allocate_remastered_command_in_captured_queue() {
