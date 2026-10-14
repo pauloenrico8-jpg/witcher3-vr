@@ -1,4 +1,5 @@
 #include "xr_fence_completion.h"
+#include "openxr_image_protocol.h"
 #include <windows.h>
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -98,4 +99,75 @@ void physical_gpu(){
     destination->Unmap(0,&none);
     check(CloseHandle(event)&&CloseHandle(other_event),"close events after exact completion");
 }
-int main(){cpu_cases();physical_gpu();std::cout<<checks<<" checks: real own DirectX queues, blocked GPU copy, stale Windows event, exact fence, allocator Reset and 512 copied bytes. Device-removed readings and failure outcomes are CPU fixtures. No OpenXR runtime, host callbacks, SDK, Witcher or Quest executed.\n";}
+void physical_image_helper(){
+    // Own image layers + fake XR handle/frame admission. Runtime remains absent.
+    wchar_t system[MAX_PATH]{};check(GetSystemDirectoryW(system,MAX_PATH)>0,"image system directory");
+    const auto path=std::wstring(system)+L"\\d3d12.dll";
+    const auto module=LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    check(module!=nullptr,"image system module");
+    const auto create=reinterpret_cast<decltype(&D3D12CreateDevice)>(GetProcAddress(module,"D3D12CreateDevice"));
+    check(create!=nullptr,"image device entry");
+    ComPtr<ID3D12Device> device;check(SUCCEEDED(create(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"image own device");
+    D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> queue;check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"image queue");
+    ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
+    check(SUCCEEDED(device->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&allocator))),"image allocator");
+    check(SUCCEEDED(device->CreateCommandList(0,q.Type,allocator.Get(),nullptr,IID_PPV_ARGS(&list))),"image list");
+    D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;desc.Width=8;desc.Height=8;
+    desc.DepthOrArraySize=2;desc.MipLevels=1;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.SampleDesc.Count=1;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+    ComPtr<ID3D12Resource> source,destination,readback;
+    check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&source))),"image own RT array");
+    check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&destination))),"image own committed copy array");
+    ComPtr<IUnknown> source_id,destination_id,source_alias_id;
+    ComPtr<ID3D12Resource> source_alias;
+    check(SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&source_id)))&&SUCCEEDED(destination->QueryInterface(IID_PPV_ARGS(&destination_id))),"canonical image identities");
+    check(SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&source_alias)))&&SUCCEEDED(source_alias->QueryInterface(IID_PPV_ARGS(&source_alias_id)))&&source_alias_id.Get()==source_id.Get(),"same COM object identity");
+    D3D12_DESCRIPTOR_HEAP_DESC h{};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;h.NumDescriptors=2;
+    ComPtr<ID3D12DescriptorHeap> rtv;check(SUCCEEDED(device->CreateDescriptorHeap(&h,IID_PPV_ARGS(&rtv))),"image RTV heap");
+    auto handle=rtv->GetCPUDescriptorHandleForHeapStart();const auto increment=device->GetDescriptorHandleIncrementSize(h.Type);
+    for(unsigned eye=0;eye<2;++eye){
+        D3D12_RENDER_TARGET_VIEW_DESC view{};view.Format=desc.Format;view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray.FirstArraySlice=eye;view.Texture2DArray.ArraySize=1;device->CreateRenderTargetView(source.Get(),&view,handle);
+        const float colors[2][4]{{1,0,0,1},{0,1,0,1}};list->ClearRenderTargetView(handle,colors[eye],0,nullptr);handle.ptr+=increment;
+    }
+    namespace x=w3vr::xr_image;x::Image image;x::Ticket ticket;
+    const uintptr_t queue_key=reinterpret_cast<uintptr_t>(queue.Get());
+    check(image.begin({{0x1000,1,1},0x2000,queue_key,3,1},ticket),"own helper fake XR begin");
+    uint32_t index{};check(image.acquire(ticket,index,[](uint32_t& v){v=0;return XR_SUCCESS;})==XR_SUCCESS&&image.wait(ticket,[]{return XR_SUCCESS;})==XR_SUCCESS,"own helper fake acquire/wait");
+    const x::Recording binding{reinterpret_cast<uintptr_t>(list.Get()),reinterpret_cast<uintptr_t>(source.Get()),reinterpret_cast<uintptr_t>(source_id.Get()),0};
+    check(image.start_recording(ticket,binding,true),"bind real own list/resource to fake XR frame");
+    unsigned before_count{},copy_count{},after_count{};
+    auto barrier=[](ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){D3D12_RESOURCE_BARRIER v{};v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;v.Transition.pResource=r;v.Transition.StateBefore=a;v.Transition.StateAfter=b;v.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;return v;};
+    const D3D12_RESOURCE_BARRIER before[]{barrier(source.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE),barrier(destination.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST)};
+    const D3D12_RESOURCE_BARRIER after[]{barrier(source.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET),barrier(destination.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON)};
+    const auto record_before=[&]{++before_count;list->ResourceBarrier(2,before);};
+    const auto copy=[&]{++copy_count;list->CopyResource(destination.Get(),source.Get());};
+    const auto record_after=[&]{++after_count;list->ResourceBarrier(2,after);};
+    check(!image.copy_source(ticket,binding,reinterpret_cast<uintptr_t>(source_alias_id.Get()),record_before,copy,record_after)&&before_count==0&&copy_count==0&&after_count==0,"real canonical alias ran copy");
+    check(image.copy_source(ticket,binding,reinterpret_cast<uintptr_t>(destination_id.Get()),record_before,copy,record_after)&&before_count==1&&copy_count==1&&after_count==1&&image.color_ready(ticket,binding),"real own image helper sequence");
+    const auto copied_to_source=barrier(destination.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);list->ResourceBarrier(1,&copied_to_source);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2]{};UINT rows[2]{};UINT64 row_bytes[2]{},total{};
+    device->GetCopyableFootprints(&desc,0,2,0,footprints,rows,row_bytes,&total);
+    check(rows[0]==8&&rows[1]==8&&row_bytes[0]==32&&row_bytes[1]==32,"real image footprints");
+    D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;buffer.Width=total;buffer.Height=1;buffer.DepthOrArraySize=1;buffer.MipLevels=1;buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    heap.Type=D3D12_HEAP_TYPE_READBACK;check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback))),"image readback");
+    for(UINT eye=0;eye<2;++eye){D3D12_TEXTURE_COPY_LOCATION dst{},src{};dst.pResource=readback.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint=footprints[eye];src.pResource=destination.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;src.SubresourceIndex=eye;list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);}
+    check(SUCCEEDED(list->Close())&&image.before_execute(ticket,binding,queue_key,true),"close/admit real own helper list");
+    ComPtr<ID3D12Fence> fence,gate;check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)))&&SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate))),"image fences");
+    check(SUCCEEDED(queue->Wait(gate.Get(),1)),"image GPU gate");ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
+    check(image.execution_returned(ticket,binding,queue_key,true),"own image execute return");
+    const HRESULT signal=queue->Signal(fence.Get(),1);check(SUCCEEDED(signal)&&image.signal(ticket,queue_key,true,1),"own image queue signal");
+    check(fence->GetCompletedValue()<1&&image.releasable(ticket),"queue receipt confused with GPU complete");
+    check(image.release(ticket,[]{return XR_SUCCESS;})==XR_SUCCESS&&image.layer_allowed(ticket),"fake runtime release receipt");
+    const HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);check(event!=nullptr&&SUCCEEDED(gate->Signal(1)),"open own image gate");
+    check(f::wait_for_completion(1,[&]{return fence->GetCompletedValue();},[&](uint64_t value){return SUCCEEDED(fence->SetEventOnCompletion(value,event));},[&]{return WaitForSingleObject(event,5000)==WAIT_OBJECT_0;}),"own image exact completion");
+    void* mapped{};D3D12_RANGE range{0,static_cast<SIZE_T>(total)};check(SUCCEEDED(readback->Map(0,&range,&mapped)),"map own two-layer image");
+    const unsigned char expected[2][4]{{255,0,0,255},{0,255,0,255}};
+    for(unsigned eye=0;eye<2;++eye)for(unsigned y=0;y<8;++y)for(unsigned px=0;px<8;++px)for(unsigned channel=0;channel<4;++channel){
+        const auto offset=footprints[eye].Offset+y*footprints[eye].Footprint.RowPitch+px*4+channel;
+        check(static_cast<const unsigned char*>(mapped)[offset]==expected[eye][channel],"own image layer pixel mismatch");
+    }
+    D3D12_RANGE none{0,0};readback->Unmap(0,&none);check(CloseHandle(event)!=FALSE,"image event drain");
+}
+int main(){cpu_cases();physical_gpu();physical_image_helper();std::cout<<checks<<" checks: real own DirectX queues, blocked GPU copy, stale Windows event, exact fence, allocator Reset and 512 copied bytes. Additional real own two-layer RT/COPY_SOURCE/RT helper copied and checked 512 image bytes; canonical COM alias rejected. XR handles/acquire/wait/release receipts, device-removed readings and failure outcomes are fixtures. No OpenXR runtime, host callbacks, SDK, Witcher or Quest executed.\n";}
