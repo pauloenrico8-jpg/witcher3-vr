@@ -32297,7 +32297,7 @@ ModernNoAASourceUse* acquire_modern_noaa_sources(w3vr::modern_eye_pair::Target t
         !w3vr::modern_eye_pair::accepts(g_modern_packed_outputs,contract,profile,true,generation,
             reinterpret_cast<uintptr_t>(binding->queue.Get()),0,binding->epoch))return nullptr;
     if(!modern_prepared_frame_allows({target.display_time,g_modern_packed_outputs[0].identity.frame.pair,generation,target.xr}))return nullptr;
-    use->queue=binding->queue;use->fence=g_xr_fence;
+    use->queue=binding->queue;use->submission_fence=g_xr_fence;use->fence=use->submission_fence;
     for(uint32_t eye=0;eye<2;++eye){
         if(g_modern_packed_outputs[eye].texture!=reinterpret_cast<uintptr_t>(g_packed_present_cache[eye]) ||
             !g_packed_present_cache_view_valid[eye])return nullptr;
@@ -32321,7 +32321,8 @@ bool modern_noaa_sources_current(const ModernNoAASourceUse* use,w3vr::modern_eye
             use->claim.outputs[0].identity.frame.generation,target.xr}) &&
         modern_xr_frame_current(target.xr,use->claim.outputs[0].identity.frame.generation) &&
         modern_noaa_output_ready(contract) && modern_graphics_current(use->binding) &&
-        modern_xr_session_current(use->xr_binding,use->binding) && use->fence.Get()==g_xr_fence &&
+        modern_xr_session_current(use->xr_binding,use->binding) &&
+        g_modern_noaa_source_store.submission_matches(use,use->queue.Get(),g_xr_fence) &&
         g_modern_output_consumption.current(use->claim,contract,
             g_remastered_core_installed_profile.load(std::memory_order_acquire),true,
             g_streamline_capture_generation.load(std::memory_order_acquire),reinterpret_cast<uintptr_t>(use->queue.Get()),use->binding->epoch);
@@ -55163,7 +55164,7 @@ void render_openxr_test_frame(
                 w3vr::minimal_xr_log::write("QUEUE_BEGIN", current_present, trace_pair_id, g_xr_fence_value + 1);
                 auto* submit_queue=managed_frame?image_session->graphics->queue.Get():(modern_sources ? modern_sources->queue.Get():g_command_queue);
                 bool execute_admitted=true;
-                auto* submit_fence=modern_sources ? modern_sources->fence.Get():g_xr_fence;
+                auto* submit_fence=modern_sources ? modern_sources->submission_fence.Get():g_xr_fence;
                 const uint64_t planned_submission=g_xr_fence_value<UINT64_MAX-1?g_xr_fence_value+1:0;
                 if(managed_frame){
                     if(!allocator_submissions || !submitted)execute_admitted=false;

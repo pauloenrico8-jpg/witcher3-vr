@@ -13,6 +13,9 @@ struct Use {
     std::array<ComPtr<ID3D12Fence>,2> producer_fences;
     std::array<ComPtr<ID3D12CommandQueue>,2> producers;
     ComPtr<ID3D12CommandQueue> queue;
+    // Submission identity remains the exact shared fence originally signalled.
+    // Retirement can switch to a private per-submission fence without changing it.
+    ComPtr<ID3D12Fence> submission_fence;
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12GraphicsCommandList> recording;
     ComPtr<ID3D12CommandAllocator> allocator;
@@ -36,6 +39,10 @@ struct Store {
     bool contains(const Use* target)const{
         for(auto* use=head;use;use=use->next)if(use==target)return true;
         return false;
+    }
+    bool submission_matches(const Use* use,ID3D12CommandQueue* queue,ID3D12Fence* fence)const{
+        return contains(use) && use->cpu_active && queue && fence &&
+            use->queue.Get()==queue && use->submission_fence.Get()==fence;
     }
     bool held(ID3D12Resource* resource)const{
         if(!resource)return false;
