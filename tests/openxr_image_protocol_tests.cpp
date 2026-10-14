@@ -1,4 +1,5 @@
 #include "openxr_image_protocol.h"
+#include "openxr_frame_cycle.h"
 #include <cstdlib>
 #include <iostream>
 #include <thread>
@@ -12,6 +13,123 @@ x::Ticket acquire_wait(x::Image& image,XrResult acquire=XR_SUCCESS,XrResult wait
     x::Ticket t;check(image.begin(input(),t),"begin");uint32_t out=99;
     check(image.acquire(t,out,[&](uint32_t& value){value=index;return acquire;})==acquire&&out==index,"acquire forwarding");
     check(image.wait(t,[&]{return wait;})==wait,"wait forwarding");return t;
+}
+void timeout_recovery_tests(){
+    {
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);
+        unsigned waits{},releases{},admissions{};auto owner=input(2);owner.generation++;
+        auto admitted=[&]{++admissions;return true;};
+        auto timeout=[&]{++waits;return XR_TIMEOUT_EXPIRED;};
+        auto release=[&]{++releases;return XR_SUCCESS;};
+        check(image.retryable_pending(),"timeout not retryable");
+        const auto first=image.recover_wait_timeout(owner,admitted,timeout,release);
+        check(first.state==x::RecoveryState::Pending&&first.wait_result==XR_TIMEOUT_EXPIRED&&waits==1&&releases==0,"timeout reacquired/released image");
+        check(image.pending()&&image.retryable_pending()&&!image.writable(t,1,true),"pending cleanup drew");
+        unsigned nested{};auto newer=input(3);newer.generation++;
+        const auto done=image.recover_wait_timeout(newer,admitted,[&]{
+            ++waits;check(!image.retryable_pending(),"recovery reentry admission");
+            auto again=image.recover_wait_timeout(input(4),[]{return true;},[&]{++nested;return XR_SUCCESS;},[&]{++nested;return XR_SUCCESS;});
+            check(again.state==x::RecoveryState::Rejected&&nested==0,"nested timeout recovery");return XR_SUCCESS;
+        },[&]{
+            ++releases;check(!image.writable(t,1,true)&&!image.start_recording(t,binding(),true),"old recovered image drawn before release");return XR_SUCCESS;
+        });
+        check(done.state==x::RecoveryState::Released&&done.wait_result==XR_SUCCESS&&done.release_result==XR_SUCCESS,"legal pending recovery");
+        check(waits==2&&releases==1&&admissions==3&&!image.pending()&&!image.layer_allowed(t),"recovery counts/published old image");
+        x::Ticket next;check(!image.begin(input(2),next)&&!image.begin(input(3),next)&&image.begin(input(4),next),"cleanup frame reused for fresh acquire");
+        uint32_t index{};check(image.acquire(next,index,[](auto& value){value=0;return XR_SUCCESS;})==XR_SUCCESS&&
+            image.wait(next,[]{return XR_SUCCESS;})==XR_SUCCESS&&image.writable(next,0,true),"new frame remained cleanup-only");
+    }
+    for(unsigned changed=0;changed<8;++changed){
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);auto owner=input(2);
+        if(changed==0)owner.frame.session++;
+        if(changed==1)owner.frame.epoch++;
+        if(changed==2)owner.frame.nonce=1;
+        if(changed==3)owner.chain++;
+        if(changed==4)owner.queue++;
+        if(changed==5)owner.images++;
+        if(changed==6)owner.generation=0;
+        if(changed==7)owner.frame.nonce=0;
+        unsigned calls{};const auto result=image.recover_wait_timeout(owner,[]{return true;},[&]{++calls;return XR_SUCCESS;},[&]{++calls;return XR_SUCCESS;});
+        check(result.state==x::RecoveryState::Rejected&&calls==0&&image.retryable_pending(),"foreign cleanup owner burned pending image");
+        auto good=image.recover_wait_timeout(input(2),[]{return true;},[]{return XR_SUCCESS;},[]{return XR_SUCCESS;});
+        check(good.state==x::RecoveryState::Released&&!image.layer_allowed(t),"legitimate cleanup after foreign rejection");
+    }
+    {
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);unsigned waits{},releases{};
+        const auto rejected=image.recover_wait_timeout(input(2),[]{return false;},[&]{++waits;return XR_SUCCESS;},[&]{++releases;return XR_SUCCESS;});
+        check(rejected.state==x::RecoveryState::Rejected&&waits==0&&releases==0&&image.retryable_pending(),"closed admission called runtime");
+        unsigned seen{};auto result=image.recover_wait_timeout(input(2),[&]{return ++seen==1;},[&]{++waits;return XR_SUCCESS;},[&]{++releases;return XR_SUCCESS;});
+        check(result.state==x::RecoveryState::Failed&&waits==1&&releases==0&&image.pending()&&!image.retryable_pending(),"changed owner released image");
+        check(!image.writable(t,1,true),"changed owner drew image");
+    }
+    for(XrResult wait:{XR_ERROR_RUNTIME_FAILURE,XR_ERROR_SESSION_LOST,XR_EVENT_UNAVAILABLE}){
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);unsigned releases{};
+        const auto result=image.recover_wait_timeout(input(2),[]{return true;},[&]{return wait;},[&]{++releases;return XR_SUCCESS;});
+        check(result.state==x::RecoveryState::Failed&&result.wait_result==wait&&releases==0&&image.pending()&&!image.retryable_pending(),"fatal wait converted to timeout");
+        check(!image.layer_allowed(t)&&!image.writable(t,1,true),"fatal wait published");
+    }
+    for(XrResult release:{XR_ERROR_RUNTIME_FAILURE,XR_TIMEOUT_EXPIRED,XR_SESSION_LOSS_PENDING}){
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);
+        const auto result=image.recover_wait_timeout(input(2),[]{return true;},[]{return XR_SUCCESS;},[&]{return release;});
+        check(result.state==x::RecoveryState::Failed&&result.release_result==release&&!image.layer_allowed(t)&&!image.retryable_pending(),"failed/lost release recovered silently");
+        check(image.pending()==(release!=XR_SESSION_LOSS_PENDING),"failed release lost acquired state");
+    }
+    {
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);unsigned releases{};
+        const auto result=image.recover_wait_timeout(input(2),[]{return true;},[]{return XR_SESSION_LOSS_PENDING;},[&]{++releases;return XR_SUCCESS;});
+        check(result.state==x::RecoveryState::Failed&&releases==1&&!image.pending()&&!image.layer_allowed(t),"loss cleanup or layer policy");
+        x::Ticket next;check(!image.begin(input(3),next),"lost session rearmed after cleanup");
+    }
+    {
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);unsigned calls{};bool rejected{};
+        std::thread other([&]{rejected=image.recover_wait_timeout(input(2),[]{return true;},[&]{++calls;return XR_SUCCESS;},[&]{++calls;return XR_SUCCESS;}).state==x::RecoveryState::Rejected;});other.join();
+        check(rejected&&calls==0&&image.retryable_pending(),"other thread recovered borrowed image");
+        check(image.wait(t,[]{return XR_SUCCESS;})==XR_SUCCESS&&image.writable(t,1,true),"same frame legal wait retry");
+    }
+    for(unsigned fault=0;fault<2;++fault){
+        x::Image image;auto t=acquire_wait(image,XR_SUCCESS,XR_TIMEOUT_EXPIRED);bool caught{};unsigned releases{};
+        try {image.recover_wait_timeout(input(2),[]{return true;},[&]()->XrResult{if(fault==0)throw std::runtime_error("own wait fault");return XR_SUCCESS;},[&]()->XrResult{++releases;throw std::runtime_error("own release fault");});}
+        catch(const std::runtime_error&){caught=true;}
+        check(caught&&releases==fault&&image.pending()&&!image.retryable_pending()&&!image.writable(t,1,true),"exception rearmed cleanup");
+    }
+    {
+        x::Image image;auto t=acquire_wait(image);check(image.start_recording(t,binding(),true)&&image.before_execute(t,binding(),0x3000,true),"executed failure setup");
+        check(image.execution_returned(t,binding(),0x3000,true)&&!image.signal(t,0x3000,false,8),"executed failure fixture");
+        unsigned calls{};auto result=image.recover_wait_timeout(input(2),[]{return true;},[&]{++calls;return XR_SUCCESS;},[&]{++calls;return XR_SUCCESS;});
+        check(result.state==x::RecoveryState::Rejected&&calls==0&&image.pending(),"unknown GPU submission used timeout recovery");
+    }
+}
+void frame_cleanup_sequence(){
+    namespace f=w3vr::xr_frame_cycle;
+    f::Cycle cycle;x::Image image;const auto session=reinterpret_cast<XrSession>(static_cast<uintptr_t>(0x1000));
+    check(cycle.session_started(session),"cleanup frame session");unsigned acquisitions{},waits{},releases{},ends{};x::Ticket original;
+    for(unsigned frame=1;frame<=4;++frame){
+        {
+            auto lease=cycle.prepare(session,7);check(bool(lease),"cleanup frame prepare");
+            check(cycle.wait(lease,[]{return XR_SUCCESS;})==XR_SUCCESS&&cycle.begin(lease,[]{return XR_SUCCESS;})==XR_SUCCESS,"cleanup frame wait/begin");
+            f::Payload payload;payload.state.predictedDisplayTime=100+frame*10;payload.state.predictedDisplayPeriod=10;payload.state.shouldRender=XR_TRUE;
+            check(cycle.publish(lease,payload),"cleanup frame payload");
+        }
+        f::Payload payload;auto lease=cycle.present(session,payload);check(bool(lease)&&cycle.current(payload.ticket),"cleanup present lease");
+        x::Input owner{payload.ticket.identity(),0x2000,0x3000,7,3};
+        if(frame==1 || frame==4){
+            x::Ticket t;check(image.begin(owner,t),"fresh image on acquisition frame");if(frame==1)original=t;
+            uint32_t index{};check(image.acquire(t,index,[&](auto& v){++acquisitions;v=1;return XR_SUCCESS;})==XR_SUCCESS,"fresh acquisition callback");
+            const auto waited=image.wait(t,[&]{++waits;return frame==1?XR_TIMEOUT_EXPIRED:XR_SUCCESS;});
+            check(waited==(frame==1?XR_TIMEOUT_EXPIRED:XR_SUCCESS)&&image.writable(t,1,true)==(frame==4),"fresh image availability");
+        }else{
+            check(!cycle.current(original.input.frame,7),"old XR frame still current");
+            auto recovered=image.recover_wait_timeout(owner,[&]{return cycle.current(payload.ticket);},[&]{
+                ++waits;f::Payload another;check(!cycle.present(session,another)&&!cycle.prepare(session,7),"recovery overlapped another frame");
+                return frame==2?XR_TIMEOUT_EXPIRED:XR_SUCCESS;
+            },[&]{++releases;return XR_SUCCESS;});
+            check(recovered.state==(frame==2?x::RecoveryState::Pending:x::RecoveryState::Released),"cleanup across frame boundaries");
+            check(!image.layer_allowed(original)&&!image.writable(original,1,true),"old image displayed on new frame");
+        }
+        XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=payload.state.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        check(cycle.end(lease,[&]{++ends;check(end.layerCount==0&&end.layers==nullptr,"cleanup sent layer");return XR_SUCCESS;})==XR_SUCCESS,"cleanup frame ended");
+    }
+    check(acquisitions==2&&waits==4&&releases==1&&ends==4,"cleanup acquired replacements or skipped frame end");
 }
 int main(){
     {
@@ -131,5 +249,7 @@ int main(){
         check(caught&&calls==failure+1&&!image.color_ready(t,b)&&!image.before_execute(t,b,0x3000,true),"partial copy restored readiness");
         check(!image.releasable(t)&&image.pending(),"partial exception returned runtime image");
     }
-    std::cout<<checks<<" CPU checks of own image acquisition, wait, color transitions, exact queue signal, release, pending quarantine and stale callbacks. Handles/results/state receipts fabricated; no OpenXR runtime, SDK, Witcher, GPU or Quest executed.\n";
+    timeout_recovery_tests();
+    frame_cleanup_sequence();
+    std::cout<<checks<<" CPU checks of own image acquisition, wait, color transitions, exact queue signal, release, timeout-only cleanup, pending quarantine and stale callbacks. Handles/results/state receipts fabricated; no OpenXR runtime, SDK, Witcher, GPU or Quest executed.\n";
 }
