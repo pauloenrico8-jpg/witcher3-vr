@@ -57,6 +57,7 @@
 #include "modern_eye_resource_set.h"
 #include "modern_graphics_binding.h"
 #include "modern_backbuffer_source.h"
+#include "modern_capture_recording.h"
 #include "modern_backbuffer_hooks.h"
 #include "modern_hook_original.h"
 static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
@@ -2010,6 +2011,8 @@ struct PendingStreamlineCapturePublication {
     uint64_t recording_epoch{}; // Modern only; observed on the actual endpoint.
     w3vr::xr_frame::Identity xr_frame{};
 };
+static_assert(std::is_trivially_copyable_v<PendingStreamlineCapturePublication> &&
+    std::is_nothrow_move_constructible_v<PendingStreamlineCapturePublication>);
 std::array<std::array<StreamlineCaptureSlot, kStreamlineCaptureRingSize>, 2> g_streamline_capture_ring{};
 std::atomic<uint64_t> g_streamline_capture_write_count[2]{};
 std::atomic<uint64_t> g_streamline_capture_serial{};
@@ -29619,6 +29622,7 @@ void barrier_source_body(
     // source is the CURRENT game swapchain texture, held until recording ends.
     // Copies use the concrete endpoint seen by ExecuteCommandLists, which
     // later publishes existing per-copy tickets/fences for the owned eye ring.
+    w3vr::capture_recording::observe([&]{
     EngineFrameTag modern_copy_tag{};
     if (modern_capture_contract && !g_packed_capture_internal && barriers &&
         command_list_is_recording_endpoint(command_list) &&
@@ -29656,6 +29660,7 @@ void barrier_source_body(
             // Their GPU use still needs the producer lease before resize/unload.
         }
     }
+    },[]()noexcept{g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);});
     if (early_hud_capture_source != nullptr) {
         capture_mode3_early_hud(
             command_list, early_hud_capture_source,
@@ -51519,22 +51524,7 @@ bool capture_tagged_backbuffer_output(
         return false;
     }
     auto& slot = g_streamline_capture_ring[eye][slot_index];
-    w3vr::modern_backbuffer_source::Record* source_record{};
-    if(modern_identity){
-        std::scoped_lock lock{g_streamline_capture_mutex};
-        try{
-            auto retained=std::make_unique<w3vr::modern_backbuffer_source::Record>();
-            retained->binding=binding;retained->source=source;retained->destination=slot.resource;
-            retained->command=command_list;retained->key={*modern_identity,epoch,capture_serial,slot_index};
-            source_record=g_modern_backbuffer_sources.adopt(std::move(retained));
-        }catch(...){}
-        if(!source_record){
-            if(slot.recording_pending && slot.capture_serial==capture_serial)slot.recording_pending=false;
-            return false; // No new resource command has been recorded yet.
-        }
-        g_modern_backbuffer_sources.mark_recorded(source_record);
-    }
-    g_packed_capture_internal = true;
+    auto record_commands=[&]{
     if (destination_was_copy_source) {
         D3D12_RESOURCE_BARRIER to_copy_dest{};
         to_copy_dest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -51567,8 +51557,64 @@ bool capture_tagged_backbuffer_output(
     slot_to_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     slot_to_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     command_list->ResourceBarrier(1, &slot_to_source);
-    g_packed_capture_internal = false;
-
+    };
+    if(modern_identity){
+        w3vr::modern_backbuffer_source::Record* source_record{};
+        bool commands_returned{};
+        auto prepare=[&]{
+            std::scoped_lock lock{g_streamline_capture_mutex};
+            auto retained=std::make_unique<w3vr::modern_backbuffer_source::Record>();
+            retained->binding=binding;retained->source=source;retained->destination=slot.resource;
+            retained->command=command_list;retained->key={*modern_identity,epoch,capture_serial,slot_index};
+            source_record=g_modern_backbuffer_sources.adopt(std::move(retained));
+            return source_record!=nullptr;
+        };
+        auto record=[&]{
+            {std::scoped_lock lock{g_streamline_capture_mutex};g_modern_backbuffer_sources.mark_recorded(source_record);}
+            record_commands();commands_returned=true;
+        };
+        auto publish=[&]{
+            std::scoped_lock lock{g_streamline_capture_mutex};
+            if(!slot.recording_pending || slot.capture_serial!=capture_serial ||
+                !g_modern_backbuffer_sources.contains(source_record) || source_record->sealed ||
+                source_record->quarantined || !modern_graphics_current(binding) ||
+                generation!=g_streamline_capture_generation.load(std::memory_order_acquire) ||
+                load_command_list_recording_epoch(command_list)!=epoch)return false;
+            slot.generation=generation;slot.pair_id=pair_id;slot.source_eye=source_eye;
+            slot.source_eye_valid=true;slot.render_view=render_view;slot.render_view_valid=render_view_valid;
+            slot.native_asymmetric_projection=native_asymmetric_source_eye_tagged(pair_id,eye);
+            slot.modern_output={*modern_identity,reinterpret_cast<uintptr_t>(slot.resource),
+                reinterpret_cast<uintptr_t>(command_list),0,0,0,epoch,0,capture_serial,0,
+                source_eye,true,render_view_valid,false,true,false,binding->epoch};
+            g_streamline_capture_pending_publications[command_list].push_back({
+                eye,slot_index,generation,pair_id,capture_serial,epoch,modern_identity->frame.xr});
+            return true;
+        };
+        auto failed=[&](bool referenced)noexcept{
+            std::scoped_lock lock{g_streamline_capture_mutex};
+            if(referenced){
+                // A partial/unknown recording cannot regain capture authority.
+                // A fully returned copy still retains its interfaces until the
+                // existing Reset + exact submission-fence proof can retire them.
+                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                if(source_record && (!commands_returned || source_record->sealed))source_record->quarantined=true;
+            }
+            if(slot.capture_serial==capture_serial){
+                slot.initialized=false;slot.pair_id=0;slot.source_eye=UINT32_MAX;
+                slot.source_eye_valid=false;slot.render_view_valid=false;slot.modern_output={};
+                if(!referenced)slot.recording_pending=false; // No resource command was attempted.
+                else{slot.last_use_fence=nullptr;slot.last_use_fence_value=UINT64_MAX;}
+            }
+        };
+        auto finish=[&]()noexcept{
+            std::scoped_lock lock{g_streamline_capture_mutex};
+            if(source_record)g_modern_backbuffer_sources.finish_cpu(source_record);
+        };
+        return w3vr::capture_recording::run(g_packed_capture_internal,prepare,record,publish,failed,finish);
+    }
+    g_packed_capture_internal=true;
+    record_commands();
+    g_packed_capture_internal=false;
     {
         std::scoped_lock lock{g_streamline_capture_mutex};
         slot.generation = generation;
@@ -51579,15 +51625,9 @@ bool capture_tagged_backbuffer_output(
         slot.render_view_valid = render_view_valid;
         slot.native_asymmetric_projection =
             native_asymmetric_source_eye_tagged(pair_id, eye);
-        if(modern_identity){
-            slot.modern_output={*modern_identity,reinterpret_cast<uintptr_t>(slot.resource),
-                reinterpret_cast<uintptr_t>(command_list),0,0,0,epoch,0,capture_serial,0,
-                source_eye,true,render_view_valid,false,true,false,binding->epoch};
-        }
         g_streamline_capture_pending_publications[command_list].push_back({
             eye, slot_index, generation, pair_id, capture_serial,epoch,
             modern_identity?modern_identity->frame.xr:w3vr::xr_frame::Identity{}});
-        if(source_record)g_modern_backbuffer_sources.finish_cpu(source_record);
     }
 
     if (g_config.runtime_diagnostics &&
