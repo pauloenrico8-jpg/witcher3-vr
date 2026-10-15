@@ -85,10 +85,13 @@ public:
             !(e->anchor=identity(e->private_fence.Get())) || !(e->event=CreateEventW(nullptr,FALSE,FALSE,nullptr))){quarantine(*e);return out;}
         out.anchor=e->anchor;out.nonce=e->nonce;return out;
     }
+    bool can_execute(const Ticket& t,ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists)const{
+        const auto* e=find(t);return e && !blocked_ && e->cpu_active && !e->cancelled && !e->sealed && e->phase==Phase::Prepared &&
+            queue==e->objects.queue.Get() && count==1 && lists && lists[0]==e->objects.command.Get();
+    }
     bool before_execute(const Ticket& t,ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
-        auto* e=find(t);if(!e || blocked_ || !e->cpu_active || e->cancelled || e->sealed || e->phase!=Phase::Prepared ||
-            queue!=e->objects.queue.Get() || count!=1 || !lists || lists[0]!=e->objects.command.Get())return false;
-        e->phase=Phase::Executing;return true; // BEFORE the original void Execute
+        if(!can_execute(t,queue,count,lists))return false;
+        find(t)->phase=Phase::Executing;return true; // BEFORE the original void Execute
     }
     bool after_shared_signal(const Ticket& t,ID3D12CommandQueue* queue,ID3D12Fence* fence,HRESULT result,std::uint64_t value){
         auto* e=find(t);if(!e || e->phase!=Phase::Executing || e->signal_called)return false;

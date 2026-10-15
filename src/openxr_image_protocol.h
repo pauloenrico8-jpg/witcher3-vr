@@ -139,8 +139,11 @@ public:
         const bool restored=transition(t,binding,0x800,4);
         if(!restored)failed_=true;return restored;
     }
+    bool can_execute(Ticket t,Recording binding,std::uintptr_t queue,bool closed)const{
+        return color_ready(t,binding) && !execute_called_ && queue==t.input.queue && closed;
+    }
     bool before_execute(Ticket t,Recording binding,std::uintptr_t queue,bool closed){
-        if(!color_ready(t,binding) || execute_called_ || queue!=t.input.queue || !closed)return false;
+        if(!can_execute(t,binding,queue,closed))return false;
         execute_called_=true;return true;
     }
     bool execution_returned(Ticket t,Recording binding,std::uintptr_t queue,bool closed){

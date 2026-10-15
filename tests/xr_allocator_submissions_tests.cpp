@@ -1,4 +1,7 @@
 #include "xr_allocator_submissions.h"
+#include "xr_submission_admission.h"
+#include <mutex>
+#include <thread>
 #include "modern_eye_source_use.h"
 #include <cstdlib>
 #include <iostream>
@@ -47,6 +50,70 @@ struct Fixture {
     void pixels(ID3D12Resource* resource){void* data{};D3D12_RANGE bytes{0,pattern.size()};check(SUCCEEDED(resource->Map(0,&bytes,&data)),"completed map");
         for(unsigned n=0;n<pattern.size();++n)check(static_cast<unsigned char*>(data)[n]==pattern[n],"retained copy byte mismatch");D3D12_RANGE none{0,0};resource->Unmap(0,&none);}
 };
+
+namespace image=w3vr::xr_image;
+image::Ticket own_image(image::Image& state,Fixture& f,image::Recording& recording){
+    image::Ticket ticket;const auto queue=reinterpret_cast<std::uintptr_t>(f.queue.Get());
+    check(state.begin({{0x1000,1,1},0x2000,queue,7,3},ticket),"own admission XR identity");
+    uint32_t index{};check(state.acquire(ticket,index,[](auto& out){out=0;return XR_SUCCESS;})==XR_SUCCESS &&
+        state.wait(ticket,[]{return XR_SUCCESS;})==XR_SUCCESS,"own admission fabricated acquire/wait");
+    recording={reinterpret_cast<std::uintptr_t>(f.command.Get()),reinterpret_cast<std::uintptr_t>(f.output.Get()),reinterpret_cast<std::uintptr_t>(f.output.Get()),0};
+    check(state.start_recording(ticket,recording,true),"own admission recording identity");return ticket;
+}
+void refused_admission(){
+    for(unsigned fault=0;fault<11;++fault){
+        Fixture f;a::Store allocator(signal_callback);f.reset(allocator);f.copy();
+        image::Image state;image::Recording recording;auto image_ticket=own_image(state,f,recording);
+        w3vr::modern_eye_source_use::Store sources;auto owned=std::make_unique<w3vr::modern_eye_source_use::Use>();
+        owned->textures[0]=f.upload;owned->textures[1]=f.output;owned->queue=f.queue;owned->submission_fence=f.shared;
+        owned->fence=f.shared;owned->recording=f.command;owned->allocator=f.allocator;owned->recorded=true;
+        auto* use=sources.adopt(std::move(owned));auto ticket=allocator.prepare(0,f.objects());check(bool(ticket.anchor),"rejection prepared ticket");
+        auto requested=ticket;auto requested_image=image_ticket;auto requested_recording=recording;
+        auto* requested_queue=f.queue.Get();UINT count=1;bool closed=true;
+        if(fault==0)++requested.nonce; // LAST participant must refuse without marking earlier ones.
+        if(fault==1)++requested_image.nonce;
+        if(fault==2)++requested_recording.resource;
+        if(fault==3)count=0;
+        if(fault==4)closed=false;
+        if(fault==6)requested_queue=f.other.Get();
+        if(fault==9)use->queue=f.other; // Source participant alone rejects the actual queue.
+        ID3D12CommandList* lists[]{fault==7?nullptr:f.command.Get()};
+        std::mutex capture;bool admitted{};unsigned native_calls{};
+        auto admit=[&]{std::lock_guard lock{capture};admitted=w3vr::xr_submission::begin(fault==10?nullptr:&sources,fault==5?nullptr:use,
+            state,requested_image,requested_recording,allocator,requested,requested_queue,count,lists,closed);};
+        if(fault==8){std::thread other(admit);other.join();}else admit();
+        if(admitted){++native_calls;f.queue->ExecuteCommandLists(1,lists);}
+        check(!admitted && native_calls==0,"invalid combined admission reached Native Execute");
+        check(use->phase==w3vr::modern_eye_pair::UsePhase::Recording && allocator.phase(ticket)==a::Phase::Prepared,
+            "late refusal partially advanced source/allocator");
+        check(state.can_execute(image_ticket,recording,reinterpret_cast<std::uintptr_t>(f.queue.Get()),true) &&
+            state.releasable(image_ticket) && !state.layer_allowed(image_ticket),"late refusal stuck image or published a layer");
+        sources.finish_cpu(use);allocator.finish_cpu(ticket);
+        check(sources.size()==1 && allocator.size()==1 && allocator.wait(0,f.allocator.Get(),0),"unsubmitted refs did not wait for actual Reset");
+        f.reset(allocator);
+        check(sources.discard_after_reset(f.command.Get(),S_OK)==1 && sources.size()==0 && allocator.size()==0,
+            "actual Reset did not retire rejected unsubmitted references");
+        unsigned releases{};check(state.release(image_ticket,[&]{++releases;return XR_SUCCESS;})==XR_SUCCESS &&
+            releases==1 && !state.pending() && !state.layer_allowed(image_ticket),"empty rejected XR frame did not close cleanly");
+        check(SUCCEEDED(f.command->Close()),"rejection final own close");
+    }
+}
+void admission_without_sources(){
+    Fixture f;a::Store allocator(signal_callback);f.reset(allocator);f.copy();
+    image::Image state;image::Recording recording;auto image_ticket=own_image(state,f,recording);
+    auto ticket=allocator.prepare(0,f.objects());check(bool(ticket.anchor),"source-free prepared ticket");ID3D12CommandList* lists[]{f.command.Get()};
+    std::mutex capture;{
+        std::lock_guard lock{capture};check(w3vr::xr_submission::begin(nullptr,nullptr,state,image_ticket,recording,allocator,ticket,
+            f.queue.Get(),1,lists,true),"source-free combined admission");}
+    {std::lock_guard lock{capture};check(!state.releasable(image_ticket)&&!w3vr::xr_submission::begin(nullptr,nullptr,state,image_ticket,recording,
+        allocator,ticket,f.queue.Get(),1,lists,true),"admission replay or pre-Execute release");}
+    f.queue->ExecuteCommandLists(1,lists);check(state.execution_returned(image_ticket,recording,reinterpret_cast<std::uintptr_t>(f.queue.Get()),true),"own Execute return");
+    const auto signal=f.queue->Signal(f.shared.Get(),5);check(allocator.after_shared_signal(ticket,f.queue.Get(),f.shared.Get(),signal,5) &&
+        state.signal(image_ticket,reinterpret_cast<std::uintptr_t>(f.queue.Get()),true,5),"source-free real queue signals");
+    allocator.finish_cpu(ticket);f.unblock();check(allocator.wait(0,f.allocator.Get(),5000),"source-free private completion");f.pixels(f.output.Get());
+    check(state.release(image_ticket,[]{return XR_SUCCESS;})==XR_SUCCESS&&state.layer_allowed(image_ticket),"fabricated XR release after own Execute");
+    f.reset(allocator);check(allocator.size()==0,"source-free references not retired after real Reset");check(SUCCEEDED(f.command->Close()),"source-free final close");
+}
 void completed_path(){
     Fixture f;a::Store store(signal_callback);f.reset(store);f.copy();
     w3vr::modern_eye_source_use::Store sources;
@@ -61,11 +128,14 @@ void completed_path(){
     check(!store.before_execute(replay,f.queue.Get(),1,lists)&&!store.before_execute(t,f.other.Get(),1,lists)&&
         !store.before_execute(t,f.queue.Get(),0,lists),"foreign ticket/queue/array admitted");
     check(SUCCEEDED(f.queue->Wait(f.gate.Get(),1)),"own queue gated");
-    check(sources.before_execute(use,f.queue.Get(),1,lists)&&store.before_execute(t,f.queue.Get(),1,lists),"own execution marker");
+    image::Image state;image::Recording recording;const auto image_ticket=own_image(state,f,recording);std::mutex capture;
+    {std::lock_guard lock{capture};check(w3vr::xr_submission::begin(&sources,use,state,image_ticket,recording,store,t,
+        f.queue.Get(),1,lists,true),"combined own execution marker");}
     check(!store.cancel(t)&&!store.before_execute(t,f.queue.Get(),1,lists),"executing cancelled/replayed");
-    f.queue->ExecuteCommandLists(1,lists);const auto original=f.queue->Signal(f.shared.Get(),5);unsigned prior=signal_calls;
+    f.queue->ExecuteCommandLists(1,lists);check(state.execution_returned(image_ticket,recording,reinterpret_cast<std::uintptr_t>(f.queue.Get()),true),"combined own return");const auto original=f.queue->Signal(f.shared.Get(),5);unsigned prior=signal_calls;
     check(store.after_shared_signal(t,f.queue.Get(),f.shared.Get(),original,5)&&signal_calls==prior+1,"own private signal");
     check(!store.after_shared_signal(t,f.queue.Get(),f.shared.Get(),original,5)&&signal_calls==prior+1,"duplicate private signal");
+    check(state.signal(image_ticket,reinterpret_cast<std::uintptr_t>(f.queue.Get()),true,5),"combined observed signal");
     const auto receipt=store.receipt(t);check(receipt.fence&&receipt.value==1&&receipt.fence.Get()!=f.shared.Get(),"private source retirement receipt");
     use->fence=receipt.fence;check(sources.after_signal(use,original,receipt.value),"source private marker");
     check(sources.submission_matches(use,f.queue.Get(),f.shared.Get())&&
@@ -79,6 +149,7 @@ void completed_path(){
     f.unblock();check(store.wait(0,f.allocator.Get(),5000)&&store.size()==1&&store.collect()==0,"completed but replayable refs released");
     ComPtr<ID3D12Resource> output=retained_output;f.pixels(output.Get());
     check(sources.collect()==1&&!sources.held(retained_output),"sources not retired by actual private fence");
+    check(state.release(image_ticket,[]{return XR_SUCCESS;})==XR_SUCCESS&&state.layer_allowed(image_ticket),"combined fabricated XR release");
     f.reset(store);check(store.size()==0&&store.known_slot(0)&&store.wait(0,f.allocator.Get(),0),"successful reset did not seal completed old recording");
     f.output=output;check(SUCCEEDED(f.command->Close()),"close reused list");
     auto next=store.prepare(0,f.objects(2,6));check(next.anchor&&next.nonce!=t.nonce,"new own epoch slot");
@@ -101,4 +172,4 @@ void failures(){
         // release from a destructor or a fabricated recovery receipt is tested.
     }
 }
-int main(){completed_path();failures();std::cout<<checks<<" checks: real own queues, retained interfaces, private submission fences, gated copy, shared-fence advance, successful Reset sealing and 512 verified bytes. XR frame IDs and failed-signal outcomes are fixtures. No SDK, Witcher, OpenXR runtime, host callbacks or Quest executed.\n";}
+int main(){refused_admission();admission_without_sources();completed_path();failures();std::cout<<checks<<" checks: real own queues, retained interfaces, private submission fences, gated copy, shared-fence advance, successful Reset sealing and 1024 verified bytes; eleven coordinated admission refusals leave no partial Execute marker and clean up after actual Reset. XR results/frame IDs and failed-signal outcomes are fixtures. No SDK, Witcher, OpenXR runtime, host callbacks or Quest executed.\n";}

@@ -85,7 +85,7 @@ target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
     add_executable(w3vr_xr_allocator_submissions_tests tests/xr_allocator_submissions_tests.cpp)
-    target_include_directories(w3vr_xr_allocator_submissions_tests PRIVATE src)
+    target_include_directories(w3vr_xr_allocator_submissions_tests PRIVATE src "${W3VR_OPENXR_DIR}/include")
     target_compile_definitions(w3vr_xr_allocator_submissions_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(w3vr_xr_allocator_submissions_tests PRIVATE dxguid)
     set_target_properties(w3vr_xr_allocator_submissions_tests PROPERTIES

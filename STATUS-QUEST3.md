@@ -10,6 +10,56 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+## Conferência conjunta antes do envio gráfico — 14 de outubro
+
+O caminho de apresentação verificava as fontes, a imagem VR e a memória de
+comandos em sequência. Cada verificação já mudava seu próprio estado. Uma
+recusa posterior podia deixar os controles anteriores marcados como enviados,
+embora a chamada de execução da GPU nunca tivesse acontecido.
+
+Um laboratório próprio reproduziu essa ordem: recusou o último comprovante,
+não chamou a execução gráfica e observou a imagem pendente e as fontes retidas
+mesmo após Reset real. Isso não foi observado durante uma partida do Witcher.
+
+1. Os três controles agora podem conferir fila, lista, imagem e comprovantes
+   sem alterar seus estados. Comprovante é o identificador daquela preparação.
+2. Um helper, a pequena função que coordena essa etapa, verifica todos primeiro.
+   Só depois marca os três como enviados para execução. O host mantém o bloqueio
+   das fontes e a exclusividade daquele quadro durante esse trecho. Nenhuma
+   chamada externa, alocação de memória ou liberação desse bloqueio acontece
+   entre essas conferências e marcações.
+3. Uma recusa deixa os três sem marcas parciais. Os recursos não enviados ainda
+   esperam o Reset real da lista para serem descartados. A imagem pode encerrar
+   o quadro sem publicar uma camada, em vez de esperar por um envio inexistente.
+   O bloqueio de novas submissões na recusa continua como antes; não há retomada
+   automática nem cancelamento de comandos que possam ter sido enviados.
+4. Quando todos aceitam, a chamada gráfica continua fora do bloqueio das fontes.
+   Permanecem os sinais reais de conclusão e a retenção dos recursos usados.
+   Referências guardam os objetos; os sinais dizem quando a GPU terminou com eles.
+
+Escolhi conferir tudo antes de marcar porque não é seguro desfazer um envio
+que talvez já tenha chegado à GPU. Esta mudança coordena os controles próprios;
+não demonstra a vida útil completa dos objetos internos do jogo nem torna
+seguro descarregar a DLL enquanto existirem chamadas em andamento.
+O [contrato de Reset do DirectX](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandallocator-reset)
+continua exigindo que a memória não seja reutilizada durante execução na GPU.
+
+O teste passou em **1.554 verificações**, incluindo onze recusas: comprovante
+antigo, imagem ou lista incompatível, fila diferente, lista não fechada,
+participantes ausentes e thread diferente. Thread é uma linha de execução do
+programa. Conferiu descarte após Reset real e também caminhos aceitos com e sem
+fontes de cena. Duas cópias gráficas próprias produziram **1.024 bytes conferidos**.
+As filas, recursos, Reset e sinais eram DirectX reais; resultados e identidades
+OpenXR foram fabricados. Isso não prova duas imagens do jogo nem funcionamento
+num headset. Falhas de sinais dos casos anteriores continuam simuladas.
+
+A DLL compilou e **128 testes passaram em 15.61 segundos**. Não executou os
+callbacks novos do host no Witcher, SDK, OpenXR real ou Quest. **Remastered
+continua fechado e o VR ainda não funciona.** Nada experimental foi instalado.
+Ainda faltam a continuidade do produtor e a ordem e retenção dos recursos
+nativos necessárias para dois olhos novos do jogo em cada quadro, antes de
+cabeça, mãos, armas, dano, bloqueio e parry físicos no headset.
+
 ## Estado numérico conservado pela observação — 14 de outubro
 
 Um teste próprio encontrou uma diferença: o observador podia mudar o modo de
