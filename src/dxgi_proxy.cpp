@@ -2452,10 +2452,11 @@ w3vr::modern_dlss_native_hooks::Forwarder g_legacy_native_reset_forwarder;
 // Preserve the existing owner and its state updates. Unbound/proxy routes
 // call the same original directly; only a validated native delegate observes.
 void forward_legacy_execute(ID3D12CommandQueue* queue, UINT count,
-    ID3D12CommandList* const* array) {
+    ID3D12CommandList* const* array,w3vr::execute_observation::Receipt& receipt) {
     if (g_legacy_native_execute_forwarder)
-        g_legacy_native_execute_forwarder.execute(queue, count, array);
-    else g_execute_command_lists(queue, count, array);
+        g_legacy_native_execute_forwarder.execute(queue,count,array,&receipt);
+    else receipt.forward_raw([&]{g_execute_command_lists(queue,count,array);});
+    receipt.require_returned();
 }
 HRESULT forward_legacy_reset(ID3D12GraphicsCommandList* command,
     ID3D12CommandAllocator* allocator, ID3D12PipelineState* pipeline) {
@@ -5480,8 +5481,11 @@ struct Mode3HudProducerReceipt {
     ID3D12CommandQueue* queue{};
     std::array<Mode3EarlyHudPending, kMode3EarlyHudSlotCount> captures{};
     uint32_t count{};
-    Mode3HudProducerReceipt(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
-    ~Mode3HudProducerReceipt();
+    const w3vr::execute_observation::Receipt& forwarding;
+    int entry_exceptions{std::uncaught_exceptions()};
+    Mode3HudProducerReceipt(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*,
+        const w3vr::execute_observation::Receipt&);
+    ~Mode3HudProducerReceipt()noexcept;
 };
 // [FIX:AER-AFW-PREEXECUTE-HUD-SNAPSHOT V1282 1/6] Command lists may be reset
 // by another renderer worker as soon as the real ExecuteCommandLists returns.
@@ -21181,7 +21185,8 @@ void publish_rt_private_history_submissions(
 void execute_source_body(
     ID3D12CommandQueue* queue,
     UINT num_command_lists,
-    ID3D12CommandList* const* command_lists, ExecuteCommandListsFn original, bool legacy_owner) {
+    ID3D12CommandList* const* command_lists, ExecuteCommandListsFn original, bool legacy_owner,
+    w3vr::execute_observation::Receipt& receipt) {
     // [TRIAL:RESHADE-IMMEDIATE-LIST-ISOLATION V23001 4/4] The official
     // D3D12 queue wrapper flushes its named immediate list as a separate raw
     // ExecuteCommandLists call before the game's submission. Preserve that GPU
@@ -21207,13 +21212,13 @@ void execute_source_body(
         // treating this owner as a complete delegate before forwarding it.
         if(legacy_owner){
             g_legacy_native_execute_forwarder.deactivate();
-            g_execute_command_lists(queue, num_command_lists, command_lists);
-        }else original(queue,num_command_lists,command_lists);
+            receipt.forward_raw([&]{g_execute_command_lists(queue,num_command_lists,command_lists);});
+        }else receipt.forward_raw([&]{original(queue,num_command_lists,command_lists);});
         return;
     }
     const bool puredark_afw_cross_queue_route =
         puredark_afw_mode3_aer_common_transport_configured();
-    Mode3HudProducerReceipt hud_producer_receipt{queue, num_command_lists, command_lists};
+    Mode3HudProducerReceipt hud_producer_receipt{queue,num_command_lists,command_lists,receipt};
     // [FIX:UNIFIED-MODE3-TRANSPORT V1234 4/6] Exact command-list identity is
     // the admission rule. Projection and queue pointer are not. This mirrors
     // the AFW producer path and lets a secondary DIRECT queue publish the same
@@ -21310,7 +21315,9 @@ void execute_source_body(
             w3vr::pipeline_flight::CpuScope flight_cpu{w3vr::pipeline_flight::Phase::QueueSubmit};
             source_batch=g_modern_backbuffer_sources.execute_from_callback(g_streamline_capture_mutex,
                 queue,num_command_lists,command_lists,[](auto* command){return load_command_list_recording_epoch(command);},
-                [&]{if(legacy_owner)forward_legacy_execute(queue,num_command_lists,command_lists);else original(queue,num_command_lists,command_lists);});
+                [&]{if(legacy_owner)forward_legacy_execute(queue,num_command_lists,command_lists,receipt);
+                    else receipt.forward_raw([&]{original(queue,num_command_lists,command_lists);});
+                    receipt.require_returned();});
         }
         w3vr::pipeline_flight::on_execute(
             queue, num_command_lists, command_lists);
@@ -21529,7 +21536,9 @@ void execute_source_body(
         w3vr::pipeline_flight::CpuScope flight_cpu{w3vr::pipeline_flight::Phase::QueueSubmit};
         source_batch=g_modern_backbuffer_sources.execute_from_callback(g_streamline_capture_mutex,
             queue,num_command_lists,command_lists,[](auto* command){return load_command_list_recording_epoch(command);},
-            [&]{if(legacy_owner)forward_legacy_execute(queue,num_command_lists,command_lists);else original(queue,num_command_lists,command_lists);});
+            [&]{if(legacy_owner)forward_legacy_execute(queue,num_command_lists,command_lists,receipt);
+                    else receipt.forward_raw([&]{original(queue,num_command_lists,command_lists);});
+                    receipt.require_returned();});
     }
     w3vr::pipeline_flight::on_execute(
         queue, num_command_lists, command_lists);
@@ -21622,12 +21631,47 @@ void execute_source_body(
         }
     }
 }
+void execute_source_guarded(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists,
+    ExecuteCommandListsFn original,bool legacy_owner)noexcept{
+    bool observation_open{};
+    auto finish=[&]()noexcept{
+        if(!observation_open)return;
+        std::lock_guard lock{g_streamline_capture_mutex};
+        g_modern_backbuffer_sources.end_execute_observation();
+        g_modern_backbuffer_sources.collect();
+    };
+    w3vr::capture_recording::CpuScope cpu{finish};
+    auto failed=[&](w3vr::execute_observation::Phase)noexcept{
+        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        std::lock_guard lock{g_streamline_capture_mutex};
+        g_modern_backbuffer_sources.quarantine_execute(count,lists);
+        for(auto* r=g_modern_backbuffer_sources.head;r;r=r->next){
+            if(!w3vr::modern_backbuffer_source::Store::submitted(r,count,lists))continue;
+            const auto eye=r->key.identity.frame.eye;
+            if(eye<0 || eye>1 || r->key.slot>=kStreamlineCaptureRingSize)continue;
+            auto& slot=g_streamline_capture_ring[eye][r->key.slot];
+            if(slot.capture_serial!=r->key.serial)continue;
+            slot.initialized=false;slot.pair_id=0;slot.source_eye_valid=false;slot.render_view_valid=false;
+            slot.modern_output.initialized=false;slot.modern_output.ordered=false;
+            slot.last_use_fence=nullptr;slot.last_use_fence_value=UINT64_MAX;
+            // Keep recording/COM ownership; neither failure nor raw return is
+            // a fence or permission to reset/reuse the reserved texture.
+        }
+    };
+    w3vr::execute_observation::run([&](auto& receipt){
+        {std::lock_guard lock{g_streamline_capture_mutex};
+            g_modern_backbuffer_sources.begin_execute_observation();observation_open=true;}
+        if(legacy_owner && source_wrapper_passthrough(queue)){
+            receipt.forward_raw([&]{original(queue,count,lists);});return;
+        }
+        execute_source_body(queue,count,lists,original,legacy_owner,receipt);
+    },[&]{original(queue,count,lists);},failed);
+}
 void STDMETHODCALLTYPE hook_execute_command_lists(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists) {
-    if(source_wrapper_passthrough(queue)){g_execute_command_lists(queue,count,lists);return;}
-    execute_source_body(queue,count,lists,g_execute_command_lists,true);
+    execute_source_guarded(queue,count,lists,g_execute_command_lists,true);
 }
 void STDMETHODCALLTYPE hook_modern_source_execute(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists) {
-    execute_source_body(queue,count,lists,g_modern_source_execute,false);
+    execute_source_guarded(queue,count,lists,g_modern_source_execute,false);
 }
 
 
@@ -25215,8 +25259,9 @@ bool apply_mode3_early_hud_label_locked(
 }
 
 Mode3HudProducerReceipt::Mode3HudProducerReceipt(
-    ID3D12CommandQueue* submitted_queue, UINT size, ID3D12CommandList* const* lists)
-    : queue(submitted_queue) {
+    ID3D12CommandQueue* submitted_queue, UINT size, ID3D12CommandList* const* lists,
+    const w3vr::execute_observation::Receipt& receipt)
+    : queue(submitted_queue),forwarding(receipt) {
     if (lists == nullptr) return;
     std::scoped_lock lock{g_mode3_early_hud_mutex};
     for (uint32_t index = 0; index < kMode3EarlyHudSlotCount; ++index) {
@@ -25233,13 +25278,25 @@ Mode3HudProducerReceipt::Mode3HudProducerReceipt(
     }
 }
 
-Mode3HudProducerReceipt::~Mode3HudProducerReceipt() {
-    if (count == 0) return;
+Mode3HudProducerReceipt::~Mode3HudProducerReceipt()noexcept {
+    if(count==0)return;
+    auto failed=[&]()noexcept{
+        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        std::lock_guard lock{g_mode3_early_hud_mutex};
+        for(uint32_t index=0;index<count;++index){
+            const auto& receipt=captures[index];auto& slot=g_mode3_early_hud_slots[receipt.slot];
+            if(!w3vr::hud_publication::same_capture(slot.generation,slot.capture_serial,
+                receipt.generation,receipt.capture_serial))continue;
+            slot.initialized=false;slot.producer_submitted=false;slot.submission_in_progress=true;
+            slot.last_use_fence=nullptr;slot.last_use_fence_value=UINT64_MAX;
+        }
+    };
+    w3vr::execute_observation::after_returned(forwarding,entry_exceptions,[&]{
     ID3D12Fence* producer_fence{};
     uint64_t producer_value{};
     const bool ordered = queue == g_command_queue ||
         signal_private_resource_queue_timeline(queue, producer_fence, producer_value);
-    if (!ordered) return;
+    if (!ordered) {failed();return;}
     std::scoped_lock lock{g_mode3_early_hud_mutex};
     for (uint32_t index = 0; index < count; ++index) {
         const auto& receipt = captures[index];
@@ -25261,6 +25318,7 @@ Mode3HudProducerReceipt::~Mode3HudProducerReceipt() {
                 slot.tag_producer_queue_fence_value);
         }
     }
+    },failed);
 }
 
 bool get_mode3_early_hud_pair(

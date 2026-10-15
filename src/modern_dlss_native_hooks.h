@@ -1,5 +1,6 @@
 #pragma once
 #include "modern_dlss_ownership.h"
+#include "execute_observation.h"
 #include <atomic>
 #include <memory>
 
@@ -35,7 +36,10 @@ public:
     explicit operator bool() const noexcept;
     void deactivate() noexcept;
     HRESULT reset(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*) const;
-    void execute(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*) const;
+    // Optional receipt is marked only around the stored raw trampoline,
+    // never around this forwarding function's before/after observations.
+    void execute(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*,
+        execute_observation::Receipt* = nullptr) const;
 private:
     std::atomic<std::shared_ptr<ForwarderData>> data_;
     friend Forwarder reset_forwarder(void*, ResetFn) noexcept;
