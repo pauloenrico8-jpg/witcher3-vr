@@ -84,6 +84,15 @@ set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
+    add_executable(w3vr_modern_capture_recording_tests tests/modern_capture_recording_tests.cpp)
+    target_include_directories(w3vr_modern_capture_recording_tests PRIVATE src "${W3VR_OPENXR_DIR}/include")
+    target_compile_definitions(w3vr_modern_capture_recording_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(w3vr_modern_capture_recording_tests PRIVATE dxguid)
+    set_target_properties(w3vr_modern_capture_recording_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/own-capture-recording-tests")
+    add_test(NAME modern_capture_recording_exception_lifetime COMMAND w3vr_modern_capture_recording_tests)
+    set_tests_properties(modern_capture_recording_exception_lifetime PROPERTIES TIMEOUT 30
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:w3vr_modern_capture_recording_tests>")
     add_executable(w3vr_xr_allocator_submissions_tests tests/xr_allocator_submissions_tests.cpp)
     target_include_directories(w3vr_xr_allocator_submissions_tests PRIVATE src "${W3VR_OPENXR_DIR}/include")
     target_compile_definitions(w3vr_xr_allocator_submissions_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
