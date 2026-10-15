@@ -35,7 +35,7 @@ struct Fixture {
     float effects_time{};
     int tick_count{}, caller_releases{}, invalidations{}, allocations{};
     std::string events;
-    bool allocation_failure{}, immediate_completion{};
+    bool allocation_failure{}, immediate_completion{},publication_confirmed{true};
     prep::PendingPair* reenter{};
 };
 thread_local Fixture* current{};
@@ -113,11 +113,13 @@ void complete() {
     current->events += 'F';
 }
 
-void __fastcall dispatch(void* command) {
+bool __fastcall dispatch(void* command,void* frame) {
     require(command == &current->command && current->queued != nullptr,
         "Dispatched an unconstructed command");
     current->events += 'D';
+    require(frame==current->queued,"Publication adapter changed its frame");
     if (current->immediate_completion) complete();
+    return current->publication_confirmed;
 }
 
 submit::NativeCommandRoute route() {
@@ -214,6 +216,15 @@ void test_failed_dispatch_and_foreign_calls() {
         prep::PendingPair::Completion::submission_failed && f.events == "LRAOX" &&
         f.caller_releases == 1 && f.invalidations == 1 && f.duplicate.references == 0,
         "Native sentinel leaked prepared resources or retained pair identities");
+}
+
+void test_unconfirmed_pair_publication() {
+    Fixture f;prep::PendingPair pair;arm(pair,f);natural_prepare(pair,f,false);f.publication_confirmed=false;
+    require(pair.at_native_command(&f.primary,route(),true)==prep::PendingPair::Completion::submission_failed &&
+        f.invalidations==1 && f.caller_releases==1 && f.duplicate.references==1 && f.events=="LRACDOX",
+        "Unconfirmed duplicate became a dispatched pair or lost its command reference");
+    pair.cancel();require(f.invalidations==1 && f.caller_releases==1,"Cancellation retried uncertain cleanup");
+    complete();require(f.duplicate.references==0 && f.primary.references==1,"Unconfirmed reference crossed to primary");
 }
 
 void test_missing_route_before_duplicate_work() {
@@ -482,6 +493,7 @@ int main() {
         test_cancellation_and_missing_stages();
         test_failed_dispatch_and_foreign_calls();
         test_missing_route_before_duplicate_work();
+        test_unconfirmed_pair_publication();
         test_reentry_and_nested_ownership();
         test_concurrent_independent_producers();
         test_arming_contract();

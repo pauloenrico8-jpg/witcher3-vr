@@ -20,6 +20,7 @@ int unavailable_command{};
 enum class Allocation { normal, null, sentinel };
 Allocation allocation{};
 bool immediate_completion{};
+bool publication_confirmed{true};
 int owned_releases{};
 std::string events;
 
@@ -53,13 +54,15 @@ void* __fastcall construct_command(void* destination, void* raw_frame, void* aux
     return destination;
 }
 
-void __fastcall dispatch_command(void* command) {
+bool __fastcall dispatch_command(void* command,void* frame) {
     events += 'D';
     require(command == &command_storage && command_frame != nullptr,
         "Dispatch did not use the constructed native allocation");
     require(!command_frame->destroyed && command_frame->references == 2,
         "Caller released its reference before dispatch");
+    require(frame==command_frame,"Publication adapter changed frame identity");
     if (immediate_completion) complete_command();
+    return publication_confirmed;
 }
 
 void __fastcall release_owned_frame(void* raw_frame) {
@@ -77,6 +80,7 @@ void reset() {
     command_frame = nullptr;
     allocation = Allocation::normal;
     immediate_completion = false;
+    publication_confirmed = true;
     owned_releases = 0;
     events.clear();
 }
@@ -99,6 +103,18 @@ void test_deferred_and_immediate_command_lifetimes() {
             require(frame.references == 0 && frame.destroyed,
                 "Deferred command did not release its independent reference");
         }
+    }
+}
+
+void test_unconfirmed_publication() {
+    for(bool immediate:{false,true}) {
+        reset();publication_confirmed=false;immediate_completion=immediate;Frame frame;
+        require(submission::submit_owned_frame(route(),&frame,release_owned_frame)==submission::Result::publication_unconfirmed,
+            "Returned but unconfirmed publication was promoted to dispatched");
+        require(owned_releases==1 && events==(immediate?"ACDFR":"ACDR"),
+            "Unconfirmed publication retried work or freed command storage");
+        if(!immediate){require(frame.references==1 && !frame.destroyed,"Uncertain command lost its own reference");complete_command();}
+        require(frame.destroyed && owned_releases==1,"Factory/command references were mixed");
     }
 }
 
@@ -168,6 +184,7 @@ int main() {
         fixture_profile=profile;
         test_deferred_and_immediate_command_lifetimes();
         test_missing_native_dependencies();
+        test_unconfirmed_publication();
         test_allocation_rejection();
         test_invalid_owned_frame_contract();
         const auto before=checks;
