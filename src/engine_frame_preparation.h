@@ -40,16 +40,16 @@ struct Profile {
     const frame_submission::Profile* submission;
     std::array<HookTarget,5> hooks;
     std::uintptr_t factory_return,prepare_return,tick_return,apply_return,construct_return;
-    std::uintptr_t engine_global,engine_vtable,effects_state_global,effects_world_global,empty_world;
+    std::uintptr_t engine_global,engine_vtable,effects_state_global,effects_world_global,empty_world,publication_return;
 };
 inline constexpr Profile remastered_500c{&modern_queue_lifecycle::remastered_500c,
     &frame_submission::remastered_500c,{{{0x02274B80,producer_500c_prefix},{0x0224C600,engine_prepare_500c_prefix},{0x02367890,effects_tick_500c_prefix},{0x02367B60,effects_apply_500c_prefix},{0x02297670,command_construct_500c_prefix}}},
     factory_return_rva,engine_prepare_return_rva,effects_tick_return_rva,effects_apply_return_rva,
-    command_construct_return_rva,engine_global_rva,engine_vtable_rva,0x05A51E98,0x05A51930,empty_world_callback_rva};
+    command_construct_return_rva,engine_global_rva,engine_vtable_rva,0x05A51E98,0x05A51930,empty_world_callback_rva,0x0227594F};
 inline constexpr Profile remastered_1048522{&modern_queue_lifecycle::remastered_1048522,
     &frame_submission::remastered_1048522,{{{0x0227D1F0,producer_1048522_prefix},{0x02254B70,engine_prepare_1048522_prefix},{0x0236FCF0,effects_tick_1048522_prefix},{0x0236FFC0,effects_apply_1048522_prefix},{0x0229FD80,command_construct_1048522_prefix}}},
     0x0227DF27,0x0227DF60,0x0227DF93,0x0227DF9B,0x0227DFB3,
-    0x05A5B8F0,0x037B3C10,0x05A5BE90,0x05A5B928,0x0031C320};
+    0x05A5B8F0,0x037B3C10,0x05A5BE90,0x05A5B928,0x0031C320,0x0227DFC1};
 inline bool known(const Profile* profile){return profile==&remastered_500c || profile==&remastered_1048522;}
 inline const Profile* selected(const engine_camera::TemporalContract* contract){
     if(contract==&engine_camera::remastered_500c)return &remastered_500c;
@@ -62,7 +62,7 @@ inline bool ready_for(const engine_camera::TemporalContract* contract,const Prof
         installed->lifecycle==lifecycle && frame_submission::selected(contract)==installed->submission &&
         modern_queue_lifecycle::ready_for(contract,lifecycle,lifecycle_ready);
 }
-enum class Boundary {factory,prepare,tick,apply,construct};
+enum class Boundary {factory,prepare,tick,apply,construct,publication};
 inline bool allows(const Profile* profile,Boundary boundary,std::uintptr_t caller){
     if(!known(profile))return false;
     switch(boundary){
@@ -71,6 +71,7 @@ inline bool allows(const Profile* profile,Boundary boundary,std::uintptr_t calle
     case Boundary::tick:return caller==profile->tick_return;
     case Boundary::apply:return caller==profile->apply_return;
     case Boundary::construct:return caller==profile->construct_return;
+    case Boundary::publication:return caller==profile->publication_return;
     default:return false;
     }
 }
@@ -87,14 +88,19 @@ inline bool prefix_matches(std::span<const std::uint8_t> expected,std::span<cons
 // Prefix checks and one-attempt admission belong to the host. These callbacks
 // are real MinHook operations in the host and spies in CPU tests. Retaining
 // forwarders after partial failure does not establish an all-call/unload barrier.
+inline constexpr std::size_t observer_count=6;
+inline std::uintptr_t observer_rva(const Profile* profile,std::size_t index){
+    if(!known(profile) || index>=observer_count)return 0;
+    return index<profile->hooks.size()?profile->hooks[index].rva:profile->submission->dispatch;
+}
 template<class Create,class Enable,class Disable,class Current>
 bool install_observers(const engine_camera::TemporalContract* contract,const Profile* profile,
     Create create,Enable enable,Disable disable,Current current){
     if(!known(profile) || selected(contract)!=profile)return false;
     std::size_t created{},enabled{};
-    for(std::size_t i=0;i<profile->hooks.size();++i){if(!current() || !create(i))break;++created;}
-    if(created==profile->hooks.size())for(std::size_t i=0;i<profile->hooks.size();++i){if(!current() || !enable(i))break;++enabled;}
-    if(created==profile->hooks.size() && enabled==profile->hooks.size() && current())return true;
+    for(std::size_t i=0;i<observer_count;++i){if(!current() || !create(i))break;++created;}
+    if(created==observer_count)for(std::size_t i=0;i<observer_count;++i){if(!current() || !enable(i))break;++enabled;}
+    if(created==observer_count && enabled==observer_count && current())return true;
     for(std::size_t i=0;i<enabled;++i)disable(i);
     return false;
 }

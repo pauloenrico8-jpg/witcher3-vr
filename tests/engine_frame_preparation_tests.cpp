@@ -360,11 +360,11 @@ void test_selection_boundaries_and_readiness() {
         !prep::ready_for(nullptr,profile,profile->lifecycle,true,true) &&
         !prep::ready_for(contract,nullptr,profile->lifecycle,true,true),
         "Readiness allowed mixed, copied or incomplete installation");
-    const std::array<std::uintptr_t,5> returns{profile->factory_return,profile->prepare_return,
-        profile->tick_return,profile->apply_return,profile->construct_return};
+    const std::array<std::uintptr_t,6> returns{profile->factory_return,profile->prepare_return,
+        profile->tick_return,profile->apply_return,profile->construct_return,profile->publication_return};
     const auto* other=other_profile();
-    const std::array<std::uintptr_t,5> other_returns{other->factory_return,other->prepare_return,
-        other->tick_return,other->apply_return,other->construct_return};
+    const std::array<std::uintptr_t,6> other_returns{other->factory_return,other->prepare_return,
+        other->tick_return,other->apply_return,other->construct_return,other->publication_return};
     for(std::size_t i=0;i<returns.size();++i) {
         const auto boundary=static_cast<prep::Boundary>(i);
         require(prep::allows(profile,boundary,returns[i]),"Natural boundary rejected");
@@ -410,37 +410,40 @@ void test_actual_empty_world_leaf() {
 void test_installation_partial_failure_and_contract_change() {
     const auto* profile=fixture_profile;
     const auto* contract=contract_for(profile);
+    for(std::size_t i=0;i<prep::observer_count;++i)
+        require(prep::observer_rva(profile,i)==(i<5?profile->hooks[i].rva:profile->submission->dispatch),"mixed observer target");
+    require(prep::observer_rva(profile,6)==0 && prep::observer_rva(nullptr,0)==0,"unknown observer target");
     // Each real helper operation can fail or lose its captured contract.
     // Spies model API return values; they do not install executable hooks.
-    for(int scenario=0;scenario<22;++scenario) {
-        std::array<bool,5> created{},enabled{},disabled{},originals{};
+    for(int scenario=0;scenario<26;++scenario) {
+        std::array<bool,6> created{},enabled{},disabled{},originals{};
         int create_count{},enable_count{},disable_count{},operation{};
         bool current=true;
         const bool success=prep::install_observers(contract,profile,
             [&](std::size_t i){
                 require(i==static_cast<std::size_t>(create_count),"Nonsequential create");
                 ++create_count;const int op=operation++;
-                if(scenario==op && scenario<10)return false;
+                if(scenario==op && scenario<12)return false;
                 created[i]=true;originals[i]=true;
-                if(scenario==10+op)current=false;
+                if(scenario==12+op)current=false;
                 return true;
             },
             [&](std::size_t i){
-                require(create_count==5 && i==static_cast<std::size_t>(enable_count),"Enabled before all creates");
+                require(create_count==6 && i==static_cast<std::size_t>(enable_count),"Enabled before all creates");
                 ++enable_count;const int op=operation++;
-                if(scenario==op && scenario<10)return false;
+                if(scenario==op && scenario<12)return false;
                 enabled[i]=true;
-                if(scenario==10+op)current=false;
+                if(scenario==12+op)current=false;
                 return true;
             },
             [&](std::size_t i){require(enabled[i] && !disabled[i],"Disabled an unenabled/duplicate entry");disabled[i]=true;++disable_count;},
             [&]{return current;});
-        require(success==(scenario>=20),"Partial or changed installation published success");
-        for(std::size_t i=0;i<5;++i) {
+        require(success==(scenario>=24),"Partial or changed installation published success");
+        for(std::size_t i=0;i<6;++i) {
             require(originals[i]==created[i],"Partial failure erased an original forwarder");
             require(disabled[i]==(enabled[i] && !success),"Incomplete rollback admission state");
         }
-        require(success?(create_count==5 && enable_count==5 && disable_count==0):disable_count==std::count(enabled.begin(),enabled.end(),true),
+        require(success?(create_count==6 && enable_count==6 && disable_count==0):disable_count==std::count(enabled.begin(),enabled.end(),true),
             "Partial rollback lost an enabled observer");
     }
     const auto copied=*profile;

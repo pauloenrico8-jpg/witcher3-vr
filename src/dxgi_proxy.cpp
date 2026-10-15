@@ -75,6 +75,8 @@ static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
 #include "engine_scene_publication.h"
+#include "scene_publication_observer.h"
+#include "scene_publication_pair.h"
 #include "engine_producer_bridge.h"
 #include "engine_scene_factory.h"
 #include "engine_scene_descriptor.h"
@@ -495,6 +497,7 @@ static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
 #include <array>
 
 extern "C" void* w3vr_temporal_leaf_original{};
+extern "C" void* w3vr_scene_publication_original{};
 
 namespace {
 
@@ -2543,6 +2546,7 @@ w3vr::frame_preparation::PrepareFrame g_remastered_effects_apply{};
 w3vr::frame_submission::ConstructCommand g_remastered_command_construct{};
 std::atomic<bool> g_remastered_preparation_hooks_ready{};
 std::atomic<bool> g_remastered_preparation_install_attempted{};
+std::atomic<uintptr_t> g_scene_publication_verified_module{};
 std::atomic<const w3vr::frame_preparation::Profile*> g_remastered_preparation_installed_profile{};
 using EngineViewRebuildFn = void(__fastcall*)(float*);
 EngineViewRebuildFn g_engine_view_rebuild{};
@@ -42372,6 +42376,7 @@ thread_local RemasteredProducerScope* g_remastered_producer_scope{};
 std::mutex g_remastered_camera_history_mutex;
 w3vr::camera_history::Bank g_remastered_camera_history;
 
+void invalidate_remastered_prepared_pair(void*,void*,void*);
 struct RemasteredProducerScope {
     RemasteredProducerScope(void* native_game,const w3vr::engine_camera::TemporalContract* captured)
         :game(native_game),contract(captured),
@@ -42381,6 +42386,10 @@ struct RemasteredProducerScope {
         binding(g_remastered_producer_scope,this,admitted){}
     ~RemasteredProducerScope(){
         pair.cancel();
+        if(publication.needs_cancel()){
+            const auto id=publication.identity();
+            invalidate_remastered_prepared_pair(this,reinterpret_cast<void*>(id.primary),reinterpret_cast<void*>(id.duplicate));
+        }
         if(xr_ticket.nonce && !xr_dispatched){std::scoped_lock lock{g_modern_prepared_frame_mutex};g_modern_prepared_frame.cancel(xr_ticket);}
         if(history_staged){std::scoped_lock history_lock{g_remastered_camera_history_mutex};
             g_remastered_camera_history.cancel(history_plan.ticket);}
@@ -42393,6 +42402,8 @@ struct RemasteredProducerScope {
     uint64_t pair_id{},present{};
     bool factory_reserved{};
     w3vr::frame_preparation::PendingPair pair{};
+    w3vr::publication_pair::Pair publication;
+    void* primary_frame{};void* duplicate_frame{};
     w3vr::temporal_source::Captured temporal_source;
     w3vr::factory_clock::windows::OwnerObservation temporal_owner_clock{};
     bool temporal_owner_staged{};
@@ -42404,7 +42415,8 @@ struct RemasteredProducerScope {
 };
 
 void invalidate_remastered_prepared_pair(void* owner, void* primary, void* duplicate) {
-    const auto* scope = static_cast<const RemasteredProducerScope*>(owner);
+    auto* scope = static_cast<RemasteredProducerScope*>(owner);
+    scope->publication.cancel();
     if(scope->xr_ticket.nonce){std::scoped_lock lock{g_modern_prepared_frame_mutex};g_modern_prepared_frame.cancel(scope->xr_ticket);}
     if(scope->history_staged){std::scoped_lock history_lock{g_remastered_camera_history_mutex};
         g_remastered_camera_history.cancel(scope->history_plan.ticket);}
@@ -42414,7 +42426,7 @@ void invalidate_remastered_prepared_pair(void* owner, void* primary, void* dupli
         g_engine_dual_frame_eyes.erase(duplicate);
     }
     g_engine_pair_retry_present.store(scope->present + 2, std::memory_order_relaxed);
-    log_line("Remastered preparation cancelled pair=%llu; no duplicate dispatched",
+    log_line("Remastered pair admission cancelled pair=%llu; CPU/GPU work not reclaimed",
         static_cast<unsigned long long>(scope->pair_id));
 }
 
@@ -42667,6 +42679,11 @@ void* allocate_remastered_command_in_captured_queue() {
 bool remastered_scene_publication_code_matches(uintptr_t module,const w3vr::frame_submission::Profile* profile){
     namespace pub=w3vr::scene_publication;
     if(!w3vr::frame_submission::known(profile))return false;
+    const auto* installed=g_remastered_preparation_installed_profile.load(std::memory_order_acquire);
+    if(g_scene_publication_verified_module.load(std::memory_order_acquire)==module &&
+        w3vr::frame_preparation::known(installed) && installed->submission==profile &&
+        w3vr_scene_publication_original &&
+        g_remastered_preparation_hooks_ready.load(std::memory_order_acquire))return true;
     uintptr_t entry{},end{};std::array<uint8_t,pub::code_bytes> code{};
     if(!pub::add(module,profile->dispatch,entry) || !pub::add(entry,code.size(),end))return false;
     __try {std::memcpy(code.data(),reinterpret_cast<const void*>(entry),code.size());}
@@ -42689,10 +42706,10 @@ bool __fastcall publish_remastered_captured_command(void* command,void* frame){
         !remastered_primary_command_matches(current.command_queue,command,frame))return reject();
     const auto* profile=scope->profile->submission;
     if(!remastered_scene_publication_code_matches(module,profile) || !remastered_scope_current(scope,contract))return reject();
-    uintptr_t entry{};if(!pub::add(module,profile->dispatch,entry))return reject();
+    if(!w3vr_scene_publication_original)return reject();
     // Do not inspect command/header AFTER publication: its consumer can have
     // already executed, destroyed or recycled it before this function returns.
-    const bool confirmed=pub::published(w3vr_invoke_scene_publication(reinterpret_cast<pub::Original>(entry),command));
+    const bool confirmed=pub::published(w3vr_invoke_scene_publication(reinterpret_cast<pub::Original>(w3vr_scene_publication_original),command));
     return confirmed ? true : reject();
 }
 w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(uintptr_t module,
@@ -42787,24 +42804,76 @@ void* __fastcall hook_remastered_command_construct(void* command,void* frame,voi
         RemasteredPreparationContext current{};
         const bool matched=read_remastered_preparation_context(module,contract,scope->game,current) &&
             current==scope->context && result==command && remastered_primary_command_matches(current.command_queue,command,frame);
-        const auto completion=scope->pair.at_native_command(frame,remastered_prepared_command_route(module,contract,scope->profile),matched);
-        if(scope->xr_ticket.nonce && completion==prep::PendingPair::Completion::dispatched){
-            std::scoped_lock lock{g_modern_prepared_frame_mutex};scope->xr_dispatched=g_modern_prepared_frame.dispatched(scope->xr_ticket);
+        const bool staged=matched && scope->publication.stage({scope->profile,
+            reinterpret_cast<uintptr_t>(command),reinterpret_cast<uintptr_t>(scope->primary_frame),
+            reinterpret_cast<uintptr_t>(scope->duplicate_frame),scope->pair_id,
+            g_streamline_capture_generation.load(std::memory_order_acquire)});
+        const auto completion=scope->pair.at_native_command(frame,remastered_prepared_command_route(module,contract,scope->profile),matched && staged);
+        if(completion==prep::PendingPair::Completion::dispatched){
+            if(!scope->publication.extra_published(true)){
+                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                g_remastered_preparation_hooks_ready.store(false,std::memory_order_release);
+            }
+        }
+    }
+    return result;
+}
+void reject_remastered_publication_observation()noexcept{
+    g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+    g_remastered_preparation_hooks_ready.store(false,std::memory_order_release);
+}
+extern "C" void w3vr_scene_publication_before(w3vr::publication_observer::Frame* f)noexcept{
+    if(!f)return;
+    try{
+        auto* scope=g_remastered_producer_scope;
+        const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+        const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if(!remastered_scope_current(scope,contract) || f->caller<module ||
+            !w3vr::frame_preparation::allows(scope->profile,w3vr::frame_preparation::Boundary::publication,f->caller-module))return;
+        const auto id=scope->publication.identity();
+        // Exact producer call loads this table into RAX before its virtual call.
+        // Keeping that entry value also disambiguates the Native null-renderer return.
+        const auto& queue=scope->context.command_queue;
+        if(!scope->publication.staged() || f->entry_integer[1]!=id.command ||
+            f->entry_integer[0]!=module+queue.profile->scene_command_vtable ||
+            f->entry_integer[0]==w3vr::scene_publication::unpublished)return;
+        RemasteredPreparationContext current{};
+        if(!read_remastered_preparation_context(module,contract,scope->game,current) ||
+            current!=scope->context ||
+            !remastered_primary_command_matches(queue,reinterpret_cast<void*>(id.command),reinterpret_cast<void*>(id.primary)))return;
+        w3vr::publication_pair::Ticket ticket{};
+        if(!scope->publication.before(id,remastered_scope_current(scope,contract),ticket)){reject_remastered_publication_observation();return;}
+        f->owner=reinterpret_cast<uintptr_t>(scope);f->serial=ticket.serial;
+        f->pair=id.pair;f->generation=id.generation;
+    }catch(...){reject_remastered_publication_observation();}
+}
+extern "C" void w3vr_scene_publication_after(w3vr::publication_observer::Frame* f)noexcept{
+    if(!f || !f->owner || !f->serial)return;
+    try{
+        auto* scope=g_remastered_producer_scope;
+        if(reinterpret_cast<uintptr_t>(scope)!=f->owner)return;
+        const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+        const auto id=scope->publication.identity();
+        const bool matching=remastered_scope_current(scope,contract) && id.pair==f->pair &&
+            id.generation==f->generation && id.command==f->entry_integer[1] &&
+            id.generation==g_streamline_capture_generation.load(std::memory_order_acquire);
+        // NO command/header dereference after Native publication. Its consumer
+        // may already have executed, released and recycled the command storage.
+        const bool confirmed=scope->publication.after({id,f->serial},matching,f->result_integer[0]);
+        if(!confirmed){reject_remastered_publication_observation();return;}
+        if(scope->xr_ticket.nonce){
+            std::scoped_lock lock{g_modern_prepared_frame_mutex};
+            scope->xr_dispatched=g_modern_prepared_frame.dispatched(scope->xr_ticket);
         }
         if(scope->history_staged){
             const auto identity=scope->history_plan.inputs.identity;
-            const bool matching=remastered_scope_current(scope,contract) && identity.contract==contract &&
-                identity.generation==g_streamline_capture_generation.load(std::memory_order_acquire) &&
-                identity.pair==scope->pair_id && identity.xr==scope->xr_frame.identity();
-            std::scoped_lock history_lock{g_remastered_camera_history_mutex};
-            g_remastered_camera_history.commit_cpu(scope->history_plan,identity,
-                matching && completion==prep::PendingPair::Completion::dispatched);
+            const bool same=identity.contract==contract && identity.generation==id.generation &&
+                identity.pair==id.pair && identity.xr==scope->xr_frame.identity();
+            std::scoped_lock lock{g_remastered_camera_history_mutex};
+            g_remastered_camera_history.commit_cpu(scope->history_plan,identity,same);
             scope->history_staged=false;
         }
-        if(completion==prep::PendingPair::Completion::dispatched && g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1)<2)
-            log_line("Remastered duplicate prepared and dispatched pair=%llu",static_cast<unsigned long long>(scope->pair_id));
-    }
-    return result;
+    }catch(...){reject_remastered_publication_observation();}
 }
 bool install_remastered_preparation_hooks() {
     namespace prep=w3vr::frame_preparation;
@@ -42816,21 +42885,25 @@ bool install_remastered_preparation_hooks() {
     auto* module=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     if(!module)return false;
     struct Hook {void* replacement;void** original;};
-    const std::array<Hook,5> hooks{{
+    const std::array<Hook,6> hooks{{
         {reinterpret_cast<void*>(&w3vr_producer_entry),&g_remastered_producer},
         {reinterpret_cast<void*>(&hook_remastered_engine_prepare),reinterpret_cast<void**>(&g_remastered_engine_prepare)},
         {reinterpret_cast<void*>(&hook_remastered_effects_tick),reinterpret_cast<void**>(&g_remastered_effects_tick)},
         {reinterpret_cast<void*>(&hook_remastered_effects_apply),reinterpret_cast<void**>(&g_remastered_effects_apply)},
-        {reinterpret_cast<void*>(&hook_remastered_command_construct),reinterpret_cast<void**>(&g_remastered_command_construct)}}};
+        {reinterpret_cast<void*>(&hook_remastered_command_construct),reinterpret_cast<void**>(&g_remastered_command_construct)},
+        {reinterpret_cast<void*>(&w3vr_scene_publication_entry),&w3vr_scene_publication_original}}};
     for(const auto& target:profile->hooks)if(!remastered_render_entry_matches(module+target.rva,target.prefix))return false;
+    if(!w3vr::publication_observer::available() ||
+        !remastered_scene_publication_code_matches(reinterpret_cast<uintptr_t>(module),profile->submission))return false;
     const auto current=[contract](){return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) && remastered_queue_ready_for(contract);};
     if(!current())return false;
     g_remastered_preparation_installed_profile.store(profile,std::memory_order_release);
     const bool installed=prep::install_observers(contract,profile,
-        [&](size_t i){return MH_CreateHook(module+profile->hooks[i].rva,hooks[i].replacement,hooks[i].original)==MH_OK;},
-        [&](size_t i){return MH_EnableHook(module+profile->hooks[i].rva)==MH_OK;},
-        [&](size_t i){MH_DisableHook(module+profile->hooks[i].rva);},current);
+        [&](size_t i){return MH_CreateHook(module+prep::observer_rva(profile,i),hooks[i].replacement,hooks[i].original)==MH_OK;},
+        [&](size_t i){return MH_EnableHook(module+prep::observer_rva(profile,i))==MH_OK;},
+        [&](size_t i){MH_DisableHook(module+prep::observer_rva(profile,i));},current);
     if(!installed){log_line("Remastered preparation observers incomplete; admission closed, originals retained");return false;}
+    g_scene_publication_verified_module.store(reinterpret_cast<uintptr_t>(module),std::memory_order_release);
     g_remastered_preparation_hooks_ready.store(true,std::memory_order_release);
     log_line("Remastered preparation observers installed for selected profile; full version gate still required");
     return remastered_preparation_ready_for(contract);
@@ -43468,6 +43541,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                     scope->present = present;
                     duplicate_deferred = scope->pair.arm(scope->profile,result, right_frame_data, release,
                         invalidate_remastered_prepared_pair, scope);
+                    if(duplicate_deferred){scope->primary_frame=result;scope->duplicate_frame=right_frame_data;}
                 }
                 if (!duplicate_deferred) release(right_frame_data);
             } else {
