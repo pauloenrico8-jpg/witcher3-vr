@@ -35,6 +35,26 @@ using Batch=std::vector<Ticket>;
 struct Store {
     Record* head{};
     std::uint64_t nonce{};
+    std::size_t execute_observations{};
+    bool observation_overflow{};
+    // Serialized by the caller's capture mutex. This allocation-free hold
+    // prevents Reset/collect from deleting a source between observer failure
+    // and raw fallback. It freezes neither contents nor the Native allocator.
+    void begin_execute_observation()noexcept{
+        if(execute_observations==SIZE_MAX){observation_overflow=true;return;}
+        ++execute_observations;
+    }
+    void end_execute_observation()noexcept{
+        if(!observation_overflow && execute_observations)--execute_observations;
+    }
+    static bool submitted(const Record* r,UINT count,ID3D12CommandList* const* lists)noexcept{
+        if(!lists || !count)return false;
+        for(UINT i=0;i<count;++i)if(lists[i]==r->command.Get())return true;
+        return false;
+    }
+    void quarantine_execute(UINT count,ID3D12CommandList* const* lists)noexcept{
+        for(auto* r=head;r;r=r->next)if(submitted(r,count,lists))r->quarantined=true;
+    }
     bool contains(const Record* target)const{
         for(auto* r=head;r;r=r->next)if(r==target)return true;return false;
     }
@@ -58,6 +78,7 @@ struct Store {
     void mark_recorded(Record* r){if(contains(r))r->recorded=true;}
     void finish_cpu(Record* r){if(contains(r)){r->cpu_active=false;collect();}}
     std::size_t collect(){
+        if(execute_observations || observation_overflow)return 0;
         std::size_t count{};auto** link=&head;
         while(*link){auto* r=*link;
             bool retired=!r->cpu_active && !r->quarantined && (!r->recorded || r->sealed);

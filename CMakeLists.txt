@@ -84,6 +84,16 @@ set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
+    add_executable(w3vr_execute_observation_tests tests/execute_observation_tests.cpp
+        src/modern_dlss_native_hooks.cpp src/modern_dlss_ownership.cpp)
+    target_include_directories(w3vr_execute_observation_tests PRIVATE src "${W3VR_OPENXR_DIR}/include")
+    target_compile_definitions(w3vr_execute_observation_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(w3vr_execute_observation_tests PRIVATE dxguid bcrypt minhook)
+    set_target_properties(w3vr_execute_observation_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/own-execute-observation-tests")
+    add_test(NAME execute_observation_exactly_once COMMAND w3vr_execute_observation_tests)
+    set_tests_properties(execute_observation_exactly_once PROPERTIES TIMEOUT 45
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:w3vr_execute_observation_tests>")
     add_executable(w3vr_modern_capture_recording_tests tests/modern_capture_recording_tests.cpp)
     target_include_directories(w3vr_modern_capture_recording_tests PRIVATE src "${W3VR_OPENXR_DIR}/include")
     target_compile_definitions(w3vr_modern_capture_recording_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

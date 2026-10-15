@@ -188,10 +188,13 @@ HRESULT Forwarder::reset(ID3D12GraphicsCommandList* command, ID3D12CommandAlloca
     command_event(proof, Operation::Reset, Moment::After, result);
     return result;
 }
-void Forwarder::execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* array) const {
+void Forwarder::execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* array,
+    execute_observation::Receipt* receipt) const {
     const auto data = data_.load();
-    if (!data || !data->execute) return;
-    if (!data->bound.load(std::memory_order_acquire)) { data->execute(queue, count, array); return; }
+    if (!data || !data->execute || (receipt && receipt->phase()!=execute_observation::Phase::NotEntered)) return;
+    auto raw=[&]{data->execute(queue,count,array);};
+    auto forward=[&]{if(receipt)receipt->forward_raw(raw);else raw();};
+    if (!data->bound.load(std::memory_order_acquire)) { forward(); return; }
     Entry entry;
     m::OwnedQueue proof;
     if (entry.outer && observing() && method(queue, 10) == data->target) {
@@ -200,7 +203,7 @@ void Forwarder::execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList
     }
     execute_event(proof, Moment::Before, count, array);
     execute_count.fetch_add(1, std::memory_order_relaxed);
-    data->execute(queue, count, array);
+    forward();
     execute_event(proof, Moment::After, count, array);
 }
 bool install(const m::OwnedCommand& command, const m::OwnedQueue& queue, m::Classify owner,
