@@ -42,6 +42,7 @@
 #include "openxr_image_protocol.h"
 #include "xr_fence_completion.h"
 #include "xr_allocator_submissions.h"
+#include "xr_submission_admission.h"
 #include "modern_camera_defaults.h"
 #include "temporal_record_leaf_bridge.h"
 #include <bcrypt.h>
@@ -55240,7 +55241,22 @@ void render_openxr_test_frame(
                     execute_admitted=bool(allocator_submission.anchor);
                     }
                 }
-                if(modern_sources && execute_admitted){
+                if(managed_frame && execute_admitted){
+                    // One serialized admission: late refusal must not leave an
+                    // earlier participant marked as if Native Execute happened.
+                    std::scoped_lock lock{g_streamline_capture_mutex};
+                    execute_admitted=modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
+                        modern_xr_session_current(image_session,image_binding) &&
+                        image_recording.command==reinterpret_cast<uintptr_t>(lists[0]) &&
+                        image_recording.resource==reinterpret_cast<uintptr_t>(swapchain.images[image_index].texture) &&
+                        (!modern_sources || (
+                            w3vr::modern_eye_pair::matches_target(modern_sources->claim.outputs,modern_target) &&
+                            modern_graphics_current(modern_sources->binding) &&
+                            modern_xr_session_current(modern_sources->xr_binding,modern_sources->binding))) &&
+                        w3vr::xr_submission::begin(modern_sources?&g_modern_noaa_source_store:nullptr,modern_sources,
+                            *image_protocol,image_ticket,image_recording,*allocator_submissions,allocator_submission,
+                            submit_queue,1,lists,true);
+                }else if(modern_sources && execute_admitted){
                     std::scoped_lock lock{g_streamline_capture_mutex};
                     execute_admitted=modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
                         w3vr::modern_eye_pair::matches_target(modern_sources->claim.outputs,modern_target) &&
@@ -55248,14 +55264,6 @@ void render_openxr_test_frame(
                         modern_xr_session_current(modern_sources->xr_binding,modern_sources->binding) &&
                         g_modern_noaa_source_store.before_execute(modern_sources,submit_queue,1,lists);
                 }
-                if(managed_frame)execute_admitted=execute_admitted &&
-                    modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
-                    modern_xr_session_current(image_session,image_binding) &&
-                    image_recording.command==reinterpret_cast<uintptr_t>(lists[0]) &&
-                    image_recording.resource==reinterpret_cast<uintptr_t>(swapchain.images[image_index].texture) &&
-                    image_protocol->before_execute(image_ticket,image_recording,reinterpret_cast<uintptr_t>(submit_queue),true);
-                if(managed_frame && execute_admitted)execute_admitted=allocator_submissions->before_execute(
-                    allocator_submission,submit_queue,1,lists);
                 if(!execute_admitted){
                     g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
                     submitted=false;

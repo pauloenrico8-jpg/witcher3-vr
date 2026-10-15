@@ -77,12 +77,16 @@ struct Store {
             }else link=&use->next;
         }return count;
     }
+    bool can_execute(const Use* use,ID3D12CommandQueue* actual_queue,UINT actual_count,
+        ID3D12CommandList* const* actual_lists)const{
+        return contains(use) && use->cpu_active && use->recorded && use->recording && use->allocator &&
+            use->queue && use->fence && use->phase==modern_eye_pair::UsePhase::Recording &&
+            actual_queue==use->queue.Get() && actual_count==1 && actual_lists &&
+            actual_lists[0]==use->recording.Get();
+    }
     bool before_execute(Use* use,ID3D12CommandQueue* actual_queue,UINT actual_count,
         ID3D12CommandList* const* actual_lists){
-        if(!contains(use) || !use->cpu_active || !use->recorded || !use->recording || !use->allocator ||
-            !use->queue || !use->fence || use->phase!=modern_eye_pair::UsePhase::Recording ||
-            actual_queue!=use->queue.Get() || actual_count!=1 || !actual_lists ||
-            actual_lists[0]!=use->recording.Get())return false;
+        if(!can_execute(use,actual_queue,actual_count,actual_lists))return false;
         use->phase=modern_eye_pair::UsePhase::Executing;return true;
     }
     bool after_signal(Use* use,HRESULT original_result,std::uint64_t actual_value){
