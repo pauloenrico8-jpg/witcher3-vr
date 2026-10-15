@@ -33,12 +33,13 @@ inline const Profile* selected(const engine_camera::TemporalContract* contract){
 #if defined(_MSC_VER)
 using AllocateCommand = void*(__fastcall*)();
 using ConstructCommand = void*(__fastcall*)(void*, void*, void*);
-using DispatchCommand = void(__fastcall*)(void*);
+// OWN adapter: confirm publication; do not cast the Native void procedure to this type.
+using DispatchCommand = bool(__fastcall*)(void*, void*);
 using ReleaseFrame = void(__fastcall*)(void*);
 #else
 using AllocateCommand = void*(*)();
 using ConstructCommand = void*(*)(void*, void*, void*);
-using DispatchCommand = void(*)(void*);
+using DispatchCommand = bool(*)(void*, void*);
 using ReleaseFrame = void(*)(void*);
 #endif
 
@@ -51,7 +52,7 @@ struct NativeCommandRoute {
     const Profile* profile{};
 };
 
-enum class Result { dispatched, invalid_frame, unavailable, allocation_failed };
+enum class Result { dispatched, invalid_frame, unavailable, allocation_failed, publication_unconfirmed };
 
 // Consumes exactly the caller's owned frame reference if frame/release are
 // valid, including normal pre-dispatch failure. The native constructor acquires
@@ -59,8 +60,9 @@ enum class Result { dispatched, invalid_frame, unavailable, allocation_failed };
 // Never allocate this command with C++ new: dispatch uses its native preheader.
 // Construction's return value is unused: the examined native function always
 // returns its destination, and dispatch targets that same native allocation.
-// A returned "dispatched" means only that the native dispatch call returned.
-// It does not prove queue execution, GPU completion or an OpenXR eye image.
+// The OWN dispatch adapter must confirm the publication instruction, rather
+// than treating a returned Native void call as success. No queue execution,
+// GPU completion or OpenXR image follows from this CPU publication receipt.
 inline Result submit_owned_frame(const NativeCommandRoute& route, void* frame,
     ReleaseFrame release) {
     if (frame == nullptr || release == nullptr) return Result::invalid_frame;
@@ -76,9 +78,11 @@ inline Result submit_owned_frame(const NativeCommandRoute& route, void* frame,
         return Result::allocation_failed;
     }
     (void)route.construct(command, frame, nullptr);
-    route.dispatch(command);
+    const bool confirmed=route.dispatch(command,frame);
+    // Native construction retained a separate reference. Uncertain command
+    // storage is never freed/retried here; release only our factory reference.
     release(frame);
-    return Result::dispatched;
+    return confirmed ? Result::dispatched : Result::publication_unconfirmed;
 }
 
 } // namespace w3vr::frame_submission

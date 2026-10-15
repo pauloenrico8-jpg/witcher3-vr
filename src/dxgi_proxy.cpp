@@ -74,6 +74,7 @@ static_assert(D3D12_RESOURCE_STATE_RENDER_TARGET == 0x4 &&
 #include "modern_dlss_native_hooks.h"
 #include "engine_frame_submission.h"
 #include "engine_frame_preparation.h"
+#include "engine_scene_publication.h"
 #include "engine_producer_bridge.h"
 #include "engine_scene_factory.h"
 #include "engine_scene_descriptor.h"
@@ -42663,6 +42664,37 @@ void* allocate_remastered_command_in_captured_queue() {
     return cq::allocate_bound(cq::Allocator{profile,reinterpret_cast<cq::AllocatePayload>(entry)},
         scope->context.command_queue,current.command_queue);
 }
+bool remastered_scene_publication_code_matches(uintptr_t module,const w3vr::frame_submission::Profile* profile){
+    namespace pub=w3vr::scene_publication;
+    if(!w3vr::frame_submission::known(profile))return false;
+    uintptr_t entry{},end{};std::array<uint8_t,pub::code_bytes> code{};
+    if(!pub::add(module,profile->dispatch,entry) || !pub::add(entry,code.size(),end))return false;
+    __try {std::memcpy(code.data(),reinterpret_cast<const void*>(entry),code.size());}
+    __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    return pub::matches(profile,module,code);
+}
+bool __fastcall publish_remastered_captured_command(void* command,void* frame){
+    namespace pub=w3vr::scene_publication;
+    const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* scope=g_remastered_producer_scope;
+    const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
+    auto reject=[](){
+        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        g_remastered_preparation_hooks_ready.store(false,std::memory_order_release);
+        return false; // Close admission; retain installed originals, no retry/unload.
+    };
+    RemasteredPreparationContext current{};
+    if(!remastered_scope_current(scope,contract) ||
+        !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context ||
+        !remastered_primary_command_matches(current.command_queue,command,frame))return reject();
+    const auto* profile=scope->profile->submission;
+    if(!remastered_scene_publication_code_matches(module,profile) || !remastered_scope_current(scope,contract))return reject();
+    uintptr_t entry{};if(!pub::add(module,profile->dispatch,entry))return reject();
+    // Do not inspect command/header AFTER publication: its consumer can have
+    // already executed, destroyed or recycled it before this function returns.
+    const bool confirmed=pub::published(w3vr_invoke_scene_publication(reinterpret_cast<pub::Original>(entry),command));
+    return confirmed ? true : reject();
+}
 w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(uintptr_t module,
     const w3vr::engine_camera::TemporalContract* contract,const w3vr::frame_preparation::Profile* profile) {
     w3vr::frame_submission::NativeCommandRoute route{};
@@ -42672,9 +42704,10 @@ w3vr::frame_submission::NativeCommandRoute remastered_prepared_command_route(uin
     route.allocate=&allocate_remastered_command_in_captured_queue;
     // Only the matching installed bundle may supply this original trampoline.
     route.construct=g_remastered_command_construct;
-    route.dispatch=reinterpret_cast<w3vr::frame_submission::DispatchCommand>(module+profile->submission->dispatch);
+    route.dispatch=&publish_remastered_captured_command;
     route.unavailable_command=reinterpret_cast<void*>(module+profile->submission->unavailable);
-    route.renderer_ready=remastered_command_renderer_ready(module) && remastered_preparation_ready_for(contract);
+    route.renderer_ready=remastered_command_renderer_ready(module) && remastered_preparation_ready_for(contract) &&
+        remastered_scene_publication_code_matches(module,profile->submission);
     return route;
 }
 extern "C" void w3vr_producer_scope_body(w3vr::producer_bridge::Frame* frame) {
