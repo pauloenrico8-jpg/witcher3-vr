@@ -10,6 +10,59 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+## Envio gráfico preservado diante de falhas de observação — 15 de outubro
+
+O envio do jogo passa por rotinas que coletam informações antes e depois dele.
+Essas rotinas podem precisar de memória. Um laboratório próprio provocou falhas
+reais de alocação e mostrou que uma falha anterior podia impedir a chamada
+original. Isso foi reproduzido num programa separado, não numa partida.
+
+1. Um comprovante acompanha três estados: a chamada original ainda não entrou,
+   entrou ou retornou. A marca fica junto da chamada efetiva, inclusive quando
+   existe uma função intermediária. Se a observação falhar antes, o código
+   encaminha a original uma vez, com a mesma fila e o mesmo conjunto de comandos.
+   Depois de entrar na original, nunca a repete para tentar corrigir a observação.
+2. Durante essa observação, o controle próprio conserva as referências das
+   imagens. Uma chamada Reset, que reinicia a lista de comandos, não pode apagar
+   esses registros no intervalo até o encaminhamento ou a recusa. Observações
+   aninhadas conservam a retenção até todas terminarem. Esse controle não congela
+   pixels nem demonstra a vida útil da memória interna do jogo.
+3. Uma falha bloqueia a apresentação moderna. Os registros das listas envolvidas
+   ficam em quarentena e suas reservas não voltam a ser imagens prontas. Não há
+   liberação por tentativa de recuperação, repetição do envio ou conclusão da GPU
+   inventada. As referências de listas diferentes continuam independentes.
+4. O comprovante de HUD, a camada de interface, só tenta publicar ao sair da função
+   se a original retornou e não existe uma exceção nova em andamento. Falhas nessa
+   publicação também conservam as reservas. Isso evita que sair da função por
+   erro seja interpretado como um envio concluído. A original continua fora do
+   bloqueio usado para proteger os registros.
+
+Escolhi marcar a chamada efetiva porque a função intermediária também pode fazer
+observações antes dela. Marcar apenas a entrada nessa função confundiria uma
+falha anterior com um envio que já começou. Retorno da chamada continua separado
+não só da publicação, mas também do sinal real de conclusão da GPU.
+
+O teste novo passou em **4.420 verificações**, com oito caminhos de envio e cinco
+casos de publicação ao sair da função. Conferiu **oito cópias DirectX reais e
+4.096 bytes**, falhas reais de alocação, o mesmo conjunto de duas listas, retenção
+através de Reset e recusa de repetição. A exceção lançada pela função original de
+apoio era simulada; não foi uma falha do driver. As identidades VR eram fabricadas.
+
+O teste gráfico separado de ganchos nativos também passou: verificou a marca antes
+e depois do envio delegado real e recusou a repetição do mesmo comprovante, sem
+duplicar observações. Esse programa fez 28 cópias próprias e conferiu seus pixels.
+Seus ganchos atuaram somente dentro dele. Nenhum callback novo do host foi
+executado no Witcher, SDK, OpenXR real ou Quest.
+
+A DLL compilou e **130 testes passaram em 11,95 segundos**. A proteção cobre
+exceções C++; não cobre falhas nativas do Windows nem quebra de uma promessa
+`noexcept`, que significa que uma rotina não pode lançar exceção. Os observadores
+nativos e as limpezas mantêm essa exigência. Não há recuperação automática do VR
+após recusa nem prova de parada completa das chamadas ou descarregamento seguro.
+**Remastered continua fechado e o VR ainda não funciona.** Nada experimental foi
+instalado. Continuam pendentes a continuidade do produtor, os recursos nativos e
+duas imagens novas do jogo em cada quadro antes dos testes no headset e combate.
+
 ## Falhas contidas durante a gravação da captura — 14 de outubro
 
 Depois de gravar uma cópia, o código ainda precisa guardar seu comprovante de
