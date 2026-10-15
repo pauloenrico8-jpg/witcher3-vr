@@ -17,7 +17,7 @@ set(required_fragments
     "[FIX:RESHADE-DEFERRED-NAME-CLASSIFICATION V23033 2/2]"
     "V23033 reshade_immediate_classification=positive_only"
     "classification=positive_only"
-    "g_execute_command_lists(queue, num_command_lists, command_lists);"
+    "receipt.forward_raw([&]{g_execute_command_lists(queue,num_command_lists,command_lists);});"
 )
 
 foreach(required IN LISTS required_fragments)

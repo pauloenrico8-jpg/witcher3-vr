@@ -31,6 +31,7 @@ struct ActiveSubmission {
     HRESULT result{E_PENDING};
 };
 thread_local ActiveSubmission* active_submission{};
+thread_local w3vr::execute_observation::Receipt* active_raw_receipt{};
 void command_observer(void* context, const m::OwnedCommand& command, native_hooks::Operation operation,
     native_hooks::Moment moment, HRESULT result) noexcept {
     auto& events = *static_cast<ProbeEvents*>(context);
@@ -55,6 +56,11 @@ void execute_observer(void*, const m::OwnedQueue& queue, native_hooks::Moment mo
     UINT count, ID3D12CommandList* const* array) noexcept {
     auto* submission = active_submission;
     if (!submission) return;
+    if (active_raw_receipt && active_raw_receipt->phase() !=
+        (moment == native_hooks::Moment::Before ? w3vr::execute_observation::Phase::NotEntered
+                                               : w3vr::execute_observation::Phase::Returned)) {
+        submission->mismatch = true; return;
+    }
     if (queue.queue_identity.Get() != submission->queue || count != submission->count ||
         array != submission->array) { submission->mismatch = true; return; }
     if (moment == native_hooks::Moment::Before)
@@ -93,8 +99,16 @@ HRESULT STDMETHODCALLTYPE foreign_reset(ID3D12GraphicsCommandList* command, ID3D
 }
 void STDMETHODCALLTYPE foreign_execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* array) {
     ++foreign_execute_calls;
-    if (legacy_execute_forwarder) legacy_execute_forwarder.execute(queue, count, array);
-    else foreign_execute_original(queue, count, array);
+    if (legacy_execute_forwarder) {
+        w3vr::execute_observation::Receipt receipt;
+        active_raw_receipt = &receipt;
+        legacy_execute_forwarder.execute(queue,count,array,&receipt);
+        active_raw_receipt = nullptr;
+        receipt.require_returned();
+        // The same receipt must suppress both raw execution and a second
+        // before/after observer pair. The counters below check all three.
+        legacy_execute_forwarder.execute(queue,count,array,&receipt);
+    } else foreign_execute_original(queue, count, array);
 }
 void STDMETHODCALLTYPE proxy_execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* array) {
     queue->ExecuteCommandLists(count, array);

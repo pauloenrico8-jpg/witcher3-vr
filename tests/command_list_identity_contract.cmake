@@ -56,7 +56,7 @@ string(FIND "${source}" "if (reshade_internal_submission) {" branch_start)
 string(FIND "${source}"
     "// [FIX:NESTED-COMMAND-LIST-IDENTITY V1532 2/3]" marker)
 string(FIND "${source}"
-    "}else original(queue,num_command_lists,command_lists);\n        return;"
+    "}else receipt.forward_raw([&]{original(queue,num_command_lists,command_lists);});\n        return;"
     opaque_return)
 if(branch_start EQUAL -1 OR marker EQUAL -1 OR opaque_return EQUAL -1 OR
         NOT branch_start LESS marker OR NOT marker LESS opaque_return)
