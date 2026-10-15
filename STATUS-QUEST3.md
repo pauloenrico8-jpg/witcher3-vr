@@ -10,6 +10,55 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+## Publicação do comando adicional confirmada — 15 de outubro
+
+A rotina nativa de entrega não tem um resultado C++ de sucesso. Ela pode
+retornar sem publicar o comando. Um caso próprio reproduziu o problema do
+adaptador anterior: retornou "entregue", embora a publicação não tivesse
+acontecido. Isso foi medido com funções fabricadas, não numa partida.
+
+1. O adaptador confere a rotina completa da versão selecionada antes de reservar
+   o comando e novamente antes da chamada. Os dois endereços internos usados por
+   ela são verificados separadamente. Uma rotina diferente continua recusada.
+2. Uma ponte pequena em assembly, uma forma de escrever instruções diretas para
+   o processador, chama a rotina original uma vez. Ela recolhe o valor produzido
+   pela instrução que publica o comando. Esse valor fica num registro, um espaço
+   de trabalho do processador; não é um retorno C++ inventado para a função nativa.
+3. O código não relê o comando depois da publicação. O jogo já pode ter executado,
+   destruído ou reutilizado essa memória enquanto a chamada termina. O teste
+   próprio cobre esse caso: a memória muda e o comprovante correto permanece.
+4. Sem confirmação, o par não ganha a marca de entrega. Novas preparações modernas
+   ficam bloqueadas, as ligações originais permanecem instaladas e não há tentativa
+   de repetir a publicação. O mod solta somente a referência recebida da fábrica;
+   conserva a referência independente que o comando adquiriu. Referência é a
+   participação que mantém o objeto vivo. Não libera um comando de destino incerto.
+
+Escolhi recolher o resultado da instrução porque tanto o simples retorno da
+função quanto uma leitura posterior da memória podem dar uma conclusão errada.
+A ponte tem uma assinatura própria conhecida; a rotina do jogo continua sendo
+chamada com um argumento e sem um retorno C++ de sucesso presumido.
+
+O teste novo passou em **3.806 verificações**, com **960 chamadas próprias** em
+três linhas de execução e **192 saídas por exceção reais no Windows**. As funções
+assembly do teste são próprias e diferentes da rotina do jogo. Elas verificam o
+caso sem escrita, o resultado incorreto, a memória reutilizada e o argumento exato.
+Os exemplos de código binário usados na conferência eram fabricados. Os testes
+anteriores de preparação e referências também passaram, incluindo recusa após
+entrega incerta sem repetir a liberação do quadro.
+
+A DLL compilou e **131 testes passaram em 12,23 segundos**. O teste novo não
+executou funções nativas do Witcher, ganchos no jogo, GPU, SDK, OpenXR ou Quest.
+A comparação estática das versões estudadas não demonstra seu funcionamento na
+partida. As cópias gráficas dos outros testes continuam com seus próprios limites.
+
+Esta confirmação cobre a publicação CPU do comando adicional. Ainda faltam a
+publicação natural do primário, a preparação normal do jogador e a vida útil,
+a ordem e os recursos dos dois olhos. Publicar um comando não significa que ele
+foi executado nem que a placa de vídeo concluiu a imagem. Não é uma barreira para
+descarregar a DLL. **Remastered continua fechado e o VR ainda não funciona.**
+Nada experimental foi instalado e não foram acrescentadas chamadas ao construtor
+nativo de históricos nem repetições das atualizações dos objetos do mundo.
+
 ## Envio gráfico preservado diante de falhas de observação — 15 de outubro
 
 O envio do jogo passa por rotinas que coletam informações antes e depois dele.
