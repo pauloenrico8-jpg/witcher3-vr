@@ -10,6 +10,55 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+## Falhas contidas durante a gravação da captura — 14 de outubro
+
+Depois de gravar uma cópia, o código ainda precisa guardar seu comprovante de
+publicação. Esse registro pode precisar de memória e falhar. O laboratório
+próprio reproduziu essa falha: a exceção escapou e a preparação CPU não terminou,
+deixando uma referência retida mesmo após Reset real. CPU é a parte do
+processador que prepara os comandos; a GPU executa o desenho e as cópias.
+A falha foi provocada num programa próprio, não observada numa partida.
+
+1. Uma rotina acompanha preparação, gravação e tentativa de publicação. Ela
+   encerra o escopo CPU uma vez em todos os resultados, inclusive erro. A marca
+   interna que evita recapturar a própria cópia volta ao valor anterior ao sair,
+   também quando existe outra observação por fora.
+2. Antes de tentar gravar comandos, uma falha pode liberar a reserva sem uso.
+   Depois dessa tentativa, o código conserva a reserva e bloqueia novas capturas.
+   Não publica um olho incompleto nem trata uma falha como imagem pronta.
+3. Se a gravação terminou e só a publicação falhou, as interfaces continuam
+   retidas pelo controle existente. Ele exige Reset real e conclusão dos sinais
+   de todas as submissões conhecidas antes de soltá-las. Uma gravação parcial
+   ou incerta permanece em quarentena; esta mudança não inventa recuperação.
+4. A observação moderna contém suas exceções C++. A chamada original da barreira
+   continua antes dela, uma vez. A sequência de transições de estado e cópia
+   dos recursos foi preservada. A compilação também exige que o comprovante
+   de publicação continue sendo apenas dados copiáveis sem operação de mudança
+   que lance exceção. Isso conserva a garantia de inserção do
+   [contêiner de registros](https://eel.is/c++draft/vector.modifiers).
+
+Escolhi separar o fim da preparação CPU da conclusão GPU porque terminar uma
+função não significa que a placa de vídeo terminou de usar os recursos. Os
+callbacks de limpeza têm contrato de não lançar exceções. O guardião não trata
+falhas nativas do Windows, descarregamento da DLL ou todo o ciclo de vida do jogo.
+Na recusa após gravação, a reserva sem estado seguro não é reutilizada; o bloqueio
+permanece. Não há retomada automática do VR depois desse erro.
+
+O teste novo passou em **2.283 verificações**, cobrindo sete resultados de
+preparação, gravação e publicação, falha real de um alocador próprio, observações
+aninhadas e finalização única. Quatro cópias DirectX próprias produziram **2.048
+bytes conferidos**. Os recursos foram retidos durante bloqueio da GPU e só
+retirados com os comprovantes apropriados; os casos incertos continuaram retidos.
+As identidades de quadro e ligação eram fabricadas. O mesmo guardião e controle
+de referências são usados pelo host, mas seus callbacks no Witcher não rodaram.
+
+A DLL compilou e **129 testes passaram em 13.54 segundos**. A última recompilação
+acrescentou somente a conferência estática do tipo do comprovante. Não executou
+Witcher, SDK, OpenXR real ou Quest nesta etapa. **O VR ainda não funciona e
+Remastered permanece fechado.** Nada experimental foi instalado. Continuam
+pendentes a continuidade do produtor, os recursos nativos e duas imagens novas
+do jogo por quadro, antes de cabeça, mãos, armas e combate físico no headset.
+
 ## Conferência conjunta antes do envio gráfico — 14 de outubro
 
 O caminho de apresentação verificava as fontes, a imagem VR e a memória de
