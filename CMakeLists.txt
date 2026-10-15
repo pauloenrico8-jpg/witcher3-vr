@@ -53,6 +53,7 @@ add_library(witcher3vr_dxgi SHARED
     src/dxgi_proxy.cpp
     src/engine_producer_bridge.asm
     src/engine_scene_publication.asm
+    src/scene_publication_observer.asm
     src/temporal_record_leaf_bridge.asm
     src/dxgi_proxy.def
     src/openxr_eye_geometry.cpp
@@ -203,6 +204,13 @@ if(BUILD_TESTING)
         target_link_libraries(w3vr_temporal_record_leaf_tests PRIVATE minhook)
         add_test(NAME temporal_record_leaf_register_preservation COMMAND w3vr_temporal_record_leaf_tests)
         set_tests_properties(temporal_record_leaf_register_preservation PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(w3vr_scene_publication_observer_tests tests/scene_publication_observer_tests.cpp
+            tests/scene_publication_observer_fixture.asm src/scene_publication_observer.asm)
+        target_include_directories(w3vr_scene_publication_observer_tests PRIVATE src)
+        target_compile_definitions(w3vr_scene_publication_observer_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_link_libraries(w3vr_scene_publication_observer_tests PRIVATE minhook)
+        add_test(NAME scene_publication_observer_state_preservation COMMAND w3vr_scene_publication_observer_tests)
+        set_tests_properties(scene_publication_observer_state_preservation PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(w3vr_engine_scene_publication_tests tests/engine_scene_publication_tests.cpp
             tests/engine_scene_publication_fixture.asm src/engine_scene_publication.asm)
         target_include_directories(w3vr_engine_scene_publication_tests PRIVATE src)

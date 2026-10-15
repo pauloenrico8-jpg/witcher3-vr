@@ -10,6 +10,58 @@ desenvolvimento e não foi instalado no jogo.
 
 
 
+## Publicação do principal ligada ao mesmo par — 15 de outubro
+
+A confirmação do comando adicional agora espera também a publicação natural do
+principal. Construir o comando, ou terminar apenas a entrega adicional, já não
+autoriza o quadro VR nem o avanço dos históricos de câmera.
+
+1. Antes da publicação natural, o observador guarda a identidade do comando,
+   dos dois quadros e do par. Ele confere o chamador da versão selecionada e a
+   tabela do comando. Uma chamada diferente continua seguindo a original, mas
+   não recebe um comprovante válido deste par.
+2. Uma ponte em assembly, instruções diretas para o processador, conserva os
+   registros, os espaços onde ficam os valores de trabalho, e o estado numérico
+   antes da observação. Ela os restaura antes de chamar a original uma vez.
+   Depois conserva o resultado da original, observa e restaura esse resultado.
+   A rotina nativa continua sem um retorno C++ de sucesso inventado.
+3. A identidade guardada e o resultado da instrução de publicação precisam
+   coincidir. O código não relê o comando depois da chamada: essa memória pode
+   ter sido executada, liberada ou reutilizada pelo consumidor do jogo.
+   Somente as duas publicações CPU confirmadas autorizam a marca do par.
+4. O construtor já não publica a admissão VR nem confirma o histórico sozinho.
+   Cancelamento, geração diferente, comprovante antigo ou publicação incerta
+   não ganham sucesso. A saída sem confirmação cancela as marcas próprias;
+   ela não recupera comandos enviados nem solta referências nativas incertas.
+5. A instalação reúne seis observadores da mesma versão numa única tentativa.
+   A rotina completa de publicação é conferida antes da alteração. Depois, o
+   encaminhamento usa a original conservada por essa instalação, sem tentar
+   reconhecer os bytes antigos sobre a entrada já modificada. Uma falha parcial
+   mantém as originais necessárias e deixa a admissão fechada.
+
+Escolhi guardar a identidade antes e o resultado depois porque os dados do
+comando podem desaparecer enquanto a função termina. As duas observações
+conservam também os resultados numéricos do jogo. A chamada adicional usa a
+original conservada diretamente, para não se confundir com a chamada natural.
+
+A DLL compilou e **132 testes passaram em 23,52 segundos**. O teste novo fez
+**3.142 verificações**: 96 observações antes/depois com ligações reais em funções
+próprias, 192 chamadas próprias de comparação, três linhas de execução e
+32 saídas adicionais por exceção C++ reais. Uma exceção da original não executa
+a observação posterior nem repete a original. Foram comparados sete registros
+inteiros, dezesseis registros vetoriais, flags aritméticas e o estado numérico
+em quatro modos de arredondamento. Os exemplos de par e código eram fabricados.
+O teste de preparação passou em 2.046 verificações, incluindo as falhas nas seis
+ligações; essas falhas da instalação foram simuladas.
+
+Esses testes não executaram os novos callbacks no Witcher, MinHook no jogo,
+SDK, OpenXR real ou Quest. Publicação CPU não comprova execução nem conclusão
+GPU. Ainda faltam a preparação normal do jogador, vida útil e ordem dos recursos,
+as duas imagens reais por quadro e a integração física das mãos e armas.
+Não foi acrescentada construção nativa de históricos ou repetição de atualizações
+do mundo. A barreira de parada e descarregamento continua pendente.
+**Remastered permanece fechado e o VR ainda não funciona.** Nada foi instalado.
+
 ## Publicação do comando adicional confirmada — 15 de outubro
 
 A rotina nativa de entrega não tem um resultado C++ de sucesso. Ela pode
