@@ -54087,7 +54087,11 @@ void render_openxr_test_frame(
                         game_backbuffer);
                 }
 
-                if (packed_stereo_available) {
+                // Each readback costs an XR GPU wait; on the experimental
+                // Remastered route it runs only with runtime diagnostics.
+                if (packed_stereo_available &&
+                    ((g_config.runtime_diagnostics && !g_config.pipeline_flight_recorder) ||
+                        !g_remastered_experimental_active.load(std::memory_order_acquire))) {
                     schedule_stereo_luminance_readback(g_xr_command_list);
                 }
 
