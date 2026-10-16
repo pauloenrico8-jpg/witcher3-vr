@@ -145,6 +145,22 @@ void reject_foreign_or_published_primary(){
   require(!match&&calls==0,"foreign/published/malformed primary authorized duplicate allocation");
  }
 }
+// WORLD path A: constructor 0229FD80 stores the borrowed scene at payload+16.
+void world_scene_primary_requires_exact_scene(){
+ constexpr std::uintptr_t scene=0x700000;
+ Fixture f;put(f.command,16,scene);
+ require(q::primary_command_matches(f.identity,f.pointer,f.primary,f.header,f.command,scene),"world command with its exact scene rejected");
+ require(!f.match(),"world command matched the null-scene no-world rule");
+ require(!q::primary_command_matches(f.identity,f.pointer,f.primary,f.header,f.command,scene+8) &&
+  !q::primary_command_matches(f.identity,f.pointer,f.primary,f.header,f.command,1),"world command matched a different scene");
+ Fixture none;
+ require(none.match() && !q::primary_command_matches(none.identity,none.pointer,none.primary,none.header,none.command,scene),
+  "no-world command adopted an expected scene or lost its null rule");
+ for(int reason=0;reason<4;++reason){Fixture w;put(w.command,16,scene);std::span<const std::uint8_t> payload=w.command;
+  if(reason==0)put(w.command,8,w.primary+8);if(reason==1)put(w.header,0,std::uint32_t(0x45584543));
+  if(reason==2)payload=payload.first(23);if(reason==3)w.primary=0;
+  require(!q::primary_command_matches(w.identity,w.pointer,w.primary,w.header,payload,scene),"world scene bypassed another primary check");}
+}
 void construction_reading_before_owner_store(){
  namespace life=w3vr::modern_queue_lifecycle;
  require(life::known_construction(&life::remastered_500c,life::normal_construct_return,0),"normal construction mode not accepted");
@@ -375,5 +391,6 @@ void observer_installation_preserves_forwarders(){
 
 }
 int main(){lifecycle_profiles_and_tickets();observer_installation_preserves_forwarders();build_profiles_cannot_share_a_binding();valid_binding_and_mutable_cursor();reject_corrupt_identity();reject_foreign_or_published_primary();
+ world_scene_primary_requires_exact_scene();
  construction_reading_before_owner_store();observed_generation_is_not_an_address();constructor_and_stop_can_race();partial_activation_cannot_adopt_an_earlier_construction();
  std::printf("Modern captured native queue: %d checks, %d failures (CPU only)\n",checks,failures);return failures?1:0;}

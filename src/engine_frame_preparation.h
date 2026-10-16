@@ -35,21 +35,35 @@ inline constexpr std::array<std::uint8_t,20> effects_tick_1048522_prefix{0x40,0x
 inline constexpr std::array<std::uint8_t,16> effects_apply_1048522_prefix{0x48,0x85,0xD2,0x0F,0x84,0xBA,0x0B,0x00,0x00,0x48,0x8B,0xC4,0x48,0x89,0x50,0x10};
 inline constexpr std::array<std::uint8_t,17> command_construct_1048522_prefix{0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x89,0x51,0x08,0x48,0x8D,0x05,0x47,0xAE,0x6B,0x01};
 struct HookTarget {std::uintptr_t rva;std::span<const std::uint8_t> prefix;};
+// WORLD branch of the same producer (normal gameplay). Zero = not examined.
+// Order: tick (inside world tick 022BEA80) BEFORE the factory (inside builder
+// 022C0820), then apply in the builder, then construct/publication (path A).
+// No engine prepare, world-receiver slot-10 or engine+40 call exists there.
+// inline_publication is path B's direct publication call (inline command).
+struct WorldBoundaries {
+    std::uintptr_t factory_return,tick_return,apply_return,construct_return,publication_return,inline_publication_return;
+    std::uint32_t world_handle,world,scene,engine_flags;std::uint8_t scene_flag;
+};
 struct Profile {
     const modern_queue_lifecycle::Profile* lifecycle;
     const frame_submission::Profile* submission;
     std::array<HookTarget,5> hooks;
     std::uintptr_t factory_return,prepare_return,tick_return,apply_return,construct_return;
     std::uintptr_t engine_global,engine_vtable,effects_state_global,effects_world_global,empty_world,publication_return;
+    WorldBoundaries world;
 };
 inline constexpr Profile remastered_500c{&modern_queue_lifecycle::remastered_500c,
     &frame_submission::remastered_500c,{{{0x02274B80,producer_500c_prefix},{0x0224C600,engine_prepare_500c_prefix},{0x02367890,effects_tick_500c_prefix},{0x02367B60,effects_apply_500c_prefix},{0x02297670,command_construct_500c_prefix}}},
     factory_return_rva,engine_prepare_return_rva,effects_tick_return_rva,effects_apply_return_rva,
-    command_construct_return_rva,engine_global_rva,engine_vtable_rva,0x05A51E98,0x05A51930,empty_world_callback_rva,0x0227594F};
+    command_construct_return_rva,engine_global_rva,engine_vtable_rva,0x05A51E98,0x05A51930,empty_world_callback_rva,0x0227594F,
+    {0,0,0,0,0,0,0,0,0,0,0}};
 inline constexpr Profile remastered_1048522{&modern_queue_lifecycle::remastered_1048522,
     &frame_submission::remastered_1048522,{{{0x0227D1F0,producer_1048522_prefix},{0x02254B70,engine_prepare_1048522_prefix},{0x0236FCF0,effects_tick_1048522_prefix},{0x0236FFC0,effects_apply_1048522_prefix},{0x0229FD80,command_construct_1048522_prefix}}},
     0x0227DF27,0x0227DF60,0x0227DF93,0x0227DF9B,0x0227DFB3,
-    0x05A5B8F0,0x037B3C10,0x05A5BE90,0x05A5B928,0x0031C320,0x0227DFC1};
+    0x05A5B8F0,0x037B3C10,0x05A5BE90,0x05A5B928,0x0031C320,0x0227DFC1,
+    {0x022C1A28,0x022C06C0,0x022C1A4C,0x0227DCD7,0x0227DCE0,0x0227DD6D,0xF0,0x08,0x5440,0x3C,0x20}};
+enum class Mode {no_world,world};
+inline bool world_examined(const Profile* profile){return profile==&remastered_1048522 && profile->world.factory_return!=0;}
 inline bool known(const Profile* profile){return profile==&remastered_500c || profile==&remastered_1048522;}
 inline const Profile* selected(const engine_camera::TemporalContract* contract){
     if(contract==&engine_camera::remastered_500c)return &remastered_500c;
@@ -63,8 +77,22 @@ inline bool ready_for(const engine_camera::TemporalContract* contract,const Prof
         modern_queue_lifecycle::ready_for(contract,lifecycle,lifecycle_ready);
 }
 enum class Boundary {factory,prepare,tick,apply,construct,publication};
-inline bool allows(const Profile* profile,Boundary boundary,std::uintptr_t caller){
+inline bool allows(const Profile* profile,Boundary boundary,std::uintptr_t caller,Mode mode=Mode::no_world){
     if(!known(profile))return false;
+    if(mode==Mode::world){
+        if(!world_examined(profile) || !caller)return false;
+        const auto& w=profile->world;
+        switch(boundary){
+        case Boundary::factory:return caller==w.factory_return;
+        case Boundary::prepare:return false; // The world branch has no engine prepare.
+        case Boundary::tick:return caller==w.tick_return;
+        case Boundary::apply:return caller==w.apply_return;
+        case Boundary::construct:return caller==w.construct_return;
+        case Boundary::publication:return caller==w.publication_return;
+        default:return false;
+        }
+    }
+    if(mode!=Mode::no_world)return false;
     switch(boundary){
     case Boundary::factory:return caller==profile->factory_return;
     case Boundary::prepare:return caller==profile->prepare_return;
@@ -74,6 +102,21 @@ inline bool allows(const Profile* profile,Boundary boundary,std::uintptr_t calle
     case Boundary::publication:return caller==profile->publication_return;
     default:return false;
     }
+}
+// The factory's immediate caller is the only selector of the pair mode.
+inline bool factory_mode(const Profile* profile,std::uintptr_t caller,Mode& out){
+    if(allows(profile,Boundary::factory,caller,Mode::no_world)){out=Mode::no_world;return true;}
+    if(allows(profile,Boundary::factory,caller,Mode::world)){out=Mode::world;return true;}
+    return false;
+}
+// Path B publishes an inline command without the examined constructor.
+inline bool inline_publication(const Profile* profile,std::uintptr_t caller){
+    return world_examined(profile) && caller && caller==profile->world.inline_publication_return;
+}
+// Path A precondition copied from 0227DCA5..0227DCB9: engine flag bit and a
+// non-null world scene. Otherwise the producer takes unsupported path B.
+inline bool world_path_a(const Profile* profile,std::uint8_t engine_flags,std::uintptr_t scene){
+    return world_examined(profile) && (engine_flags&profile->world.scene_flag) && scene;
 }
 inline bool empty_callback(const Profile* profile,std::uintptr_t module,std::uintptr_t callback,
     std::span<const std::uint8_t> code){
@@ -129,6 +172,10 @@ using InvalidatePair = void(*)(void*, void*, void*);
 // stack-backed descriptor or pointed descriptor resource is retained here.
 // Natural preparation must finish before either duplicate preparation or
 // command dispatch. Shared effects time is observed once, never replayed.
+// WORLD mode: no engine stage exists (engine prepare is never called). The
+// shared effects tick happens BEFORE the factory, so it is recorded by the
+// host and handed to arm(); a tick after arm poisons the pair. Only effects
+// apply is replayed on the duplicate, and only if the primary received it.
 class PendingPair {
 public:
     PendingPair() = default;
@@ -137,15 +184,20 @@ public:
     ~PendingPair() { cancel(); }
 
     bool arm(const Profile* profile,void* primary, void* duplicate, frame_submission::ReleaseFrame release,
-        InvalidatePair invalidate, void* owner) {
+        InvalidatePair invalidate, void* owner, Mode mode = Mode::no_world, std::uint32_t ticks_before_arm = 0) {
         if (!known(profile) || primary == nullptr || duplicate == nullptr || primary == duplicate ||
             release == nullptr || invalidate == nullptr || armed_) return false;
+        if (mode != Mode::no_world && mode != Mode::world) return false;
+        if (mode == Mode::world && (!world_examined(profile) || ticks_before_arm > 1)) return false;
+        if (mode == Mode::no_world && ticks_before_arm != 0) return false;
         profile_ = profile;
         primary_ = primary;
         duplicate_ = duplicate;
         release_ = release;
         invalidate_ = invalidate;
         owner_ = owner;
+        mode_ = mode;
+        tick_seen_ = ticks_before_arm == 1;
         armed_ = true;
         return true;
     }
@@ -153,12 +205,19 @@ public:
     bool accepts(void* frame) const { return armed_ && duplicate_ && frame == primary_; }
     bool pending()const{return duplicate_!=nullptr;}
     bool available() const { return !armed_; }
+    Mode mode() const { return mode_; }
+    bool world() const { return armed_ && mode_ == Mode::world; }
+    bool tick_seen() const { return tick_seen_; }
+    bool effects_seen() const { return effects_seen_; }
+    // Diagnostic only: first poison/rejection cause, a static string.
+    const char* reason() const { return reason_; }
 
     void observe_engine(const Profile* profile,void* frame, void* receiver, PrepareFrame prepare,
         bool shared_callback_absent) {
         if (!accepts(frame)) return;
+        if (mode_ == Mode::world) { poison("engine_in_world"); return; }
         if (profile!=profile_ || !known(profile) || engine_seen_ || tick_seen_ || effects_seen_ || receiver == nullptr ||
-            prepare == nullptr || !shared_callback_absent) { poisoned_ = true; return; }
+            prepare == nullptr || !shared_callback_absent) { poison("engine_stage"); return; }
         engine_ = receiver;
         engine_prepare_ = prepare;
         engine_seen_ = true;
@@ -166,14 +225,16 @@ public:
 
     void observe_effects_tick(const Profile* profile) {
         if (!duplicate_) return;
-        if (profile!=profile_ || !known(profile) || !engine_seen_ || tick_seen_ || effects_seen_) { poisoned_ = true; return; }
+        if (mode_ == Mode::world) { poison("tick_after_world_factory"); return; }
+        if (profile!=profile_ || !known(profile) || !engine_seen_ || tick_seen_ || effects_seen_) { poison("tick_stage"); return; }
         tick_seen_ = true;
     }
 
     void observe_effects(const Profile* profile,void* frame, void* first_argument, PrepareFrame apply) {
         if (!accepts(frame)) return;
-        if (profile!=profile_ || !known(profile) || !engine_seen_ || !tick_seen_ || effects_seen_ || apply == nullptr) {
-            poisoned_ = true; return;
+        const bool stages = mode_ == Mode::world ? !engine_seen_ : engine_seen_ && tick_seen_;
+        if (profile!=profile_ || !known(profile) || !stages || effects_seen_ || apply == nullptr) {
+            poison("apply_stage"); return;
         }
         effects_first_argument_ = first_argument;
         effects_apply_ = apply;
@@ -185,11 +246,15 @@ public:
     Completion at_native_command(void* frame, const frame_submission::NativeCommandRoute& route,
         bool context_still_matches) {
         if (!accepts(frame)) return Completion::ignored;
-        if (poisoned_ || !known(profile_) || route.profile!=profile_->submission ||
-            !engine_seen_ || tick_seen_ != effects_seen_ ||
-            !context_still_matches || !route.renderer_ready || route.allocate == nullptr ||
-            route.construct == nullptr || route.dispatch == nullptr ||
-            route.unavailable_command == nullptr) {
+        const bool world = mode_ == Mode::world;
+        const char* failed = poisoned_ ? reason_ : !known(profile_) || route.profile!=profile_->submission ? "profile" :
+            (world ? engine_seen_ : !engine_seen_ || tick_seen_ != effects_seen_) ? "stage" :
+            !context_still_matches ? "context" :
+            (world ? route.auxiliary == nullptr : route.auxiliary != nullptr) ? "auxiliary" :
+            !route.renderer_ready || route.allocate == nullptr || route.construct == nullptr ||
+                route.dispatch == nullptr || route.unavailable_command == nullptr ? "route" : nullptr;
+        if (failed != nullptr) {
+            if (reason_ == nullptr) reason_ = failed;
             cancel();
             return Completion::rejected;
         }
@@ -197,10 +262,11 @@ public:
         // replay or release this same duplicate a second time.
         void* duplicate = duplicate_;
         duplicate_ = nullptr;
-        engine_prepare_(engine_, duplicate);
+        if (!world) engine_prepare_(engine_, duplicate);
         if (effects_seen_) effects_apply_(effects_first_argument_, duplicate);
         const auto result = frame_submission::submit_owned_frame(route, duplicate, release_);
         if (result != frame_submission::Result::dispatched) {
+            if (reason_ == nullptr) reason_ = "submission";
             invalidate_(owner_, primary_, duplicate);
             return Completion::submission_failed;
         }
@@ -216,12 +282,15 @@ public:
     }
 
 private:
+    void poison(const char* why) { if (reason_ == nullptr) reason_ = why; poisoned_ = true; }
     const Profile* profile_{};
     void* primary_{};
     void* duplicate_{};
     frame_submission::ReleaseFrame release_{};
     InvalidatePair invalidate_{};
     void* owner_{};
+    Mode mode_{Mode::no_world};
+    const char* reason_{};
     bool armed_{};
     bool poisoned_{};
     bool engine_seen_{};

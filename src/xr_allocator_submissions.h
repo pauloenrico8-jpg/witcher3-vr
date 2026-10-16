@@ -105,6 +105,7 @@ public:
     bool cancel(const Ticket& t){auto* e=find(t);if(!e || e->phase!=Phase::Prepared || !e->cpu_active || e->cancelled)return false;e->cancelled=true;return true;}
     void finish_cpu(const Ticket& t){if(auto* e=find(t)){e->cpu_active=false;if(e->phase==Phase::Prepared)e->cancelled=true;}collect();}
     bool established()const{return bool(queue_identity_);}
+    bool blocked()const{return blocked_;} // diagnostic read only
     bool known_slot(std::size_t slot)const{return slot<slots_.size()&&bool(known_allocators_[slot]);}
     bool has_slot(std::size_t slot)const{return slot<slots_.size()&&slots_[slot];}
     bool wait(std::size_t slot,ID3D12CommandAllocator* allocator,DWORD timeout_ms){

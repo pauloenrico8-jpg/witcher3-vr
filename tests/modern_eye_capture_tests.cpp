@@ -1,6 +1,7 @@
 #include "modern_eye_capture.h"
 #include <cstdlib>
 #include <iostream>
+#include <span>
 #include <vector>
 #include <stdexcept>
 namespace cap=w3vr::modern_eye_capture;
@@ -39,6 +40,16 @@ int main(){
  other=live;other.frame.view_valid=false;rejects(other,"Missing frozen view accepted");other=live;other.frame.normal_factory_lineage=false;rejects(other,"Private or incomplete frame accepted");
  for(auto t:{cap::Transition{1,4,0,0},cap::Transition{2,4,0,0},cap::Transition{0,0,0,0},cap::Transition{0,4,4,0},cap::Transition{0,4,0,1},cap::Transition{0,8,0,0}}){out=sentinel;require(!request(live,out,t),"Split, nonwrite or incomplete transition accepted");require(out.command==sentinel.command,"Rejected transition changed request");}
  require(request(live,out,{0,0x400,0,0}),"Copy-destination final buffer rejected");
+ // COPY_DEST->PRESENT then RENDER_TARGET->PRESENT in one eye scope: the later
+ // copy of the same pair must win. Only a pending, newer, same-pair copy defers.
+ {using C=cap::RecordedCopy;const C ring[3]{{5,99,false},{6,99,true},{4,98,true}};
+  require(cap::later_copy_pending(5,99,ring),"Earlier eye copy promoted while final copy pending");
+  require(!cap::later_copy_pending(6,99,ring),"Final published copy waited for itself");
+  const C done[3]{{5,99,false},{6,99,false},{7,100,true}};
+  require(!cap::later_copy_pending(5,99,done),"Published or other-pair copy deferred promotion");
+  const C older[2]{{3,99,true},{2,99,true}};require(!cap::later_copy_pending(5,99,older),"Older pending copy superseded newer published eye");
+  require(!cap::later_copy_pending(1,0,ring)&&!cap::later_copy_pending(1,UINT64_MAX,ring),"Invalid pair deferred");
+  require(!cap::later_copy_pending(1,99,std::span<const C>{}),"Empty ring deferred");}
  out=sentinel;require(!request(live,out,render_end,&cam::remastered_1048522,&core::remastered_1048522,false),"Closed hooks accepted");
  require(!request(live,out,render_end,&cam::remastered_1048522,&core::remastered_500c),"Other installed bundle accepted");
  require(!request(live,out,render_end,&cam::legacy_404),"Legacy contract used modern path");

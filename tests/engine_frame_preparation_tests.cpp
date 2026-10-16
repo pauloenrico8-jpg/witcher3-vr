@@ -37,6 +37,9 @@ struct Fixture {
     std::string events;
     bool allocation_failure{}, immediate_completion{},publication_confirmed{true};
     prep::PendingPair* reenter{};
+    // WORLD producer: no engine preparation; command carries the scene.
+    bool world{};
+    int scene{};
 };
 thread_local Fixture* current{};
 
@@ -62,7 +65,7 @@ void tick_once(float delta) {
 void __fastcall apply(void* first_argument, void* raw_frame) {
     auto& f = *current;
     auto* frame = static_cast<Frame*>(raw_frame);
-    require(first_argument == &f.effects_argument && frame->prepared &&
+    require(first_argument == &f.effects_argument && (f.world || frame->prepared) &&
         frame->references > 0 && !frame->effects_applied,
         "Effects lost the observed argument, preceded preparation or repeated");
     frame->effects_applied = true;
@@ -96,8 +99,9 @@ void* __fastcall allocate() {
 void* __fastcall construct(void* command, void* raw_frame, void* auxiliary) {
     auto& f = *current;
     auto* frame = static_cast<Frame*>(raw_frame);
-    require(command == &f.command && frame == &f.duplicate && auxiliary == nullptr &&
-        frame->prepared && frame->references == 1,
+    require(command == &f.command && frame == &f.duplicate &&
+        auxiliary == (f.world ? static_cast<void*>(&f.scene) : nullptr) &&
+        (f.world ? !frame->prepared : frame->prepared) && frame->references == 1,
         "Native command preceded duplicate preparation or changed ownership");
     ++frame->references;
     f.queued = frame;
@@ -123,7 +127,8 @@ bool __fastcall dispatch(void* command,void* frame) {
 }
 
 submit::NativeCommandRoute route() {
-    return {allocate, construct, dispatch, &current->sentinel, true,current->profile->submission};
+    return {allocate, construct, dispatch, &current->sentinel, true,current->profile->submission,
+        current->world ? &current->scene : nullptr};
 }
 
 void arm(prep::PendingPair& pair, Fixture& f) {
@@ -488,6 +493,131 @@ void test_rejected_scopes_mask_restore_and_unwind() {
     }catch(const std::runtime_error&){require(slot==&parent,"Admitted unwind lost parent");}
 }
 
+// WORLD branch (1048522 normal gameplay): tick BEFORE the factory/arm, no
+// engine prepare, apply after arm, construct with the producer's scene.
+void arm_world(prep::PendingPair& pair, Fixture& f, std::uint32_t ticks) {
+    current = &f;
+    f.world = true;
+    require(pair.arm(&prep::remastered_1048522,&f.primary, &f.duplicate, release, invalidate, &f,
+        prep::Mode::world, ticks), "Could not arm world pair");
+    require(pair.world() && pair.mode()==prep::Mode::world && pair.tick_seen()==(ticks==1),"World mode/tick not recorded");
+}
+
+void test_world_pair_order_and_ownership() {
+    for (bool tick : {false, true}) for (bool effects : {false, true}) for (bool immediate : {false, true}) {
+        Fixture f;
+        f.profile = &prep::remastered_1048522;
+        f.immediate_completion = immediate;
+        current = &f;
+        if (tick) tick_once(0.016f); // Natural world tick precedes the factory.
+        {
+            prep::PendingPair pair;
+            arm_world(pair, f, tick ? 1u : 0u);
+            if (effects) {
+                apply(&f.effects_argument, &f.primary);
+                pair.observe_effects(&prep::remastered_1048522,&f.primary,&f.effects_argument,apply);
+                require(pair.effects_seen(),"World apply not observed");
+            }
+            require(f.allocations == 0 && f.caller_releases == 0,"World duplicate work escaped before command");
+            require(pair.at_native_command(&f.primary, route(), true) ==
+                prep::PendingPair::Completion::dispatched, "World command rejected");
+            const std::string expected = std::string(tick ? "T" : "") + (effects ? "lr" : "") + "ACD" +
+                std::string(immediate ? "FO" : "O");
+            require(f.events == expected && f.tick_count == (tick ? 1 : 0) && !f.primary.prepared && !f.duplicate.prepared &&
+                f.primary.effects_applied == f.duplicate.effects_applied && f.primary.effects_time == f.duplicate.effects_time &&
+                f.caller_releases == 1 && f.invalidations == 0 && pair.reason() == nullptr,
+                "World order, engine prepare, replayed apply or ownership changed");
+            if (!immediate) complete();
+        }
+        require(f.duplicate.references == 0 && f.primary.references == 1,"World pair leaked/consumed references");
+    }
+}
+
+void test_world_rejections() {
+    for (int reason = 0; reason < 8; ++reason) {
+        Fixture f;
+        f.profile = &prep::remastered_1048522;
+        {
+            prep::PendingPair pair;
+            arm_world(pair, f, 1);
+            auto r = route();
+            if (reason == 0) pair.observe_engine(&prep::remastered_1048522,&f.primary,&f.engine,prepare,true);
+            if (reason == 1) pair.observe_effects_tick(&prep::remastered_1048522); // Tick after the factory.
+            if (reason == 2) {
+                apply(&f.effects_argument, &f.primary);
+                pair.observe_effects(&prep::remastered_1048522,&f.primary,&f.effects_argument,apply);
+                pair.observe_effects(&prep::remastered_1048522,&f.primary,&f.effects_argument,apply);
+            }
+            if (reason == 3) r.auxiliary = nullptr; // Duplicate would lose the scene.
+            if (reason == 4) pair.observe_effects(&prep::remastered_500c,&f.primary,&f.effects_argument,apply);
+            if (reason == 5) r.profile = prep::remastered_500c.submission;
+            if (reason == 6) pair.observe_effects(&prep::remastered_1048522,&f.primary,&f.effects_argument,nullptr);
+            const bool live = reason != 7;
+            require(pair.at_native_command(&f.primary, r, live) == prep::PendingPair::Completion::rejected &&
+                pair.reason() != nullptr, "Invalid world producer accepted or gave no reason");
+        }
+        require(f.allocations == 0 && f.caller_releases == 1 && f.invalidations == 1 &&
+            f.duplicate.references == 0 && f.primary.references == 1 && !f.duplicate.prepared,
+            "Rejected world pair allocated, prepared or mishandled ownership");
+    }
+    {
+        Fixture f;current=&f;
+        prep::PendingPair pair;
+        require(!pair.arm(&prep::remastered_1048522,&f.primary,&f.duplicate,release,invalidate,&f,prep::Mode::world,2) &&
+            !pair.arm(&prep::remastered_500c,&f.primary,&f.duplicate,release,invalidate,&f,prep::Mode::world,0) &&
+            !pair.arm(&prep::remastered_1048522,&f.primary,&f.duplicate,release,invalidate,&f,prep::Mode::no_world,1) &&
+            !pair.arm(&prep::remastered_1048522,&f.primary,&f.duplicate,release,invalidate,&f,static_cast<prep::Mode>(9),0),
+            "Repeated tick, unexamined world profile or mixed mode accepted ownership");
+        require(pair.available() && f.events.empty() && f.duplicate.references == 1,"Rejected world arm consumed the frame");
+    }
+    {
+        // No-world pair must keep its null auxiliary and cannot become world.
+        Fixture f;f.profile=&prep::remastered_1048522;prep::PendingPair pair;
+        current=&f;require(pair.arm(&prep::remastered_1048522,&f.primary,&f.duplicate,release,invalidate,&f),"no-world arm failed");
+        natural_prepare(pair,f,false);
+        f.world=true;auto r=route();f.world=false;
+        require(!pair.world() && pair.at_native_command(&f.primary,r,true)==prep::PendingPair::Completion::rejected &&
+            f.allocations==0,"No-world pair accepted a scene auxiliary");
+    }
+}
+
+void test_world_boundaries() {
+    const auto* p=&prep::remastered_1048522;
+    const auto& w=p->world;
+    using B=prep::Boundary;using M=prep::Mode;
+    require(prep::allows(p,B::factory,w.factory_return,M::world) && prep::allows(p,B::tick,w.tick_return,M::world) &&
+        prep::allows(p,B::apply,w.apply_return,M::world) && prep::allows(p,B::construct,w.construct_return,M::world) &&
+        prep::allows(p,B::publication,w.publication_return,M::world),"Examined world boundary rejected");
+    require(!prep::allows(p,B::prepare,p->prepare_return,M::world) && !prep::allows(p,B::prepare,0,M::world),"World mode admitted engine prepare");
+    const std::array<std::uintptr_t,5> world_returns{w.factory_return,w.tick_return,w.apply_return,w.construct_return,w.publication_return};
+    const std::array<B,5> stages{B::factory,B::tick,B::apply,B::construct,B::publication};
+    const std::array<std::uintptr_t,5> no_world{p->factory_return,p->tick_return,p->apply_return,p->construct_return,p->publication_return};
+    for(std::size_t i=0;i<stages.size();++i){
+        require(!prep::allows(p,stages[i],world_returns[i]) && !prep::allows(p,stages[i],no_world[i],M::world) &&
+            !prep::allows(p,stages[i],world_returns[i]+1,M::world) && !prep::allows(&prep::remastered_500c,stages[i],world_returns[i],M::world),
+            "World and no-world boundaries mixed");
+        for(std::size_t j=0;j<stages.size();++j)if(i!=j)
+            require(!prep::allows(p,stages[i],world_returns[j],M::world),"World stage adopted another world boundary");
+    }
+    auto copied=*p;
+    require(!prep::allows(&copied,B::factory,w.factory_return,M::world) &&
+        !prep::allows(p,B::factory,w.factory_return,static_cast<M>(9)),"Copied profile or unknown mode accepted");
+    M mode{};
+    require(prep::factory_mode(p,p->factory_return,mode) && mode==M::no_world &&
+        prep::factory_mode(p,w.factory_return,mode) && mode==M::world &&
+        !prep::factory_mode(p,w.construct_return,mode) && !prep::factory_mode(&prep::remastered_500c,w.factory_return,mode) &&
+        prep::factory_mode(&prep::remastered_500c,prep::remastered_500c.factory_return,mode) && mode==M::no_world,
+        "Factory caller did not select the pair mode exactly");
+    require(prep::inline_publication(p,w.inline_publication_return) && !prep::inline_publication(p,w.publication_return) &&
+        !prep::inline_publication(&prep::remastered_500c,w.inline_publication_return) && !prep::inline_publication(p,0),
+        "Path B publication misclassified");
+    require(prep::world_path_a(p,0x20,0x1000) && prep::world_path_a(p,0xFF,0x1000) && !prep::world_path_a(p,0xDF,0x1000) &&
+        !prep::world_path_a(p,0x20,0) && !prep::world_path_a(&prep::remastered_500c,0x20,0x1000),"Path A predicate wrong");
+    require(w.world_handle==0xF0 && w.world==8 && w.scene==0x5440 && w.engine_flags==0x3C && w.scene_flag==0x20,"World field offsets changed");
+    require(w.tick_return<w.factory_return && w.factory_return<w.apply_return && w.construct_return<w.publication_return &&
+        w.publication_return<w.inline_publication_return,"World boundary order changed");
+}
+
 int main() {
     int profile_checks{};
     for(const auto* profile:{&prep::remastered_500c,&prep::remastered_1048522}) {
@@ -508,6 +638,10 @@ int main() {
         test_rejected_scopes_mask_restore_and_unwind();
         profile_checks+=checks.load()-before;
     }
+    fixture_profile=&prep::remastered_1048522;
+    test_world_pair_order_and_ownership();
+    test_world_rejections();
+    test_world_boundaries();
     std::cout << checks.load() << " CPU checks; " << profile_checks << " new profile/scope/installation checks. "
         "Both versions preserve one effects tick, ownership and immediate/deferred order. "
         "Spies did not run Native functions, MinHook, SEH, the game, GPU or Quest.\n";

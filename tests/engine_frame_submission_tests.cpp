@@ -21,6 +21,8 @@ enum class Allocation { normal, null, sentinel };
 Allocation allocation{};
 bool immediate_completion{};
 bool publication_confirmed{true};
+void* expected_auxiliary{};
+void* constructed_auxiliary{};
 int owned_releases{};
 std::string events;
 
@@ -46,7 +48,8 @@ void* __fastcall allocate_command() {
 void* __fastcall construct_command(void* destination, void* raw_frame, void* auxiliary) {
     events += 'C';
     require(destination == &command_storage, "Constructor used a foreign allocation");
-    require(auxiliary == nullptr, "Duplicate command used an unproved auxiliary object");
+    require(auxiliary == expected_auxiliary, "Duplicate command used an unproved auxiliary object");
+    constructed_auxiliary = auxiliary;
     command_frame = static_cast<Frame*>(raw_frame);
     require(!command_frame->destroyed && command_frame->references == 1,
         "Constructor received a dead or unexpectedly retained frame");
@@ -81,6 +84,8 @@ void reset() {
     allocation = Allocation::normal;
     immediate_completion = false;
     publication_confirmed = true;
+    expected_auxiliary = nullptr;
+    constructed_auxiliary = nullptr;
     owned_releases = 0;
     events.clear();
 }
@@ -178,6 +183,33 @@ void test_profile_selection_and_rejection() {
             "Rejected route allocated or mishandled its owned frame");
     }
 }
+// WORLD path A: the duplicate command receives the producer's exact scene;
+// the route never invents one, and no-world routes keep the null argument.
+void test_world_scene_auxiliary() {
+    int scene{};
+    for (bool world : {false, true}) for (bool immediate : {false, true}) {
+        reset();
+        immediate_completion = immediate;
+        expected_auxiliary = world ? &scene : nullptr;
+        Frame frame;
+        auto r = route();
+        r.auxiliary = expected_auxiliary;
+        require(submission::submit_owned_frame(r, &frame, release_owned_frame) ==
+            submission::Result::dispatched, "World/no-world command route rejected");
+        require(constructed_auxiliary == expected_auxiliary && owned_releases == 1 &&
+            events == (immediate ? "ACDFR" : "ACDR"), "Scene argument or ownership order changed");
+        if (!immediate) complete_command();
+        require(frame.destroyed, "Scene route leaked the frame reference");
+    }
+    reset();
+    Frame frame;
+    auto r = route();
+    r.auxiliary = &scene;
+    r.renderer_ready = false;
+    require(submission::submit_owned_frame(r, &frame, release_owned_frame) ==
+        submission::Result::unavailable && events == "R" && constructed_auxiliary == nullptr,
+        "Unavailable world route constructed a command with the scene");
+}
 int main() {
     int profile_checks{};
     for(const auto* profile:{&submission::remastered_500c,&submission::remastered_1048522}) {
@@ -187,6 +219,7 @@ int main() {
         test_unconfirmed_publication();
         test_allocation_rejection();
         test_invalid_owned_frame_contract();
+        test_world_scene_auxiliary();
         const auto before=checks;
         test_profile_selection_and_rejection();
         profile_checks+=checks-before;

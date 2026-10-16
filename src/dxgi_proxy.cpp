@@ -552,10 +552,33 @@ IDxcCompiler3* g_dxc_compiler{};
 std::mutex g_log_mutex{};
 std::once_flag g_init_once{};
 std::atomic<bool> g_legacy_engine_layout_accepted{};
+// True only when the INI opted into the Remastered 1048522 diagnostic route
+// and the executable fingerprint matched. Fixed 4.04 installers stay off.
+std::atomic<bool> g_remastered_experimental_active{};
+// Bounded Remastered NoAA chain diagnostics: sample index when due, else UINT32_MAX.
+uint32_t remastered_noaa_diag_sample(std::atomic<uint32_t>& counter) {
+    if(!g_remastered_experimental_active.load(std::memory_order_acquire))return UINT32_MAX;
+    const auto n=counter.fetch_add(1,std::memory_order_relaxed);return n<16 || n%600==0 ? n:UINT32_MAX;
+}
 // Published only after the legacy preflight. The statically examined 5.00c
 // camera contract does not authorize the rest of the engine hook graph.
 std::atomic<const w3vr::engine_camera::TemporalContract*>
     g_engine_camera_temporal_contract{};
+// Installers that patch hard-coded 4.04 addresses must call this first. It is
+// false before the preflight and on the opt-in Remastered diagnostic route.
+void log_line(const char* format, ...);
+bool legacy_404_fixed_addresses_allowed() {
+    const bool allowed = g_legacy_engine_layout_accepted.load(std::memory_order_acquire) &&
+        g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
+            &w3vr::engine_camera::legacy_404;
+    if (!allowed && g_remastered_experimental_active.load(std::memory_order_acquire)) {
+        static std::atomic<uint32_t> skipped{};
+        if (skipped.fetch_add(1, std::memory_order_relaxed) < 32)
+            log_line("Remastered experimental route skipped a fixed 4.04 installer "
+                "(feature absent on this executable).");
+    }
+    return allowed;
+}
 
 const w3vr::engine_camera_layout::Layout* selected_engine_camera_layout() {
     return w3vr::engine_camera_layout::selected(
@@ -680,6 +703,8 @@ struct Config {
     bool engine_frame_factory_probe{false};
     bool engine_dual_render_probe{false};
     bool engine_dual_render_start{false};
+    // Opt-in diagnostic route for Remastered 5.0.0.1048522. OFF by default.
+    bool engine_remastered_experimental{false};
     bool engine_sync_swap_eyes{false};
     bool engine_menu_state_probe{false};
     bool engine_animation_hmd_frustum{false};
@@ -2002,6 +2027,9 @@ struct StreamlineCaptureSlot {
     bool render_view_valid{};
     bool native_asymmetric_projection{};
     w3vr::modern_eye_pair::Output modern_output{};
+    // Diagnostic only: D3D12 StateBefore of the finished ->PRESENT transition
+    // that recorded this modern copy (0x4 RENDER_TARGET, 0x400 COPY_DEST).
+    uint32_t modern_transition_before{UINT32_MAX};
 };
 // [FIX:CROSS-QUEUE-SCENE-CAPTURE-OWNERSHIP V1368 1/7] Recording a copy is not
 // publication. Preserve its exact slot identity until ExecuteCommandLists can
@@ -2039,6 +2067,16 @@ bool modern_prepared_frame_cancelled(const w3vr::xr_frame_cycle::Payload& frame)
 }
 
 std::atomic<bool> g_modern_noaa_consumer_blocked{};
+void log_line(const char* fmt, ...);
+// Same sticky block as before; also records the FIRST source line that set it.
+void block_modern_noaa_consumer_at(int line) noexcept {
+    static std::atomic<int> first_line{};
+    int expected=0;
+    if(!g_modern_noaa_consumer_blocked.exchange(true,std::memory_order_acq_rel) &&
+        first_line.compare_exchange_strong(expected,line))
+        log_line("Modern NoAA consumer blocked first_site_line=%d",line);
+}
+#define W3VR_BLOCK_MODERN_NOAA_CONSUMER() block_modern_noaa_consumer_at(__LINE__)
 // Process-lifetime POD root. In-flight or failed-signal references are not
 // released by a static destructor in DllMain. This is not an unload barrier.
 struct ModernNoAASourceUse : w3vr::modern_eye_source_use::Use {
@@ -2240,7 +2278,8 @@ bool capture_tagged_backbuffer_output(
     uint32_t source_eye,
     bool source_eye_valid,
     const w3vr::modern_eye_capture::Identity* modern_identity = nullptr,
-    const w3vr::modern_graphics_binding::Snapshot& binding = {});
+    const w3vr::modern_graphics_binding::Snapshot& binding = {},
+    uint32_t modern_transition_before = UINT32_MAX);
 bool modern_noaa_output_requested();
 bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract*);
 bool modern_backbuffer_hooks_accept(const w3vr::modern_graphics_binding::Snapshot&,ID3D12GraphicsCommandList*);
@@ -3385,6 +3424,32 @@ bool initialize_native_asymmetric_pair(uint64_t pair_id) {
     return true;
 }
 
+// Remastered pose pairs render each eye with its own raw OpenXR asymmetric
+// projection (modern_camera_pose::prepare_pair). The legacy writer that marks
+// factory_mask does not exist on that route, so the final submit treated the
+// pair as symmetric, failed the symmetric crop and sent a black frame. Record
+// the exact FOVs the pair was rendered with and mark both eyes as built.
+bool mark_remastered_native_asymmetric_pair(uint64_t pair_id, const XrFovf (&fovs)[2]) {
+    if (pair_id == 0 || pair_id == UINT64_MAX) return false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor descriptor{};
+        if (!w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(fovs[eye], 1, 1, descriptor))
+            return false;
+    }
+    std::scoped_lock slot_lock{g_native_asymmetric_pair_slot_mutex};
+    auto& slot = g_native_asymmetric_pair_slots[pair_id % kNativeAsymmetricPairSlotCount];
+    slot.pair_id.store(UINT64_MAX, std::memory_order_release);
+    slot.generation.store(g_streamline_capture_generation.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    slot.factory_mask.store(0x3, std::memory_order_relaxed);
+    slot.temporal_mask.store(0, std::memory_order_relaxed);
+    slot.dlss_input_mask.store(0, std::memory_order_relaxed);
+    slot.fov[0] = fovs[0];
+    slot.fov[1] = fovs[1];
+    slot.pair_id.store(pair_id, std::memory_order_release);
+    return true;
+}
+
 bool snapshot_native_asymmetric_pair_fov(
     uint64_t pair_id,
     uint32_t eye,
@@ -4206,6 +4271,11 @@ std::atomic<bool> g_stereo_luma_scheduled{};
 std::atomic<bool> g_stereo_luma_logged{};
 uint64_t g_stereo_luma_pair{};
 bool g_stereo_luma_cinema{};
+DXGI_FORMAT g_stereo_luma_format{DXGI_FORMAT_UNKNOWN};
+// Experimental Remastered route only: bounded re-armed samples of the exact
+// accepted eye pair consumed by OpenXR (first pair 30, then n<16 || n%600).
+uint64_t g_stereo_luma_next_pair{30};
+uint32_t g_stereo_luma_samples{};
 ID3D12Resource* g_startup_backbuffer_luma_readback{};
 D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_startup_backbuffer_luma_footprint{};
 uint64_t g_startup_backbuffer_luma_readback_bytes{};
@@ -14832,6 +14902,8 @@ void load_config() {
         g_config.engine_frame_factory_probe = read_ini_bool("engine", "frame_factory_probe", false);
         g_config.engine_dual_render_probe = read_ini_bool("engine", "dual_render_probe", false);
         g_config.engine_dual_render_start = read_ini_bool("engine", "dual_render_start", false);
+        g_config.engine_remastered_experimental = read_ini_bool(
+            "engine", "remastered_experimental", false);
         g_config.engine_sync_swap_eyes = read_ini_bool("engine", "sync_swap_eyes", false);
         g_config.engine_menu_state_probe = read_ini_bool("engine", "menu_state_probe", false);
         g_config.engine_animation_hmd_frustum = read_ini_bool(
@@ -20870,6 +20942,16 @@ take_streamline_capture_submissions(
                     !w3vr::modern_eye_pair::finite(epoch) || epoch!=publication.recording_epoch){
                     // Retain the reservation: unknown ordering cannot prove an
                     // abandoned or retired GPU recording. A real Reset can.
+                    static std::atomic<uint32_t> take_logs{};
+                    const auto n=remastered_noaa_diag_sample(take_logs);
+                    if(n!=UINT32_MAX)
+                        log_line("Remastered NoAA eye source submission held sample=%u eye=%u pair=%llu serial_match=%d command_match=%d "
+                            "epoch_match=%d xr_match=%d",n,publication.eye,static_cast<unsigned long long>(publication.pair_id),
+                            slot.capture_serial==publication.capture_serial?1:0,
+                            slot.modern_output.command==reinterpret_cast<uintptr_t>(command_lists[index])?1:0,
+                            (w3vr::modern_eye_pair::finite(epoch) && epoch==publication.recording_epoch &&
+                                slot.modern_output.recording_epoch==publication.recording_epoch)?1:0,
+                            slot.modern_output.identity.frame.xr==publication.xr_frame?1:0);
                     rejected.push_back(publication);continue;
                 }
                 slot.modern_output.submitted_epoch=epoch;
@@ -20950,6 +21032,20 @@ void publish_streamline_capture_submissions(
                 slot.modern_output.submitted_epoch==publication.recording_epoch &&
                 modern_graphics_current(binding) && slot.modern_output.binding_epoch==binding->epoch);
             const bool publication_ready=consumer_ordered && identity_current && modern_current;
+            if(modern){
+                static std::atomic<uint32_t> publish_logs[2]{};
+                const auto n=remastered_noaa_diag_sample(publish_logs[publication_ready ? 0:1]);
+                if(n!=UINT32_MAX)
+                    log_line("Remastered NoAA eye source publication sample=%u ready=%d eye=%u pair=%llu slot=%u ordered=%d "
+                        "identity_current=%d output_ready=%d xr_current=%d epochs=%d binding=%d producer=%p consumer=%p fence_value=%llu",
+                        n,publication_ready?1:0,publication.eye,static_cast<unsigned long long>(publication.pair_id),publication.slot,
+                        consumer_ordered?1:0,identity_current?1:0,modern_noaa_output_ready(contract)?1:0,
+                        modern_xr_frame_current(publication.xr_frame,publication.generation)?1:0,
+                        (slot.modern_output.recording_epoch==publication.recording_epoch &&
+                            slot.modern_output.submitted_epoch==publication.recording_epoch)?1:0,
+                        (modern_graphics_current(binding) && slot.modern_output.binding_epoch==binding->epoch)?1:0,
+                        producer_queue,ordered_consumer.Get(),static_cast<unsigned long long>(producer_queue_fence_value));
+            }
             if(modern){
                 auto& output=slot.modern_output;
                 output.producer=reinterpret_cast<uintptr_t>(producer_queue);
@@ -21647,7 +21743,7 @@ void execute_source_guarded(ID3D12CommandQueue* queue,UINT count,ID3D12CommandLi
     };
     w3vr::capture_recording::CpuScope cpu{finish};
     auto failed=[&](w3vr::execute_observation::Phase)noexcept{
-        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        W3VR_BLOCK_MODERN_NOAA_CONSUMER();
         std::lock_guard lock{g_streamline_capture_mutex};
         g_modern_backbuffer_sources.quarantine_execute(count,lists);
         for(auto* r=g_modern_backbuffer_sources.head;r;r=r->next){
@@ -25286,7 +25382,7 @@ Mode3HudProducerReceipt::Mode3HudProducerReceipt(
 Mode3HudProducerReceipt::~Mode3HudProducerReceipt()noexcept {
     if(count==0)return;
     auto failed=[&]()noexcept{
-        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        W3VR_BLOCK_MODERN_NOAA_CONSUMER();
         std::lock_guard lock{g_mode3_early_hud_mutex};
         for(uint32_t index=0;index<count;++index){
             const auto& receipt=captures[index];auto& slot=g_mode3_early_hud_slots[receipt.slot];
@@ -29687,13 +29783,42 @@ void barrier_source_body(
     // later publishes existing per-copy tickets/fences for the owned eye ring.
     w3vr::capture_recording::observe([&]{
     EngineFrameTag modern_copy_tag{};
-    if (modern_capture_contract && !g_packed_capture_internal && barriers &&
+    // Diagnostic only: a write->PRESENT transition seen on this thread, with or without an eye label.
+    bool present_transition{};
+    if (modern_capture_contract && barriers && g_remastered_experimental_active.load(std::memory_order_acquire))
+        for (UINT i=0;i<num_barriers && !present_transition;++i)
+            present_transition=barriers[i].Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                barriers[i].Transition.StateAfter==D3D12_RESOURCE_STATE_PRESENT &&
+                (barriers[i].Transition.StateBefore==D3D12_RESOURCE_STATE_RENDER_TARGET ||
+                 barriers[i].Transition.StateBefore==D3D12_RESOURCE_STATE_COPY_DEST);
+    const bool modern_tag_admitted = modern_capture_contract && !g_packed_capture_internal && barriers &&
         command_list_is_recording_endpoint(command_list) &&
         command_list->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT &&
-        snapshot_modern_noaa_capture_tag(modern_copy_tag)) {
+        snapshot_modern_noaa_capture_tag(modern_copy_tag);
+    if (present_transition && !modern_tag_admitted) {
+        static std::atomic<uint32_t> unlabelled_logs{};
+        const auto n=remastered_noaa_diag_sample(unlabelled_logs);
+        if (n!=UINT32_MAX)
+            log_line("Remastered NoAA capture PRESENT transition without eye label sample=%u command=%p internal=%d "
+                "endpoint=%d identity_eye=%d identity_pair=%llu identity_xr_valid=%d tid=%lu present=%llu",
+                n,command_list,g_packed_capture_internal?1:0,command_list_is_recording_endpoint(command_list)?1:0,
+                g_modern_capture_identity.frame.eye,static_cast<unsigned long long>(g_modern_capture_identity.frame.pair),
+                w3vr::xr_frame::valid(g_modern_capture_identity.frame.xr)?1:0,
+                static_cast<unsigned long>(GetCurrentThreadId()),static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+    }
+    if (modern_tag_admitted) {
         auto source_lease=acquire_current_game_backbuffer();
         auto* source=source_lease.resource.Get();
-        if (source && modern_graphics_registry()->owns_child(source_lease.binding,command_list)) {
+        const bool owned=source && modern_graphics_registry()->owns_child(source_lease.binding,command_list);
+        if (!owned) {
+            static std::atomic<uint32_t> source_logs{};
+            const auto n=remastered_noaa_diag_sample(source_logs);
+            if (n!=UINT32_MAX)
+                log_line("Remastered NoAA capture labelled barrier rejected sample=%u reason=%s eye=%d pair=%llu command=%p",
+                    n,source?"command_not_owned_by_binding":"no_current_backbuffer",g_modern_capture_identity.frame.eye,
+                    static_cast<unsigned long long>(g_modern_capture_identity.frame.pair),command_list);
+        }
+        if (owned) {
             const D3D12_RESOURCE_BARRIER* last{};
             for (UINT i=0;i<num_barriers;++i)
                 if (barriers[i].Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
@@ -29701,29 +29826,42 @@ void barrier_source_body(
             const auto description=source->GetDesc();
             const auto capture_identity=g_modern_capture_identity;
             w3vr::modern_eye_capture::Request request{};
-            if (last && modern_xr_frame_current(capture_identity.frame.xr,capture_identity.frame.generation) &&
+            const bool xr_current=last && modern_xr_frame_current(capture_identity.frame.xr,capture_identity.frame.generation);
+            const bool single=description.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                description.MipLevels==1 && description.DepthOrArraySize==1 &&
+                description.Width==source_lease.binding->width && description.Height==source_lease.binding->height;
+            const bool prepared=xr_current &&
                 w3vr::modern_eye_capture::prepare(capture_identity,
                     g_engine_camera_temporal_contract.load(std::memory_order_acquire),
                     g_remastered_core_installed_profile.load(std::memory_order_acquire),
                     g_remastered_core_hooks_ready.load(std::memory_order_acquire),
                     g_streamline_capture_generation.load(std::memory_order_acquire),
                     reinterpret_cast<uintptr_t>(command_list),true,
-                    reinterpret_cast<uintptr_t>(source),true,
-                    description.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                        description.MipLevels==1 && description.DepthOrArraySize==1 &&
-                        description.Width==source_lease.binding->width && description.Height==source_lease.binding->height,
+                    reinterpret_cast<uintptr_t>(source),true,single,
                     {static_cast<uint32_t>(last->Flags),static_cast<uint32_t>(last->Transition.StateBefore),
-                     static_cast<uint32_t>(last->Transition.StateAfter),last->Transition.Subresource},request)) {
-                capture_tagged_backbuffer_output(command_list,source,D3D12_RESOURCE_STATE_PRESENT,
+                     static_cast<uint32_t>(last->Transition.StateAfter),last->Transition.Subresource},request);
+            const bool captured=prepared && capture_tagged_backbuffer_output(command_list,source,D3D12_RESOURCE_STATE_PRESENT,
                     static_cast<uint32_t>(request.eye),request.generation,request.pair,
                     modern_copy_tag.render_view,modern_copy_tag.render_view_valid,
-                    static_cast<uint32_t>(request.eye),true,&capture_identity,source_lease.binding);
+                    static_cast<uint32_t>(request.eye),true,&capture_identity,source_lease.binding,
+                    static_cast<uint32_t>(last->Transition.StateBefore));
+            if (last) {
+                static std::atomic<uint32_t> backbuffer_logs[2]{};
+                const auto n=remastered_noaa_diag_sample(backbuffer_logs[captured ? 0:1]);
+                if (n!=UINT32_MAX)
+                    log_line("Remastered NoAA capture backbuffer barrier sample=%u result=%s eye=%d pair=%llu "
+                        "before=0x%X after=0x%X flags=0x%X sub=0x%X single=%d command=%p tid=%lu present=%llu",
+                        n,captured ? "recorded":!xr_current ? "xr_frame_not_current":!prepared ? "prepare_rejected":"copy_rejected",
+                        capture_identity.frame.eye,static_cast<unsigned long long>(capture_identity.frame.pair),
+                        static_cast<unsigned>(last->Transition.StateBefore),static_cast<unsigned>(last->Transition.StateAfter),
+                        static_cast<unsigned>(last->Flags),last->Transition.Subresource,single?1:0,command_list,
+                        static_cast<unsigned long>(GetCurrentThreadId()),static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
             }
             // Source/chain/device/queue references survive this recording scope.
             // Their GPU use still needs the producer lease before resize/unload.
         }
     }
-    },[]()noexcept{g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);});
+    },[]()noexcept{W3VR_BLOCK_MODERN_NOAA_CONSUMER();});
     if (early_hud_capture_source != nullptr) {
         capture_mode3_early_hud(
             command_list, early_hud_capture_source,
@@ -31730,10 +31868,31 @@ void __fastcall hook_remastered_render_core(void* renderer, void* frame, void* s
             found_label = true;
         }
     }
-    found_label=found_label && (!modern_noaa_output_requested() || modern_xr_frame_current(tag.xr_frame,tag.generation));
+    const bool tag_found=found_label;
+    const bool tag_xr_current=!modern_noaa_output_requested() || modern_xr_frame_current(tag.xr_frame,tag.generation);
+    found_label=found_label && tag_xr_current;
     const w3vr::render_core::FrameLabel label{
         reinterpret_cast<uintptr_t>(frame), tag.generation, tag.pair_id,
         static_cast<int>(tag.eye), tag.render_view_valid, tag.modern_camera_lineage_complete,tag.hmd_pose.tracking.display_time,tag.xr_frame};
+    {
+        // Separate budgets: loading-screen calls (other caller) cannot hide gameplay ones.
+        static std::atomic<uint32_t> core_logs[3]{};
+        const auto n=remastered_noaa_diag_sample(core_logs[!profile || caller!=profile->normal_return ? 2:(tag_found ? 0:1)]);
+        if(n!=UINT32_MAX){
+            const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+            log_line("Remastered NoAA core entry sample=%u caller=0x%llX normal_return=0x%llX frame=%p scene=%p "
+                "dual=%d ready=%d tag=%d xr_current=%d eye=%d pair=%llu tag_gen=%u gen=%u view=%d lineage=%d display_time=%lld accepted=%d",
+                n,static_cast<unsigned long long>(caller),static_cast<unsigned long long>(profile?profile->normal_return:0),frame,scene,
+                g_engine_dual_render_active.load(std::memory_order_acquire)?1:0,
+                w3vr::render_core::ready_for(contract,g_remastered_core_installed_profile.load(std::memory_order_acquire),
+                    g_remastered_core_hooks_ready.load(std::memory_order_acquire))?1:0,
+                tag_found?1:0,tag_xr_current?1:0,tag_found?static_cast<int>(tag.eye):-1,static_cast<unsigned long long>(tag.pair_id),
+                tag.generation,generation,tag.render_view_valid?1:0,tag.modern_camera_lineage_complete?1:0,
+                static_cast<long long>(tag.hmd_pose.tracking.display_time),
+                w3vr::render_core::accepts_label(contract,caller,reinterpret_cast<uintptr_t>(renderer),
+                    reinterpret_cast<uintptr_t>(frame),found_label?&label:nullptr,generation)?1:0);
+        }
+    }
     const RemasteredCoreThreadState labelled{
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
         tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,
@@ -31774,10 +31933,28 @@ void __fastcall hook_remastered_normal_epilogue(void* task) {
         const auto found = g_engine_dual_frame_eyes.find(reinterpret_cast<void*>(record.frame));
         if (found != g_engine_dual_frame_eyes.end()) { tag = found->second; found_label = true; }
     }
-    found_label=found_label && (!modern_noaa_output_requested() || modern_xr_frame_current(tag.xr_frame,tag.generation));
+    const bool tag_found=found_label;
+    const bool tag_xr_current=!modern_noaa_output_requested() || modern_xr_frame_current(tag.xr_frame,tag.generation);
+    found_label=found_label && tag_xr_current;
     const w3vr::render_core::FrameLabel label{record.frame, tag.generation,
         tag.pair_id, static_cast<int>(tag.eye), tag.render_view_valid,
         tag.modern_camera_lineage_complete,tag.hmd_pose.tracking.display_time,tag.xr_frame};
+    {
+        static std::atomic<uint32_t> epilogue_logs[2]{};
+        const auto n=remastered_noaa_diag_sample(epilogue_logs[found_label ? 0:1]);
+        if(n!=UINT32_MAX){
+            const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
+            const bool accepted=found_label && w3vr::render_core::accepts_frame_label(record.renderer,record.frame,&label,generation);
+            const char* reason=!admitted ? "hooks_not_ready":!record_valid ? "task_record":
+                !g_engine_dual_render_active.load(std::memory_order_acquire) ? "dual_inactive":!tag_found ? "no_tag":
+                !tag_xr_current ? "xr_frame_not_current":!accepted ? "label_rejected":"admitted";
+            log_line("Remastered NoAA epilogue capture admission sample=%u reason=%s task=%p frame=0x%llX eye=%d pair=%llu "
+                "tag_gen=%u gen=%u view=%d lineage=%d display_time=%lld",
+                n,reason,task,static_cast<unsigned long long>(record.frame),tag_found?static_cast<int>(tag.eye):-1,
+                static_cast<unsigned long long>(tag.pair_id),tag.generation,generation,tag.render_view_valid?1:0,
+                tag.modern_camera_lineage_complete?1:0,static_cast<long long>(tag.hmd_pose.tracking.display_time));
+        }
+    }
     const RemasteredCoreThreadState labelled{
         static_cast<int>(tag.eye), tag.generation, tag.pair_id, tag.render_view,
         tag.render_view_valid, true, tag.pixel_projection, tag.hmd_pose, nullptr,{},
@@ -32290,11 +32467,14 @@ void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data
 
 bool remastered_render_entry_matches(const uint8_t* target,
     std::span<const uint8_t> expected) {
-    if (!target || expected.size() != 16) return false;
-    std::array<uint8_t, 16> prefix{};
-    __try { std::memcpy(prefix.data(), target, prefix.size()); }
+    // Profiles use complete-instruction prefixes of 13 to 20 bytes. The old
+    // fixed 16-byte rule rejected every other length, even with exact code.
+    constexpr size_t kMaxPrefix = 32;
+    if (!target || expected.size() < 5 || expected.size() > kMaxPrefix) return false;
+    std::array<uint8_t, kMaxPrefix> prefix{};
+    __try { std::memcpy(prefix.data(), target, expected.size()); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return std::equal(prefix.begin(), prefix.end(), expected.begin());
+    return std::equal(expected.begin(), expected.end(), prefix.begin());
 }
 bool remastered_core_ready_for(const w3vr::engine_camera::TemporalContract* contract) {
     return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) &&
@@ -32352,25 +32532,43 @@ bool modern_noaa_output_ready(const w3vr::engine_camera::TemporalContract* contr
 }
 ModernNoAASourceUse* acquire_modern_noaa_sources(w3vr::modern_eye_pair::Target target) {
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
-    if(!modern_noaa_output_ready(contract))return nullptr;
-    auto binding=modern_graphics_snapshot();if(!binding)return nullptr;
+    bool locked{}; // Packed receipts are read for diagnostics only under their mutex.
+    const auto refuse=[&](const char* reason)->ModernNoAASourceUse*{
+        static std::atomic<uint32_t> refuse_logs{};
+        const auto n=remastered_noaa_diag_sample(refuse_logs);
+        const auto packed=locked ? g_modern_packed_outputs[0].identity.frame:w3vr::render_core::FrameLabel{};
+        if(n!=UINT32_MAX)
+            log_line("Remastered NoAA sources refused sample=%u reason=%s target_time=%lld target_prepared=%d packed_valid=%d "
+                "packed_pair=%llu packed_time=%lld xr_match=%d accepted_pair=%llu consumer_blocked=%d present=%llu",
+                n,reason,static_cast<long long>(target.display_time),target.prepared?1:0,locked&&g_packed_present_cache_valid?1:0,
+                static_cast<unsigned long long>(packed.pair),static_cast<long long>(packed.display_time),
+                packed.xr==target.xr?1:0,static_cast<unsigned long long>(locked?g_packed_accepted_pair_id:0),
+                g_modern_noaa_consumer_blocked.load(std::memory_order_acquire)?1:0,
+                static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+        return nullptr;
+    };
+    if(!modern_noaa_output_ready(contract))return refuse("output_not_ready");
+    auto binding=modern_graphics_snapshot();if(!binding)return refuse("no_graphics_binding");
     auto use=std::make_unique<ModernNoAASourceUse>();use->binding=binding;
     use->xr_binding=modern_xr_session_graphics(binding);
-    if(!use->xr_binding || !modern_xr_frame_current(target.xr,
-        g_streamline_capture_generation.load(std::memory_order_acquire)))return nullptr;
-    std::scoped_lock lock{g_streamline_capture_mutex};
+    if(!use->xr_binding)return refuse("no_xr_binding");
+    if(!modern_xr_frame_current(target.xr,
+        g_streamline_capture_generation.load(std::memory_order_acquire)))return refuse("xr_frame_not_current");
+    std::scoped_lock lock{g_streamline_capture_mutex};locked=true;
     collect_modern_noaa_source_uses();
     const auto* profile=g_remastered_core_installed_profile.load(std::memory_order_acquire);
     const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
-    if(!g_packed_present_cache_valid || !modern_graphics_current(binding) || !g_xr_fence ||
-        !modern_graphics_registry()->owns_child(binding,g_xr_fence) ||
-        !w3vr::modern_eye_pair::accepts(g_modern_packed_outputs,contract,profile,true,generation,
-            reinterpret_cast<uintptr_t>(binding->queue.Get()),0,binding->epoch))return nullptr;
-    if(!modern_prepared_frame_allows({target.display_time,g_modern_packed_outputs[0].identity.frame.pair,generation,target.xr}))return nullptr;
+    if(!g_packed_present_cache_valid)return refuse("no_accepted_pair");
+    if(!modern_graphics_current(binding) || !g_xr_fence ||
+        !modern_graphics_registry()->owns_child(binding,g_xr_fence))return refuse("graphics_or_xr_fence");
+    if(!w3vr::modern_eye_pair::accepts(g_modern_packed_outputs,contract,profile,true,generation,
+            reinterpret_cast<uintptr_t>(binding->queue.Get()),0,binding->epoch))return refuse("pair_outputs_rejected");
+    if(!modern_prepared_frame_allows({target.display_time,g_modern_packed_outputs[0].identity.frame.pair,generation,target.xr}))
+        return refuse("prepared_frame_not_dispatched_for_pair");
     use->queue=binding->queue;use->submission_fence=g_xr_fence;use->fence=use->submission_fence;
     for(uint32_t eye=0;eye<2;++eye){
         if(g_modern_packed_outputs[eye].texture!=reinterpret_cast<uintptr_t>(g_packed_present_cache[eye]) ||
-            !g_packed_present_cache_view_valid[eye])return nullptr;
+            !g_packed_present_cache_view_valid[eye])return refuse("cache_texture_mismatch");
         use->textures[eye]=g_packed_present_cache[eye];
         use->producer_fences[eye]=reinterpret_cast<ID3D12Fence*>(g_modern_packed_outputs[eye].fence);
         use->producers[eye]=reinterpret_cast<ID3D12CommandQueue*>(g_modern_packed_outputs[eye].producer);
@@ -32379,7 +32577,8 @@ ModernNoAASourceUse* acquire_modern_noaa_sources(w3vr::modern_eye_pair::Target t
     use->native_asymmetric=g_packed_present_cache_native_asymmetric;
     if(!modern_noaa_output_ready(contract) ||
         !g_modern_output_consumption.begin_for_frame(g_modern_packed_outputs,contract,profile,true,generation,
-            reinterpret_cast<uintptr_t>(use->queue.Get()),binding->epoch,{true,true,true,false,false,false},target,use->claim))return nullptr;
+            reinterpret_cast<uintptr_t>(use->queue.Get()),binding->epoch,{true,true,true,false,false,false},target,use->claim))
+        return refuse(w3vr::modern_eye_pair::matches_target(g_modern_packed_outputs,target) ? "consumption_refused":"pair_not_for_target");
     return static_cast<ModernNoAASourceUse*>(g_modern_noaa_source_store.adopt(std::move(use)));
 }
 bool modern_noaa_sources_current(const ModernNoAASourceUse* use,w3vr::modern_eye_pair::Target target) {
@@ -32825,6 +33024,8 @@ void __fastcall hook_engine_dlss_command_emit(
 }
 
 void install_engine_dlss_command_emit_hook() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     if (!dlss_sequential_mode_active() ||
         g_engine_dlss_command_emit != nullptr) {
         return;
@@ -33332,6 +33533,8 @@ void install_engine_upscaler_pipeline_hook() {
 }
 
 void install_engine_dlss_command_route_hook() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     // [FIX:STRICT-DLSS-SMOKE-EXACT-EYE V1231 2/2] This hook is functional:
     // it restores the exact emitter eye/pair while REDengine executes the
     // deferred DLSS command. ngx_trace controls only the bounded log inside
@@ -33637,6 +33840,8 @@ void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
 }
 
 void install_engine_gameplay_entry_probe() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     if ((!g_config.engine_gameplay_entry_probe &&
             !g_engine_dual_render_active.load() &&
             !clean_mono_transport_active()) ||
@@ -33674,6 +33879,8 @@ void __fastcall hook_engine_scene_enqueue(void* render_context, void* frame_data
 }
 
 void install_engine_scene_enqueue_probe() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     if (!g_config.engine_scene_enqueue_probe || g_engine_scene_enqueue != nullptr) {
         return;
     }
@@ -33885,6 +34092,8 @@ void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time)
 }
 
 void install_engine_render_scene_setup_probe() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     if (g_engine_render_scene_setup != nullptr) {
         return;
     }
@@ -34071,6 +34280,8 @@ void __fastcall hook_engine_shadow_cascade_build(
 }
 
 void install_engine_shadow_cascade_build_hook() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     if (g_engine_shadow_cascade_build != nullptr) {
         return;
     }
@@ -34879,6 +35090,8 @@ int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) 
 }
 
 void install_engine_animated_component_visibility_hook() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     if (!g_config.engine_animated_component_visible ||
         g_engine_frustum_aabb_test != nullptr) {
         return;
@@ -41011,6 +41224,8 @@ void install_engine_camera_direction_hook() {
 
 
 void initialize_engine_player_pose_helpers() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     constexpr uintptr_t kTransformToEulerRva = 0x02C9C30;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     g_engine_transform_to_euler = module != nullptr
@@ -41404,6 +41619,8 @@ void __fastcall hook_engine_world_vector_to_view_ratio(
 }
 
 void install_engine_world_vector_to_view_ratio_hook() {
+    // Hard-coded 4.04 addresses: never patch/read them on another executable.
+    if (!legacy_404_fixed_addresses_allowed()) return;
     if (!g_config.hmd_freelook ||
         g_engine_world_vector_to_view_ratio != nullptr) {
         return;
@@ -42235,7 +42452,7 @@ bool install_remastered_queue_lifecycle_hooks() {
     namespace life=w3vr::modern_queue_lifecycle;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     const auto* profile=life::selected(contract);
-    if(!profile)return false;
+    if(!profile){log_line("Remastered queue lifecycle install skipped: no profile");return false;}
     if(g_remastered_queue_lifecycle_hooks_ready.load(std::memory_order_acquire))return remastered_queue_ready_for(contract);
     if(g_remastered_queue_lifecycle_install_attempted.exchange(true,std::memory_order_acq_rel))return false;
     auto* module=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
@@ -42246,7 +42463,9 @@ bool install_remastered_queue_lifecycle_hooks() {
         {reinterpret_cast<void*>(&hook_remastered_queue_stop),reinterpret_cast<void**>(&g_remastered_queue_stop)},
         {reinterpret_cast<void*>(&hook_remastered_queue_destroy),reinterpret_cast<void**>(&g_remastered_queue_destroy)}}};
     for(const auto& target:profile->hooks)
-        if(!remastered_render_entry_matches(module+target.rva,target.prefix))return false;
+        if(!remastered_render_entry_matches(module+target.rva,target.prefix)){
+            log_line("Remastered queue lifecycle install refused: code prefix mismatch RVA=0x%llX",
+                static_cast<unsigned long long>(target.rva));return false;}
     const auto current=[contract](){return g_engine_camera_temporal_contract.load(std::memory_order_acquire)==contract;};
     if(!current())return false;
     g_remastered_queue_installed_profile.store(profile,std::memory_order_release);
@@ -42269,11 +42488,24 @@ struct RemasteredPreparationContext {
     w3vr::modern_queue_lifecycle::Snapshot queue_observation{};
     void* world_handle{};
     void* world_receiver{};
+    // Slot-10 callback of world_receiver. Normal gameplay has a NON-empty one.
+    uintptr_t world_callback{};
     void* engine{};
     void* effects_state{};
     void* effects_world{};
+    // WORLD producer only (zero otherwise): [[game+F0]+8], its scene +5440
+    // (path A command auxiliary) and the engine+3C flag byte selecting path A.
+    bool world{};
+    void* world_object{};
+    void* world_scene{};
+    uint8_t engine_flags{};
     bool operator==(const RemasteredPreparationContext&) const = default;
 };
+// Bounded diagnostics for the WORLD route: first 16, then every 600th.
+bool remastered_world_log_due(std::atomic<uint32_t>& counter) {
+    const auto n=counter.fetch_add(1,std::memory_order_relaxed);
+    return n<16 || n%600==0;
+}
 
 bool read_remastered_command_queue(uintptr_t module,const w3vr::engine_camera::TemporalContract* contract,
     w3vr::modern_command_queue::Identity& result) {
@@ -42306,7 +42538,7 @@ bool read_remastered_command_queue(uintptr_t module,const w3vr::engine_camera::T
     result=first;return true;
 }
 bool remastered_primary_command_matches(const w3vr::modern_command_queue::Identity& queue,
-    void* command,void* frame) {
+    void* command,void* frame,void* auxiliary=nullptr) {
     namespace cq=w3vr::modern_command_queue;
     const auto address=reinterpret_cast<uintptr_t>(command);
     uintptr_t end{};
@@ -42320,7 +42552,7 @@ bool remastered_primary_command_matches(const w3vr::modern_command_queue::Identi
         std::memcpy(repeat_payload.data(),command,repeat_payload.size());
     } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
     return header==repeat_header && payload==repeat_payload && cq::primary_command_matches(queue,
-        address,reinterpret_cast<uintptr_t>(frame),header,payload);
+        address,reinterpret_cast<uintptr_t>(frame),header,payload,reinterpret_cast<uintptr_t>(auxiliary));
 }
 
 // The native producer supplies CGame as its first argument. In particular,
@@ -42335,39 +42567,94 @@ bool remastered_preparation_ready_for(const w3vr::engine_camera::TemporalContrac
             g_remastered_queue_installed_profile.load(std::memory_order_acquire),
             g_remastered_preparation_hooks_ready.load(std::memory_order_acquire),remastered_queue_ready_for(contract));
 }
-bool read_remastered_preparation_context(uintptr_t module,
-    const w3vr::engine_camera::TemporalContract* contract,void* game,
-    RemasteredPreparationContext& context) {
-    context={};
-    const auto* profile=w3vr::frame_preparation::selected(contract);
-    if(module==0 || game==nullptr || !profile || !remastered_preparation_ready_for(contract))return false;
-    RemasteredPreparationContext candidate{};candidate.profile=profile;
+// Diagnostic only: names the FIRST failed condition of a context read so a
+// real game session shows where the Remastered route stops. Bounded logging.
+enum class RemasteredContextReject : uint32_t {
+    arguments,world_handle,world_callback,engine_null,engine_table,shared_callback,
+    ready_changed,command_queue,queue_profile,queue_snapshot,exception,world_object,count
+};
+void note_remastered_context_reject(RemasteredContextReject reason) {
+    static std::array<std::atomic<uint32_t>,static_cast<size_t>(RemasteredContextReject::count)> counts{};
+    static constexpr const char* names[]{"arguments","world_handle","world_callback","engine_null",
+        "engine_table","shared_callback","ready_changed","command_queue","queue_profile","queue_snapshot","exception",
+        "world_object"};
+    static_assert(std::size(names)==static_cast<size_t>(RemasteredContextReject::count));
+    const auto index=static_cast<size_t>(reason);
+    const auto n=counts[index].fetch_add(1,std::memory_order_relaxed)+1;
+    if(n<=8 || n%600==0)
+        log_line("Remastered preparation context rejected reason=%s count=%u present=%llu",
+            names[index],n,static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+}
+// Kept separate from the C++ caller: __try cannot share a frame with objects
+// that need unwinding. Returns the first failed condition, or count on success.
+RemasteredContextReject read_remastered_preparation_fields(uintptr_t module,
+    const w3vr::engine_camera::TemporalContract* contract,const w3vr::frame_preparation::Profile* profile,
+    void* game,RemasteredPreparationContext& candidate,bool world) {
+    using R=RemasteredContextReject;
     __try {
+        if(world){
+            // Same loads as 0227DC90..0227DCB2: R14=[[game+F0]+8], scene=[R14+5440].
+            const auto& w=profile->world;void* handle{};
+            memcpy(&handle,static_cast<const uint8_t*>(game)+w.world_handle,sizeof(handle));
+            if(!handle)return R::world_object;
+            memcpy(&candidate.world_object,static_cast<const uint8_t*>(handle)+w.world,sizeof(candidate.world_object));
+            if(!candidate.world_object || (reinterpret_cast<uintptr_t>(candidate.world_object)&7))return R::world_object;
+            memcpy(&candidate.world_scene,static_cast<const uint8_t*>(candidate.world_object)+w.scene,sizeof(candidate.world_scene));
+            candidate.world=true;
+        }
         memcpy(&candidate.world_handle,static_cast<const uint8_t*>(game)+0x100,sizeof(candidate.world_handle));
-        if(!candidate.world_handle)return false;
+        if(!candidate.world_handle)return R::world_handle;
         memcpy(&candidate.world_receiver,static_cast<const uint8_t*>(candidate.world_handle)+8,sizeof(candidate.world_receiver));
         if(candidate.world_receiver){
             const auto* table=*reinterpret_cast<const uintptr_t* const*>(candidate.world_receiver);
-            const auto callback=table[10];
-            // Only the independently examined exact RET 0 leaf is accepted.
-            // Its code checks are not proof of receiver ownership or lifetime.
-            if(!w3vr::frame_preparation::empty_callback(profile,module,callback,
-                std::span<const uint8_t>{reinterpret_cast<const uint8_t*>(callback),3}))return false;
+            candidate.world_callback=table[10];
+            // The native producer calls this callback exactly ONCE, with the
+            // primary frame, before engine prepare. The port never calls it
+            // again for the duplicate and copies nothing it appends: the
+            // duplicate is built from a descriptor snapshot taken before the
+            // primary factory. The working 4.04 stereo route also builds its
+            // duplicate without this per-viewport player preparation. The old
+            // RET-0-only rule rejected every normal gameplay frame. Only an
+            // address inside the executable image is required now; a change
+            // of receiver or callback still cancels the pair (context compare).
+            const auto* image=w3vr::factory_clock::selected(contract);
+            if(!image || candidate.world_callback<module ||
+                candidate.world_callback>=module+image->image_bytes)return R::world_callback;
         }
         memcpy(&candidate.engine,reinterpret_cast<const void*>(module+profile->engine_global),sizeof(candidate.engine));
         memcpy(&candidate.effects_state,reinterpret_cast<const void*>(module+profile->effects_state_global),sizeof(candidate.effects_state));
         memcpy(&candidate.effects_world,reinterpret_cast<const void*>(module+profile->effects_world_global),sizeof(candidate.effects_world));
-        if(!candidate.engine)return false;
+        if(!candidate.engine)return R::engine_null;
         const auto* table=*reinterpret_cast<const uintptr_t* const*>(candidate.engine);
-        if(reinterpret_cast<uintptr_t>(table)!=module+profile->engine_vtable || table[13]!=module+profile->hooks[1].rva)return false;
+        if(reinterpret_cast<uintptr_t>(table)!=module+profile->engine_vtable || table[13]!=module+profile->hooks[1].rva)
+            return R::engine_table;
         void* shared_callback{};
         memcpy(&shared_callback,static_cast<const uint8_t*>(candidate.engine)+0x40,sizeof(shared_callback));
-        if(shared_callback!=nullptr || !remastered_preparation_ready_for(contract) ||
-            !read_remastered_command_queue(module,contract,candidate.command_queue) ||
-            candidate.command_queue.profile!=profile->lifecycle->queue ||
-            !g_remastered_queue_observations.snapshot(candidate.command_queue,candidate.queue_observation) ||
-            !remastered_preparation_ready_for(contract))return false;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+        // Engine+40 is called only by engine prepare, which the WORLD branch
+        // never reaches; there the flag byte that selects path A is recorded.
+        if(world)memcpy(&candidate.engine_flags,static_cast<const uint8_t*>(candidate.engine)+profile->world.engine_flags,sizeof(candidate.engine_flags));
+        else if(shared_callback!=nullptr)return R::shared_callback;
+        if(!remastered_preparation_ready_for(contract))return R::ready_changed;
+        if(!read_remastered_command_queue(module,contract,candidate.command_queue))return R::command_queue;
+        if(candidate.command_queue.profile!=profile->lifecycle->queue)return R::queue_profile;
+        if(!g_remastered_queue_observations.snapshot(candidate.command_queue,candidate.queue_observation))
+            return R::queue_snapshot;
+        if(!remastered_preparation_ready_for(contract))return R::ready_changed;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return R::exception;}
+    return R::count;
+}
+bool read_remastered_preparation_context(uintptr_t module,
+    const w3vr::engine_camera::TemporalContract* contract,void* game,
+    RemasteredPreparationContext& context,bool world=false) {
+    using R=RemasteredContextReject;
+    context={};
+    const auto* profile=w3vr::frame_preparation::selected(contract);
+    if(module==0 || game==nullptr || !profile || !remastered_preparation_ready_for(contract) ||
+        (world && !w3vr::frame_preparation::world_examined(profile))){
+        note_remastered_context_reject(R::arguments);return false;}
+    RemasteredPreparationContext candidate{};candidate.profile=profile;
+    const auto failed=read_remastered_preparation_fields(module,contract,profile,game,candidate,world);
+    if(failed!=R::count){note_remastered_context_reject(failed);return false;}
     context=candidate;return true;
 }
 
@@ -42401,6 +42688,10 @@ struct RemasteredProducerScope {
     RemasteredPreparationContext context{};
     uint64_t pair_id{},present{};
     bool factory_reserved{};
+    // WORLD producer: chosen ONLY by the factory's immediate caller 022C1A28.
+    // Effects ticks at 022C06C0 precede that factory and are counted here.
+    bool world{};
+    uint32_t world_ticks{};
     w3vr::frame_preparation::PendingPair pair{};
     w3vr::publication_pair::Pair publication;
     void* primary_frame{};void* duplicate_frame{};
@@ -42426,8 +42717,11 @@ void invalidate_remastered_prepared_pair(void* owner, void* primary, void* dupli
         g_engine_dual_frame_eyes.erase(duplicate);
     }
     g_engine_pair_retry_present.store(scope->present + 2, std::memory_order_relaxed);
-    log_line("Remastered pair admission cancelled pair=%llu; CPU/GPU work not reclaimed",
-        static_cast<unsigned long long>(scope->pair_id));
+    static std::atomic<uint32_t> cancel_logs{};
+    const auto cancel_n=cancel_logs.fetch_add(1,std::memory_order_relaxed);
+    if(cancel_n<16 || cancel_n%600==0)
+        log_line("Remastered pair admission cancelled pair=%llu sample=%u; CPU/GPU work not reclaimed",
+            static_cast<unsigned long long>(scope->pair_id),cancel_n);
 }
 
 bool remastered_scope_current(const RemasteredProducerScope* scope,
@@ -42496,12 +42790,25 @@ bool begin_remastered_temporal_source(uintptr_t caller,void* history,float time,
         // Descriptor remains zero. The real factory must bind it later.
     }else{
         w3vr::native_caller_context::Snapshot root{};
-        if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
-            module+fc::current.fragment,24},root) || root.rbp<0x80)return false;
+        auto site=fc::CallSite::descriptor_constructor;auto anchor=fc::descriptor_constructor_return;
+        if(!w3vr::native_caller_context::capture({module+anchor,module,module+fc::current.fragment,24},root)){
+            // WORLD producer: 0227D8F7 game vt[0x170] -> 0227F7C0 -> 022BC5E0.
+            // Fallback only while no earlier source (e.g. the world-tick
+            // producer update) was observed; a second site would revoke it.
+            site=fc::CallSite::world_descriptor_constructor;anchor=fc::current.world.descriptor_anchor;
+            if(producer->temporal_source.attempted() ||
+                !w3vr::native_caller_context::capture({module+anchor,module,module+fc::current.world.fragment,24},root))return false;
+        }
+        if(root.rbp<0x80)return false;
         c.descriptor=root.rbp-0x80;
-        if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,c.descriptor,
-            ticket.clock,fc::CallSite::descriptor_constructor) ||
-            ticket.clock.borrowed_caller().rdi!=c.owner || !ticket.clock.sample(c.thread,c.clock))return false;
+        fc::windows::ObserveStage stage{};
+        if(!fc::windows::observe(contract,module,module+anchor,c.descriptor,ticket.clock,site,&stage) ||
+            ticket.clock.borrowed_caller().rdi!=c.owner || !ticket.clock.sample(c.thread,c.clock)){
+            if(fc::world_site(site)){static std::atomic<uint32_t> logs{};
+                if(remastered_world_log_due(logs))log_line("Remastered world temporal source rejected stage=%d present=%llu",
+                    static_cast<int>(stage),static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));}
+            return false;
+        }
     }
     c.history=reinterpret_cast<uintptr_t>(history);c.position=reinterpret_cast<uintptr_t>(position);
     c.rotation=reinterpret_cast<uintptr_t>(rotation);c.time=time;c.fov=fov;c.aspect=aspect;
@@ -42583,12 +42890,17 @@ extern "C" void w3vr_temporal_leaf_after(w3vr::temporal_leaf::Frame* frame) {
         if(!fc::windows::read_owner(fc::selected(contract),module,c.owner,owner_clock,c.clock))return;
     }else{
         w3vr::native_caller_context::Snapshot root{};
-        if(!w3vr::native_caller_context::capture({module+fc::descriptor_constructor_return,module,
-            module+fc::current.fragment,24},root) || root.rbp<0x80)return;
+        auto site=fc::CallSite::descriptor_constructor;auto anchor=fc::descriptor_constructor_return;
+        if(!w3vr::native_caller_context::capture({module+anchor,module,module+fc::current.fragment,24},root)){
+            // WORLD producer fallback, only before any other source observation.
+            site=fc::CallSite::world_descriptor_constructor;anchor=fc::current.world.descriptor_anchor;
+            if(producer->temporal_source.attempted() ||
+                !w3vr::native_caller_context::capture({module+anchor,module,module+fc::current.world.fragment,24},root))return;
+        }
+        if(root.rbp<0x80)return;
         c.descriptor=root.rbp-0x80;
-        if(!fc::windows::observe(contract,module,module+fc::descriptor_constructor_return,c.descriptor,
-            clock,fc::CallSite::descriptor_constructor) || clock.borrowed_caller().rdi!=c.owner ||
-            !clock.sample(c.thread,c.clock))return;
+        if(!fc::windows::observe(contract,module,module+anchor,c.descriptor,clock,site) ||
+            clock.borrowed_caller().rdi!=c.owner || !clock.sample(c.thread,c.clock))return;
     }
     w3vr::engine_camera::TemporalRecord canonical{},copied{};uintptr_t repeated{};
     const bool route=read_normal_reset_route(c.owner,module,c.history,c.director,c.site) &&
@@ -42664,7 +42976,7 @@ void* allocate_remastered_command_in_captured_queue() {
     const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     RemasteredPreparationContext current{};
     if(!remastered_scope_current(scope,contract) ||
-        !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context)return nullptr;
+        !read_remastered_preparation_context(module,contract,scope->game,current,scope->world) || current!=scope->context)return nullptr;
     const auto* profile=cq::selected(contract);
     if(!profile || profile!=scope->context.command_queue.profile || profile!=scope->profile->lifecycle->queue)return nullptr;
     uintptr_t entry{},end{};
@@ -42696,14 +43008,14 @@ bool __fastcall publish_remastered_captured_command(void* command,void* frame){
     const auto* scope=g_remastered_producer_scope;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     auto reject=[](){
-        g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+        W3VR_BLOCK_MODERN_NOAA_CONSUMER();
         g_remastered_preparation_hooks_ready.store(false,std::memory_order_release);
         return false; // Close admission; retain installed originals, no retry/unload.
     };
     RemasteredPreparationContext current{};
     if(!remastered_scope_current(scope,contract) ||
-        !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context ||
-        !remastered_primary_command_matches(current.command_queue,command,frame))return reject();
+        !read_remastered_preparation_context(module,contract,scope->game,current,scope->world) || current!=scope->context ||
+        !remastered_primary_command_matches(current.command_queue,command,frame,scope->world ? scope->context.world_scene : nullptr))return reject();
     const auto* profile=scope->profile->submission;
     if(!remastered_scene_publication_code_matches(module,profile) || !remastered_scope_current(scope,contract))return reject();
     if(!w3vr_scene_publication_original)return reject();
@@ -42749,7 +43061,7 @@ void __fastcall hook_remastered_engine_prepare(void* engine,void* frame) {
     if(binding.admitted()){
         if(!remastered_scope_current(scope,contract)){scope->pair.cancel();return;}
         RemasteredPreparationContext current{};
-        const bool matched=read_remastered_preparation_context(module,contract,scope->game,current) &&
+        const bool matched=read_remastered_preparation_context(module,contract,scope->game,current,scope->world) &&
             current==scope->context && engine==current.engine;
         scope->pair.observe_engine(scope->profile,frame,engine,g_remastered_engine_prepare,matched);
     }
@@ -42760,15 +43072,36 @@ void __fastcall hook_remastered_effects_tick(void* first_argument,float delta) {
     auto* scope=g_remastered_producer_scope;
     const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
-    const bool admitted=remastered_scope_current(scope,contract) && scope->pair.pending() &&
-        prep::allows(scope->profile,prep::Boundary::tick,caller);
+    const bool current_scope=remastered_scope_current(scope,contract);
+    // WORLD: the tick at 022C06C0 runs inside world tick 022BEA80, BEFORE the
+    // factory. Count it in the producer scope; arm() receives that count.
+    const bool world_tick=current_scope && prep::allows(scope->profile,prep::Boundary::tick,caller,prep::Mode::world);
+    const bool admitted=current_scope && (world_tick ||
+        (scope->pair.pending() && prep::allows(scope->profile,prep::Boundary::tick,caller)));
     prep::ScopedProducer binding(g_remastered_producer_scope,scope,admitted);
     // Preserve RCX and the float argument without inventing a receiver meaning.
     g_remastered_effects_tick(first_argument,delta);
+    if(binding.admitted() && world_tick){
+        static std::atomic<uint32_t> world_tick_logs{};
+        if(!scope->pair.pending() && !scope->factory_reserved){
+            ++scope->world_ticks;
+            if(remastered_world_log_due(world_tick_logs))
+                log_line("Remastered world effects tick recorded before factory count=%u present=%llu",
+                    scope->world_ticks,static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+        }else{
+            // Order violation: a tick after the world factory poisons the pair.
+            if(remastered_world_log_due(world_tick_logs))
+                log_line("Remastered world effects tick AFTER factory pending=%d pair=%llu; pair poisoned",
+                    scope->pair.pending()?1:0,static_cast<unsigned long long>(scope->pair_id));
+            ++scope->world_ticks;
+            scope->pair.observe_effects_tick(scope->profile);
+        }
+        return;
+    }
     if(binding.admitted()){
         RemasteredPreparationContext current{};
         if(!remastered_scope_current(scope,contract) ||
-            !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context){scope->pair.cancel();return;}
+            !read_remastered_preparation_context(module,contract,scope->game,current,scope->world) || current!=scope->context){scope->pair.cancel();return;}
         scope->pair.observe_effects_tick(scope->profile);
     }
 }
@@ -42779,14 +43112,29 @@ void __fastcall hook_remastered_effects_apply(void* first_argument,void* frame) 
     const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
     const bool admitted=remastered_scope_current(scope,contract) && scope->pair.accepts(frame) &&
-        prep::allows(scope->profile,prep::Boundary::apply,caller);
+        prep::allows(scope->profile,prep::Boundary::apply,caller,scope->pair.mode());
     prep::ScopedProducer binding(g_remastered_producer_scope,scope,admitted);
     g_remastered_effects_apply(first_argument,frame);
     if(binding.admitted()){
         RemasteredPreparationContext current{};
+        const bool world=scope->pair.world();
+        static std::atomic<uint32_t> world_apply_logs{};
         if(!remastered_scope_current(scope,contract) ||
-            !read_remastered_preparation_context(module,contract,scope->game,current) || current!=scope->context){scope->pair.cancel();return;}
+            !read_remastered_preparation_context(module,contract,scope->game,current,scope->world) || current!=scope->context){
+            if(world && remastered_world_log_due(world_apply_logs))
+                log_line("Remastered world effects apply: context changed; pair=%llu cancelled",static_cast<unsigned long long>(scope->pair_id));
+            scope->pair.cancel();return;}
         scope->pair.observe_effects(scope->profile,frame,first_argument,g_remastered_effects_apply);
+        if(world && remastered_world_log_due(world_apply_logs))
+            log_line("Remastered world effects apply observed pair=%llu accepted=%d reason=%s",
+                static_cast<unsigned long long>(scope->pair_id),scope->pair.effects_seen()?1:0,
+                scope->pair.reason()?scope->pair.reason():"none");
+    }else if(remastered_scope_current(scope,contract) && scope->pair.world() && scope->pair.pending() &&
+        prep::allows(scope->profile,prep::Boundary::apply,caller,prep::Mode::world)){
+        static std::atomic<uint32_t> foreign_apply_logs{};
+        if(remastered_world_log_due(foreign_apply_logs))
+            log_line("Remastered world effects apply for a different frame=%p ignored pair=%llu",frame,
+                static_cast<unsigned long long>(scope->pair_id));
     }
 }
 void* __fastcall hook_remastered_command_construct(void* command,void* frame,void* auxiliary) {
@@ -42795,23 +43143,41 @@ void* __fastcall hook_remastered_command_construct(void* command,void* frame,voi
     auto* scope=g_remastered_producer_scope;
     const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-module;
-    const bool admitted=remastered_scope_current(scope,contract) && auxiliary==nullptr &&
-        scope->pair.accepts(frame) && prep::allows(scope->profile,prep::Boundary::construct,caller);
+    const bool current_scope=remastered_scope_current(scope,contract);
+    // WORLD path A passes the borrowed scene [world+5440]; no-world passes null.
+    const bool world=current_scope && scope->pair.world();
+    void* expected_auxiliary=world ? scope->context.world_scene : nullptr;
+    const bool boundary=current_scope && prep::allows(scope->profile,prep::Boundary::construct,caller,scope->pair.mode());
+    const bool admitted=current_scope && (!world || expected_auxiliary!=nullptr) && auxiliary==expected_auxiliary &&
+        scope->pair.accepts(frame) && boundary;
+    static std::atomic<uint32_t> world_construct_logs{};
+    if(world && !admitted && scope->pair.pending() && boundary && remastered_world_log_due(world_construct_logs))
+        log_line("Remastered world construct rejected pair=%llu frame_match=%d auxiliary=%p expected=%p",
+            static_cast<unsigned long long>(scope->pair_id),scope->pair.accepts(frame)?1:0,auxiliary,expected_auxiliary);
     prep::ScopedProducer binding(g_remastered_producer_scope,scope,admitted);
     void* result=g_remastered_command_construct(command,frame,auxiliary);
     if(binding.admitted()){
         if(!remastered_scope_current(scope,contract)){scope->pair.cancel();return result;}
         RemasteredPreparationContext current{};
-        const bool matched=read_remastered_preparation_context(module,contract,scope->game,current) &&
-            current==scope->context && result==command && remastered_primary_command_matches(current.command_queue,command,frame);
+        const bool context=read_remastered_preparation_context(module,contract,scope->game,current,scope->world) &&
+            current==scope->context;
+        const bool matched=context && result==command &&
+            remastered_primary_command_matches(current.command_queue,command,frame,expected_auxiliary);
         const bool staged=matched && scope->publication.stage({scope->profile,
             reinterpret_cast<uintptr_t>(command),reinterpret_cast<uintptr_t>(scope->primary_frame),
             reinterpret_cast<uintptr_t>(scope->duplicate_frame),scope->pair_id,
             g_streamline_capture_generation.load(std::memory_order_acquire)});
-        const auto completion=scope->pair.at_native_command(frame,remastered_prepared_command_route(module,contract,scope->profile),matched && staged);
+        auto route=remastered_prepared_command_route(module,contract,scope->profile);
+        // The duplicate command gets the SAME scene; its constructor add-refs it.
+        route.auxiliary=expected_auxiliary;
+        const auto completion=scope->pair.at_native_command(frame,route,matched && staged);
+        if(world && remastered_world_log_due(world_construct_logs))
+            log_line("Remastered world construct pair=%llu context=%d command=%d staged=%d completion=%d reason=%s",
+                static_cast<unsigned long long>(scope->pair_id),context?1:0,matched?1:0,staged?1:0,
+                static_cast<int>(completion),scope->pair.reason()?scope->pair.reason():"none");
         if(completion==prep::PendingPair::Completion::dispatched){
             if(!scope->publication.extra_published(true)){
-                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                W3VR_BLOCK_MODERN_NOAA_CONSUMER();
                 g_remastered_preparation_hooks_ready.store(false,std::memory_order_release);
             }
         }
@@ -42819,7 +43185,7 @@ void* __fastcall hook_remastered_command_construct(void* command,void* frame,voi
     return result;
 }
 void reject_remastered_publication_observation()noexcept{
-    g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+    W3VR_BLOCK_MODERN_NOAA_CONSUMER();
     g_remastered_preparation_hooks_ready.store(false,std::memory_order_release);
 }
 extern "C" void w3vr_scene_publication_before(w3vr::publication_observer::Frame* f)noexcept{
@@ -42828,23 +43194,42 @@ extern "C" void w3vr_scene_publication_before(w3vr::publication_observer::Frame*
         auto* scope=g_remastered_producer_scope;
         const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
         const auto module=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-        if(!remastered_scope_current(scope,contract) || f->caller<module ||
-            !w3vr::frame_preparation::allows(scope->profile,w3vr::frame_preparation::Boundary::publication,f->caller-module))return;
+        if(!remastered_scope_current(scope,contract) || f->caller<module)return;
+        const auto mode=scope->world ? w3vr::frame_preparation::Mode::world : w3vr::frame_preparation::Mode::no_world;
+        if(scope->world && w3vr::frame_preparation::inline_publication(scope->profile,f->caller-module)){
+            // Path B (inline command 0227DD09.., direct call 0227DD68) has no
+            // examined constructor or scene. Unsupported: cancel the pair now.
+            static std::atomic<uint32_t> path_b_logs{};
+            if(remastered_world_log_due(path_b_logs))
+                log_line("Remastered world path B publication detected pair=%llu pending=%d; pair cancelled (unsupported)",
+                    static_cast<unsigned long long>(scope->pair_id),scope->pair.pending()?1:0);
+            scope->pair.cancel();return;
+        }
+        if(!w3vr::frame_preparation::allows(scope->profile,w3vr::frame_preparation::Boundary::publication,f->caller-module,mode))return;
         const auto id=scope->publication.identity();
+        static std::atomic<uint32_t> world_publication_logs{};
+        auto world_reject=[&](const char* why){
+            if(scope->world && remastered_world_log_due(world_publication_logs))
+                log_line("Remastered world publication not observed pair=%llu reason=%s",
+                    static_cast<unsigned long long>(scope->pair_id),why);
+        };
         // Exact producer call loads this table into RAX before its virtual call.
         // Keeping that entry value also disambiguates the Native null-renderer return.
         const auto& queue=scope->context.command_queue;
         if(!scope->publication.staged() || f->entry_integer[1]!=id.command ||
             f->entry_integer[0]!=module+queue.profile->scene_command_vtable ||
-            f->entry_integer[0]==w3vr::scene_publication::unpublished)return;
+            f->entry_integer[0]==w3vr::scene_publication::unpublished){world_reject("identity");return;}
         RemasteredPreparationContext current{};
-        if(!read_remastered_preparation_context(module,contract,scope->game,current) ||
+        if(!read_remastered_preparation_context(module,contract,scope->game,current,scope->world) ||
             current!=scope->context ||
-            !remastered_primary_command_matches(queue,reinterpret_cast<void*>(id.command),reinterpret_cast<void*>(id.primary)))return;
+            !remastered_primary_command_matches(queue,reinterpret_cast<void*>(id.command),reinterpret_cast<void*>(id.primary),
+                scope->world ? scope->context.world_scene : nullptr)){world_reject("command");return;}
         w3vr::publication_pair::Ticket ticket{};
-        if(!scope->publication.before(id,remastered_scope_current(scope,contract),ticket)){reject_remastered_publication_observation();return;}
+        if(!scope->publication.before(id,remastered_scope_current(scope,contract),ticket)){world_reject("ticket");reject_remastered_publication_observation();return;}
         f->owner=reinterpret_cast<uintptr_t>(scope);f->serial=ticket.serial;
         f->pair=id.pair;f->generation=id.generation;
+        if(scope->world && remastered_world_log_due(world_publication_logs))
+            log_line("Remastered world primary publication observed pair=%llu",static_cast<unsigned long long>(id.pair));
     }catch(...){reject_remastered_publication_observation();}
 }
 extern "C" void w3vr_scene_publication_after(w3vr::publication_observer::Frame* f)noexcept{
@@ -42879,7 +43264,10 @@ bool install_remastered_preparation_hooks() {
     namespace prep=w3vr::frame_preparation;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     const auto* profile=prep::selected(contract);
-    if(!profile || !w3vr::producer_bridge::available() || !remastered_queue_ready_for(contract))return false;
+    if(!profile || !w3vr::producer_bridge::available() || !remastered_queue_ready_for(contract)){
+        log_line("Remastered preparation install skipped: profile=%d bridge=%d queue_ready=%d",
+            profile?1:0,w3vr::producer_bridge::available()?1:0,remastered_queue_ready_for(contract)?1:0);
+        return false;}
     if(g_remastered_preparation_hooks_ready.load(std::memory_order_acquire))return remastered_preparation_ready_for(contract);
     if(g_remastered_preparation_install_attempted.exchange(true,std::memory_order_acq_rel))return false;
     auto* module=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
@@ -42892,9 +43280,15 @@ bool install_remastered_preparation_hooks() {
         {reinterpret_cast<void*>(&hook_remastered_effects_apply),reinterpret_cast<void**>(&g_remastered_effects_apply)},
         {reinterpret_cast<void*>(&hook_remastered_command_construct),reinterpret_cast<void**>(&g_remastered_command_construct)},
         {reinterpret_cast<void*>(&w3vr_scene_publication_entry),&w3vr_scene_publication_original}}};
-    for(const auto& target:profile->hooks)if(!remastered_render_entry_matches(module+target.rva,target.prefix))return false;
+    for(const auto& target:profile->hooks)if(!remastered_render_entry_matches(module+target.rva,target.prefix)){
+        log_line("Remastered preparation install refused: code prefix mismatch RVA=0x%llX",
+            static_cast<unsigned long long>(target.rva));return false;}
     if(!w3vr::publication_observer::available() ||
-        !remastered_scene_publication_code_matches(reinterpret_cast<uintptr_t>(module),profile->submission))return false;
+        !remastered_scene_publication_code_matches(reinterpret_cast<uintptr_t>(module),profile->submission)){
+        log_line("Remastered preparation install refused: observer=%d publication_code=%d",
+            w3vr::publication_observer::available()?1:0,
+            remastered_scene_publication_code_matches(reinterpret_cast<uintptr_t>(module),profile->submission)?1:0);
+        return false;}
     const auto current=[contract](){return contract==g_engine_camera_temporal_contract.load(std::memory_order_acquire) && remastered_queue_ready_for(contract);};
     if(!current())return false;
     g_remastered_preparation_installed_profile.store(profile,std::memory_order_release);
@@ -42940,11 +43334,25 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const auto factory_module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto* clock_entry_contract = g_engine_camera_temporal_contract.load(std::memory_order_acquire);
     w3vr::factory_clock::BorrowedScope normal_factory_clock;
+    // The immediate caller selects the site: 0227DF27 no-world producer,
+    // 022C1A28 builder of the WORLD producer (normal gameplay).
+    auto factory_clock_site = w3vr::factory_clock::CallSite::factory;
+    const bool world_factory_caller = w3vr::factory_clock::factory_site(
+        w3vr::factory_clock::selected(clock_entry_contract), factory_module, factory_caller_pc, factory_clock_site) &&
+        factory_clock_site == w3vr::factory_clock::CallSite::world_factory;
     if (w3vr::factory_clock::selected(clock_entry_contract) &&
         remastered_camera_copy_ready_for(clock_entry_contract) &&
         remastered_preparation_ready_for(clock_entry_contract)) {
-        w3vr::factory_clock::windows::observe(clock_entry_contract,factory_module,
-            factory_caller_pc,reinterpret_cast<uintptr_t>(scene_descriptor),normal_factory_clock);
+        w3vr::factory_clock::windows::ObserveStage clock_stage{};
+        const bool observed = w3vr::factory_clock::windows::observe(clock_entry_contract,factory_module,
+            factory_caller_pc,reinterpret_cast<uintptr_t>(scene_descriptor),normal_factory_clock,factory_clock_site,&clock_stage);
+        if (world_factory_caller) {
+            static std::atomic<uint32_t> world_clock_logs{};
+            if (remastered_world_log_due(world_clock_logs))
+                log_line("Remastered world factory clock %s stage=%d present=%llu",
+                    observed ? "admitted" : "rejected", static_cast<int>(clock_stage),
+                    static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+        }
     }
     w3vr::pipeline_flight::CpuScope flight_cpu{
         w3vr::pipeline_flight::Phase::FrameFactory};
@@ -43034,10 +43442,44 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             "reason=post_video_cinema",
             static_cast<unsigned long long>(present));
     }
+    // Remastered has no legacy view-constants hook, so hmd_camera_recent and
+    // gameplay arming never happen there. Its factory route writes the
+    // per-eye HMD pose itself (prepare_pair below, which still requires the
+    // current tracking generation). Arm from live tracking outside menus.
+    bool remastered_hmd_tracking{};
+    if (factory_contract == &w3vr::engine_camera::remastered_1048522 &&
+        g_config.hmd_freelook && !g_config.hmd_compositor_only && !native_loading_video &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 && factory_inputs_ready) {
+        const auto tracking_pose = snapshot_current_hmd_camera_pose();
+        const auto generation = g_streamline_capture_generation.load(std::memory_order_acquire);
+        remastered_hmd_tracking = tracking_pose.valid && generation != 0 &&
+            tracking_pose.tracking_generation == generation;
+        if (remastered_hmd_tracking) {
+            // The cinema detector and auto-start read this legacy signal,
+            // which only the 4.04 view-constants hook published. Without it
+            // every Remastered gameplay frame was classified as a cutscene.
+            g_engine_hmd_camera_last_present.store(present, std::memory_order_relaxed);
+        }
+        if (remastered_hmd_tracking &&
+            !g_engine_dual_gameplay_armed.exchange(true, std::memory_order_relaxed)) {
+            static std::atomic<uint32_t> arm_logs{};
+            if (arm_logs.fetch_add(1, std::memory_order_relaxed) < 16)
+                log_line("Remastered gameplay stereo armed from HMD tracking present=%llu generation=%u",
+                    static_cast<unsigned long long>(present), generation);
+        }
+        if (!remastered_hmd_tracking) {
+            static std::atomic<uint32_t> wait_logs{};
+            const auto n = wait_logs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 8 || n % 600 == 0)
+                log_line("Remastered gameplay stereo waiting for tracking present=%llu valid=%d pose_generation=%u generation=%u",
+                    static_cast<unsigned long long>(present), tracking_pose.valid ? 1 : 0,
+                    tracking_pose.tracking_generation, generation);
+        }
+    }
     const bool dual_render_auto_ready = g_config.engine_dual_render_start &&
         !native_loading_video &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
-        (hmd_camera_recent || automatic_full_vr_bootstrap) &&
+        (hmd_camera_recent || remastered_hmd_tracking || automatic_full_vr_bootstrap) &&
         factory_inputs_ready;
     if (g_config.engine_dual_render_probe && !g_engine_dual_render_active.load() &&
         dual_render_auto_ready && !g_dual_render_auto_start_consumed.exchange(true)) {
@@ -43073,20 +43515,73 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     bool duplicate_render =
         stereo_render_eligible && !mode3_aer_single_render;
     const bool remastered_factory = w3vr::scene_factory::modern(factory_version);
+    // Diagnostic: why a gameplay Remastered factory call did not duplicate.
+    if (remastered_factory && g_remastered_experimental_active.load(std::memory_order_acquire) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0) {
+        auto* scope = g_remastered_producer_scope;
+        const bool copy_ready = remastered_camera_copy_ready_for(factory_contract);
+        const bool scope_current = remastered_scope_current(scope, factory_contract);
+        const bool clock_ok = scope_current && clock_entry_contract == factory_contract &&
+            normal_factory_clock.borrowed_caller().rdi == reinterpret_cast<uintptr_t>(scope->game);
+        auto diagnostic_mode = w3vr::frame_preparation::Mode::no_world;
+        const bool boundary_ok = scope_current &&
+            w3vr::frame_preparation::factory_mode(scope->profile, caller_rva, diagnostic_mode);
+        const bool not_reserved = scope_current && !scope->factory_reserved;
+        const bool pair_available = scope_current && scope->pair.available();
+        if (!(stereo_render_eligible && copy_ready && scope_current && clock_ok && boundary_ok &&
+                not_reserved && pair_available)) {
+            static std::atomic<uint32_t> factory_logs{};
+            const auto n = factory_logs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 24 || n % 600 == 0)
+                log_line("Remastered factory not duplicated sample=%u present=%llu eligible=%d dual=%d armed=%d "
+                    "retry_at=%llu scene=%d copy_ready=%d scope=%d scope_ptr=%p clock=%d boundary=%d caller=0x%llX "
+                    "not_reserved=%d pair_available=%d loading_video=%d world=%d",
+                    n, static_cast<unsigned long long>(present), stereo_render_eligible ? 1 : 0,
+                    g_engine_dual_render_active.load() ? 1 : 0,
+                    g_engine_dual_gameplay_armed.load(std::memory_order_relaxed) ? 1 : 0,
+                    static_cast<unsigned long long>(g_engine_pair_retry_present.load(std::memory_order_relaxed)),
+                    scene_descriptor ? 1 : 0, copy_ready ? 1 : 0, scope_current ? 1 : 0, scope,
+                    clock_ok ? 1 : 0, boundary_ok ? 1 : 0, static_cast<unsigned long long>(caller_rva),
+                    not_reserved ? 1 : 0, pair_available ? 1 : 0, native_loading_video ? 1 : 0,
+                    boundary_ok && diagnostic_mode == w3vr::frame_preparation::Mode::world ? 1 : 0);
+        }
+    }
     if (duplicate_render && remastered_factory) {
         auto* scope = g_remastered_producer_scope;
         RemasteredPreparationContext context{};
-        duplicate_render = remastered_camera_copy_ready_for(factory_contract) &&
-            remastered_scope_current(scope,factory_contract) &&
+        auto pair_mode = w3vr::frame_preparation::Mode::no_world;
+        const bool scope_ok = remastered_camera_copy_ready_for(factory_contract) &&
+            remastered_scope_current(scope,factory_contract);
+        const bool mode_ok = scope_ok &&
+            w3vr::frame_preparation::factory_mode(scope->profile,caller_rva,pair_mode);
+        const bool world_pair = mode_ok && pair_mode == w3vr::frame_preparation::Mode::world;
+        const bool clock_ok = mode_ok &&
             (factory_contract != &w3vr::engine_camera::remastered_1048522 ||
                 (clock_entry_contract == factory_contract &&
                  normal_factory_clock.borrowed_caller().rdi == reinterpret_cast<uintptr_t>(scope->game) &&
-                 w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock))) &&
-            w3vr::frame_preparation::allows(scope->profile,w3vr::frame_preparation::Boundary::factory,caller_rva) &&
-            !scope->factory_reserved && scope->pair.available() &&
-            read_remastered_preparation_context(module,factory_contract,scope->game,context);
+                 normal_factory_clock.site() == (world_pair ? w3vr::factory_clock::CallSite::world_factory : w3vr::factory_clock::CallSite::factory) &&
+                 w3vr::factory_clock::windows::revalidate(factory_contract,normal_factory_clock)));
+        const bool slot_ok = clock_ok && !scope->factory_reserved && scope->pair.available();
+        const bool context_ok = slot_ok &&
+            read_remastered_preparation_context(module,factory_contract,scope->game,context,world_pair);
+        // Path B (inline command, no examined constructor) is unsupported:
+        // never create a duplicate that could only be cancelled later.
+        const bool path_ok = context_ok && (!world_pair ||
+            w3vr::frame_preparation::world_path_a(scope->profile,context.engine_flags,
+                reinterpret_cast<uintptr_t>(context.world_scene)));
+        duplicate_render = path_ok;
+        if (world_pair) {
+            static std::atomic<uint32_t> world_admission_logs{};
+            if (remastered_world_log_due(world_admission_logs))
+                log_line("Remastered world factory admission %s present=%llu clock=%d slot=%d context=%d path_a=%d "
+                    "ticks_before=%u engine_flags=0x%02X scene=%p",
+                    path_ok ? "accepted" : "rejected", static_cast<unsigned long long>(present),
+                    clock_ok ? 1 : 0, slot_ok ? 1 : 0, context_ok ? 1 : 0, path_ok ? 1 : 0,
+                    scope->world_ticks, context.engine_flags, context.world_scene);
+        }
         if (duplicate_render) {
             scope->factory_reserved = true;
+            scope->world = world_pair;
             scope->context = context;
         }
     }
@@ -43248,14 +43743,31 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         auto* scope=g_remastered_producer_scope;
         const auto generation=g_streamline_capture_generation.load(std::memory_order_acquire);
         bool reserved{};
-        if(remastered_scope_current(scope,factory_contract) && modern_pair_frame.renderable() &&
-            modern_pair_frame.ticket.generation==generation && modern_xr_frame_cycle().current(modern_pair_frame.ticket)){
+        const bool reserve_scope=remastered_scope_current(scope,factory_contract);
+        const bool reserve_renderable=modern_pair_frame.renderable();
+        const bool reserve_generation=modern_pair_frame.ticket.generation==generation;
+        const bool reserve_current=modern_xr_frame_cycle().current(modern_pair_frame.ticket);
+        if(reserve_scope && reserve_renderable && reserve_generation && reserve_current){
             std::scoped_lock lock{g_modern_prepared_frame_mutex};
             reserved=g_modern_prepared_frame.reserve({pair_pose_display_time,pair_id,generation,modern_pair_frame.ticket.identity()},
                 true,modern_pair_frame.state.predictedDisplayTime,modern_pair_frame.ticket.identity(),scope->xr_ticket);
             if(reserved)scope->xr_frame=modern_pair_frame.ticket;
         }
-        if(!reserved)duplicate_render=false;
+        if(!reserved){
+            duplicate_render=false;
+            if(g_remastered_experimental_active.load(std::memory_order_acquire)){
+                static std::atomic<uint32_t> reserve_logs{};
+                const auto n=reserve_logs.fetch_add(1,std::memory_order_relaxed);
+                if(n<16 || n%600==0)
+                    log_line("Remastered XR pair reservation failed sample=%u pair=%llu present=%llu scope=%d renderable=%d "
+                        "generation_match=%d (ticket=%u current=%u) cycle_current=%d reserve_call=%d display_time=%lld",
+                        n,static_cast<unsigned long long>(pair_id),static_cast<unsigned long long>(present),
+                        reserve_scope?1:0,reserve_renderable?1:0,reserve_generation?1:0,
+                        modern_pair_frame.ticket.generation,generation,reserve_current?1:0,
+                        (reserve_scope && reserve_renderable && reserve_generation && reserve_current)?1:0,
+                        static_cast<long long>(pair_pose_display_time));
+            }
+        }
     }
     const int previous_eye = g_engine_factory_eye;
     const int primary_eye = tag_aer_frame
@@ -43320,8 +43832,15 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
             duplicate_render = false;
             // No native factory has run and no source byte was changed.
             g_engine_pair_retry_present.store(present + 2, std::memory_order_relaxed);
-            if (g_config.runtime_diagnostics && g_engine_dual_render_log_count.fetch_add(1) < 8)
-                log_line("Remastered stereo camera pose/lens preparation rejected; unmodified native input used");
+            static std::atomic<uint32_t> pose_reject_logs{};
+            const auto pose_n=pose_reject_logs.fetch_add(1,std::memory_order_relaxed);
+            if (pose_n < 16 || pose_n % 600 == 0)
+                log_line("Remastered stereo camera pose/lens preparation rejected sample=%u present=%llu "
+                    "tracking_generation=%u generation=%u display_time=%lld tracking_time=%lld right_descriptor=%d",
+                    pose_n, static_cast<unsigned long long>(present), remastered_pair_pose.tracking_generation,
+                    remastered_pair_generation, static_cast<long long>(pair_pose_display_time),
+                    static_cast<long long>(remastered_pair_pose.tracking.display_time),
+                    right_scene_descriptor != nullptr ? 1 : 0);
         }
     }
     if (duplicate_render || tag_aer_frame) {
@@ -43540,8 +44059,26 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
                     scope->pair_id = pair_id;
                     scope->present = present;
                     duplicate_deferred = scope->pair.arm(scope->profile,result, right_frame_data, release,
-                        invalidate_remastered_prepared_pair, scope);
-                    if(duplicate_deferred){scope->primary_frame=result;scope->duplicate_frame=right_frame_data;}
+                        invalidate_remastered_prepared_pair, scope,
+                        scope->world ? w3vr::frame_preparation::Mode::world : w3vr::frame_preparation::Mode::no_world,
+                        scope->world ? scope->world_ticks : 0);
+                    if(duplicate_deferred){scope->primary_frame=result;scope->duplicate_frame=right_frame_data;
+                        const XrFovf pair_fovs[2]{remastered_pair_pose.tracking.views[0].fov,
+                            remastered_pair_pose.tracking.views[1].fov};
+                        const bool marked=mark_remastered_native_asymmetric_pair(pair_id,pair_fovs);
+                        static std::atomic<uint32_t> asym_logs{};
+                        if(remastered_world_log_due(asym_logs))
+                            log_line("Remastered pair native asymmetric marked=%d pair=%llu fov0=%.4f,%.4f,%.4f,%.4f fov1=%.4f,%.4f,%.4f,%.4f",
+                                marked?1:0,static_cast<unsigned long long>(pair_id),
+                                pair_fovs[0].angleLeft,pair_fovs[0].angleRight,pair_fovs[0].angleUp,pair_fovs[0].angleDown,
+                                pair_fovs[1].angleLeft,pair_fovs[1].angleRight,pair_fovs[1].angleUp,pair_fovs[1].angleDown);}
+                }
+                if (scope && scope->world) {
+                    static std::atomic<uint32_t> world_arm_logs{};
+                    if (remastered_world_log_due(world_arm_logs))
+                        log_line("Remastered world pair %s pair=%llu present=%llu ticks_before=%u",
+                            duplicate_deferred ? "armed" : "not armed", static_cast<unsigned long long>(pair_id),
+                            static_cast<unsigned long long>(present), scope->world_ticks);
                 }
                 if (!duplicate_deferred) release(right_frame_data);
             } else {
@@ -43639,9 +44176,16 @@ void install_engine_frame_factory_probe() {
     if (kEngineFrameDataFactoryRva == 0) return;
     // Every modern factory still requires the separately ported queue/preparation
     // admission; recognizing the current input layout cannot bypass those gates.
-    if (w3vr::scene_factory::modern(factory_version) &&
-        (!install_remastered_queue_lifecycle_hooks() || !install_remastered_camera_copy_hooks() ||
-            !install_remastered_preparation_hooks())) return;
+    if (w3vr::scene_factory::modern(factory_version)) {
+        const bool queue = install_remastered_queue_lifecycle_hooks();
+        const bool copy = queue && install_remastered_camera_copy_hooks();
+        const bool preparation = copy && install_remastered_preparation_hooks();
+        if (!preparation) {
+            log_line("Engine frame data factory probe NOT installed: queue=%d camera_copy=%d preparation=%d",
+                queue ? 1 : 0, copy ? 1 : 0, preparation ? 1 : 0);
+            return;
+        }
+    }
     if (g_engine_camera_temporal_contract.load(std::memory_order_acquire)!=factory_contract) return;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* target = module != nullptr ? module + kEngineFrameDataFactoryRva : nullptr;
@@ -43670,13 +44214,41 @@ void __fastcall hook_engine_is_any_menu(void* gui_manager, void* script_context,
         "changed");
 }
 
+// CR4GuiManager IsAnyMenu script native for Remastered 5.0.0.1048522. Found by
+// its single name reference in the GUI manager native registration (name RVA
+// 0x038076E8, registration 0x00495CCA). Same (receiver, stack, bool* result)
+// shape as 4.04; it calls receiver vtable+0x1E0. The whole 35-byte body is
+// verified before hooking, so a different executable is never patched.
+constexpr uintptr_t kRemastered1048522IsAnyMenuRva = 0x01DF41A0;
+constexpr std::array<uint8_t, 35> kRemastered1048522IsAnyMenuCode{
+    0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0xFF,0x42,0x30,0x49,0x8B,0xD8,0x48,0x8B,0x01,0xFF,0x90,
+    0xE0,0x01,0x00,0x00,0x48,0x85,0xDB,0x74,0x02,0x88,0x03,0x48,0x83,0xC4,0x20,0x5B,0xC3};
+bool remastered_is_any_menu_code_matches(const uint8_t* target) {
+    __try {
+        return std::memcmp(target, kRemastered1048522IsAnyMenuCode.data(),
+            kRemastered1048522IsAnyMenuCode.size()) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void install_engine_menu_state_probe() {
     if (!g_config.engine_menu_state_probe || g_engine_is_any_menu != nullptr) {
         return;
     }
-
-    constexpr uintptr_t kEngineIsAnyMenuRva = 0x01F3C5C0;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    uintptr_t kEngineIsAnyMenuRva = 0x01F3C5C0;
+    if (g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
+        &w3vr::engine_camera::remastered_1048522) {
+        kEngineIsAnyMenuRva = kRemastered1048522IsAnyMenuRva;
+        if (module == nullptr || !remastered_is_any_menu_code_matches(module + kEngineIsAnyMenuRva)) {
+            log_line("Engine IsAnyMenu probe skipped: Remastered 1048522 code mismatch");
+            return;
+        }
+    } else if (!legacy_404_fixed_addresses_allowed()) {
+        // Hard-coded 4.04 address: never patch it on another executable.
+        return;
+    }
     auto* target = module != nullptr ? module + kEngineIsAnyMenuRva : nullptr;
     if (target != nullptr &&
         MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_is_any_menu),
@@ -46496,8 +47068,28 @@ void install_engine_viewport_resolution_hook() {
         g_config.render_width <= 0 || g_config.render_height <= 0) {
         return;
     }
-    constexpr uintptr_t kViewportResolutionRva = 0x01563DC0;
     auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    uintptr_t kViewportResolutionRva = 0x01563DC0;
+    if (g_engine_camera_temporal_contract.load(std::memory_order_acquire) ==
+        &w3vr::engine_camera::remastered_1048522) {
+        // GetViewportResolution(bool fullscreen, const String*, uint32* w, uint32* h)
+        // for 5.0.0.1048522: same shape as 4.04; it parses Viewport/Resolution
+        // and writes only the two out-params. The engine keeps its own
+        // CRenderViewport size, so resizing the swapchain alone leaves the
+        // scene drawn at the old size in the top-left of each eye.
+        // Fullscreen-exclusive mode (2) still snaps to a display mode.
+        kViewportResolutionRva = 0x0228F3B0;
+        static constexpr uint8_t kPrefix[18]{0x48,0x8B,0xC4,0x88,0x48,0x08,0x57,0x48,0x81,0xEC,
+            0xB0,0x00,0x00,0x00,0x48,0x89,0x58,0x10};
+        if (module == nullptr ||
+            !remastered_render_entry_matches(module + kViewportResolutionRva, kPrefix)) {
+            log_line("REDengine viewport resolution hook skipped: Remastered 1048522 code mismatch");
+            return;
+        }
+    } else if (!legacy_404_fixed_addresses_allowed()) {
+        // Hard-coded 4.04 address: never patch it on another executable.
+        return;
+    }
     auto* target = module != nullptr ? module + kViewportResolutionRva : nullptr;
     if (target != nullptr &&
         MH_CreateHook(target, &hook_engine_viewport_resolution,
@@ -46896,14 +47488,29 @@ void ensure_initialized() {
         // engine, graphics, input or upscaler hooks. Keep Windows DXGI exports
         // available so loading an unsupported development DLL does not attempt
         // to run the old fixed-address code. This is not a Remastered port.
-        if (!legacy_engine_preflight_for_process()) {
-            log_line("Quest3 development build disabled: legacy 4.04 callback "
-                "layout mismatch. Engine hooks and VR remain inactive; "
-                "Remastered requires a verified port.");
-            return;
+        if (legacy_engine_preflight_for_process()) {
+            g_engine_camera_temporal_contract.store(
+                &w3vr::engine_camera::legacy_404, std::memory_order_release);
+        } else {
+            // EXPERIMENTAL diagnostic route, opt-in only: [engine]
+            // remastered_experimental=true AND the exact 1048522 PE identity
+            // (timestamp, image size, pinned code, unwind) must both match.
+            // Every installer with fixed 4.04 addresses is skipped below.
+            const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            if (!g_config.engine_remastered_experimental ||
+                !current_temporal_builder_prefix_matches(module)) {
+                log_line("Quest3 development build disabled: legacy 4.04 callback "
+                    "layout mismatch. Engine hooks and VR remain inactive; "
+                    "Remastered requires a verified port (opt-in=%d).",
+                    g_config.engine_remastered_experimental ? 1 : 0);
+                return;
+            }
+            g_engine_camera_temporal_contract.store(
+                &w3vr::engine_camera::remastered_1048522, std::memory_order_release);
+            g_remastered_experimental_active.store(true, std::memory_order_release);
+            log_line("EXPERIMENTAL Remastered 1048522 diagnostic route selected by INI. "
+                "Legacy fixed-address installers are skipped; this is NOT a verified port.");
         }
-        g_engine_camera_temporal_contract.store(
-            &w3vr::engine_camera::legacy_404, std::memory_order_release);
         g_legacy_engine_layout_accepted.store(true, std::memory_order_release);
         if (g_config.renderdoc_capture_enabled &&
             g_config.renderdoc_streamline_device_bridge) {
@@ -50207,16 +50814,39 @@ bool promote_sequential_cinema_pair(
 bool schedule_stereo_luminance_readback(ID3D12GraphicsCommandList* command_list) {
     if (command_list == nullptr || g_d3d12_device == nullptr ||
         g_stereo_luma_scheduled.load() || !g_packed_present_cache_valid ||
-        g_packed_accepted_pair_id < 30 || g_packed_present_cache[0] == nullptr ||
+        g_packed_accepted_pair_id < g_stereo_luma_next_pair ||
+        g_packed_present_cache[0] == nullptr ||
         g_packed_present_cache[1] == nullptr) {
         return false;
     }
 
     const auto desc = g_packed_present_cache[0]->GetDesc();
+    // The experimental Remastered route also decodes the other 32-bit
+    // swapchain layouts; every other route keeps its original RGBA8 gate.
+    const bool experimental =
+        g_remastered_experimental_active.load(std::memory_order_acquire);
+    const bool extended_format = experimental &&
+        (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+            desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+            desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
     if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
-        desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && !extended_format) {
         log_line("Stereo luminance readback unsupported format=%u",
             static_cast<unsigned>(desc.Format));
+        g_stereo_luma_scheduled.store(true);
+        return false;
+    }
+
+    // A re-armed sample may follow a resize. Never release or overrun the
+    // existing readback buffers (GPU use is not proven idle here): stop.
+    if (g_stereo_luma_readback[0] != nullptr &&
+        (g_stereo_luma_footprint.Footprint.Width != desc.Width ||
+            g_stereo_luma_footprint.Footprint.Height != desc.Height ||
+            g_stereo_luma_format != desc.Format)) {
+        log_line("Stereo luminance readback stopped after resize size=%llux%u format=%u",
+            static_cast<unsigned long long>(desc.Width), desc.Height,
+            static_cast<unsigned>(desc.Format));
+        g_stereo_luma_logged.store(true);
         g_stereo_luma_scheduled.store(true);
         return false;
     }
@@ -50246,6 +50876,7 @@ bool schedule_stereo_luminance_readback(ID3D12GraphicsCommandList* command_list)
                 return false;
             }
         }
+        g_stereo_luma_format = desc.Format;
     }
 
     for (uint32_t eye = 0; eye < 2; ++eye) {
@@ -50279,6 +50910,24 @@ void log_stereo_luminance_readback() {
     const UINT width = g_stereo_luma_footprint.Footprint.Width;
     const UINT height = g_stereo_luma_footprint.Footprint.Height;
     const UINT row_pitch = g_stereo_luma_footprint.Footprint.RowPitch;
+    // Every accepted format is 4 bytes per pixel; RGBA8 decodes exactly as
+    // before. BGRA8 swaps red/blue; R10G10B10A2 keeps the top 8 bits.
+    const DXGI_FORMAT luma_format = g_stereo_luma_format;
+    const auto decode = [luma_format](const uint8_t* pixel, uint32_t (&rgb)[3]) {
+        if (luma_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            uint32_t packed{};
+            std::memcpy(&packed, pixel, sizeof(packed));
+            rgb[0] = (packed & 0x3FFu) >> 2;
+            rgb[1] = ((packed >> 10) & 0x3FFu) >> 2;
+            rgb[2] = ((packed >> 20) & 0x3FFu) >> 2;
+            return;
+        }
+        const bool bgra = luma_format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+            luma_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        rgb[0] = pixel[bgra ? 2 : 0];
+        rgb[1] = pixel[1];
+        rgb[2] = pixel[bgra ? 0 : 2];
+    };
     uint8_t* mapped_eyes[2]{};
     bool mapped_valid[2]{};
     for (uint32_t eye = 0; eye < 2; ++eye) {
@@ -50302,31 +50951,72 @@ void log_stereo_luminance_readback() {
                 g_stereo_luma_footprint.Offset +
                 static_cast<size_t>(y) * row_pitch;
             for (UINT x = 0; x < width; x += kSampleStride) {
-                const auto* pixel = row + static_cast<size_t>(x) * 4;
-                const uint32_t r = pixel[0];
-                const uint32_t g = pixel[1];
-                const uint32_t b = pixel[2];
+                uint32_t rgb[3]{};
+                decode(row + static_cast<size_t>(x) * 4, rgb);
+                const uint32_t r = rgb[0];
+                const uint32_t g = rgb[1];
+                const uint32_t b = rgb[2];
                 sum_r += r;
                 sum_g += g;
                 sum_b += b;
                 sum_luma += (54u * r + 183u * g + 19u * b) >> 8;
                 black += (r <= 2 && g <= 2 && b <= 2) ? 1u : 0u;
                 for (uint32_t channel = 0; channel < 3; ++channel) {
-                    hash ^= pixel[channel];
+                    hash ^= rgb[channel];
                     hash *= 1099511628211ull;
                 }
                 ++samples;
             }
         }
         const double denominator = samples != 0 ? static_cast<double>(samples) : 1.0;
-        log_line("Stereo content packed eye=%u pair=%llu cinema=%d samples=%llu hash=0x%016llX rgb=%.4f,%.4f,%.4f luma=%.4f black=%.4f%%",
+        log_line("Stereo content packed eye=%u pair=%llu cinema=%d samples=%llu hash=0x%016llX rgb=%.4f,%.4f,%.4f luma=%.4f black=%.4f%% format=%u",
             eye,
             static_cast<unsigned long long>(g_stereo_luma_pair),
             g_stereo_luma_cinema ? 1 : 0,
             static_cast<unsigned long long>(samples),
             static_cast<unsigned long long>(hash),
             sum_r / denominator, sum_g / denominator, sum_b / denominator,
-            sum_luma / denominator, 100.0 * black / denominator);
+            sum_luma / denominator, 100.0 * black / denominator,
+            static_cast<unsigned>(luma_format));
+        // Diagnostic picture of the exact eye image OpenXR consumes: a
+        // 1/4-scale 24-bit BMP next to the game executable, first 8 only,
+        // only on the experimental Remastered route.
+        static std::atomic<uint32_t> eye_dumps{};
+        if (g_remastered_experimental_active.load(std::memory_order_acquire) &&
+            width >= 4 && height >= 4 && eye_dumps.fetch_add(1, std::memory_order_relaxed) < 8) {
+            const uint32_t out_w = width / kSampleStride, out_h = height / kSampleStride;
+            const uint32_t out_pitch = (out_w * 3 + 3) & ~3u;
+            std::vector<uint8_t> bmp(54 + static_cast<size_t>(out_pitch) * out_h, 0);
+            const auto put32 = [&bmp](size_t at, uint32_t v) { std::memcpy(bmp.data() + at, &v, 4); };
+            bmp[0] = 'B'; bmp[1] = 'M'; put32(2, static_cast<uint32_t>(bmp.size())); put32(10, 54);
+            put32(14, 40); put32(18, out_w); put32(22, out_h); bmp[26] = 1; bmp[28] = 24;
+            put32(34, static_cast<uint32_t>(bmp.size() - 54));
+            for (uint32_t oy = 0; oy < out_h; ++oy) {
+                const auto* row = mapped_eyes[eye] + g_stereo_luma_footprint.Offset +
+                    static_cast<size_t>(oy * kSampleStride) * row_pitch;
+                uint8_t* dst = bmp.data() + 54 + static_cast<size_t>(out_h - 1 - oy) * out_pitch;
+                for (uint32_t ox = 0; ox < out_w; ++ox) {
+                    uint32_t rgb[3]{};
+                    decode(row + static_cast<size_t>(ox * kSampleStride) * 4, rgb);
+                    dst[ox * 3 + 0] = static_cast<uint8_t>(rgb[2]);
+                    dst[ox * 3 + 1] = static_cast<uint8_t>(rgb[1]);
+                    dst[ox * 3 + 2] = static_cast<uint8_t>(rgb[0]);
+                }
+            }
+            char path[MAX_PATH]{};
+            GetModuleFileNameA(nullptr, path, sizeof(path));
+            if (char* slash = strrchr(path, '\\')) slash[1] = '\0';
+            char name[96]{};
+            sprintf_s(name, "witcher3vr-eye%u-pair%llu.bmp", eye,
+                static_cast<unsigned long long>(g_stereo_luma_pair));
+            strcat_s(path, name);
+            FILE* out{};
+            if (fopen_s(&out, path, "wb") == 0 && out) {
+                fwrite(bmp.data(), 1, bmp.size(), out);
+                fclose(out);
+                log_line("Stereo eye picture written %s", name);
+            }
+        }
     }
 
     if (mapped_valid[0] && mapped_valid[1]) {
@@ -50341,8 +51031,10 @@ void log_stereo_luminance_readback() {
                 g_stereo_luma_footprint.Offset +
                 static_cast<size_t>(y) * row_pitch;
             for (UINT x = 0; x < width; x += kSampleStride) {
-                const auto* left = left_row + static_cast<size_t>(x) * 4;
-                const auto* right = right_row + static_cast<size_t>(x) * 4;
+                uint32_t left[3]{};
+                uint32_t right[3]{};
+                decode(left_row + static_cast<size_t>(x) * 4, left);
+                decode(right_row + static_cast<size_t>(x) * 4, right);
                 const uint32_t left_luma =
                     (54u * left[0] + 183u * left[1] + 19u * left[2]) >> 8;
                 const uint32_t right_luma =
@@ -50379,6 +51071,17 @@ void log_stereo_luminance_readback() {
         g_stereo_luma_readback[eye]->Unmap(0, &written_range);
     }
     g_stereo_luma_logged.store(true);
+    // Experimental Remastered route only: re-arm the same exact-pair readback
+    // with a bounded cadence: 16 samples 30 pairs apart, then one every 600
+    // pairs. Each sample still costs one XR GPU wait. A failed map or an
+    // unsupported format is never re-armed (no per-frame wait or log loop).
+    if (g_remastered_experimental_active.load(std::memory_order_acquire) &&
+        mapped_valid[0] && mapped_valid[1]) {
+        const uint32_t sample = ++g_stereo_luma_samples;
+        g_stereo_luma_next_pair = g_stereo_luma_pair + (sample < 16 ? 30u : 600u);
+        g_stereo_luma_scheduled.store(false, std::memory_order_relaxed);
+        g_stereo_luma_logged.store(false, std::memory_order_relaxed);
+    }
 }
 
 bool schedule_startup_backbuffer_luminance(
@@ -51182,6 +51885,18 @@ bool update_packed_eye_cache() {
         left.generation != generation || right.generation != generation ||
         left.pair_id == 0 || left.pair_id != right.pair_id ||
         left.pair_id <= g_packed_accepted_pair_id) {
+        // Only a published-but-unpaired modern eye is interesting; idle Presents stay silent.
+        if (modern_noaa && (left.initialized || right.initialized) &&
+            !(left.initialized && right.initialized && left.pair_id == right.pair_id && left.pair_id <= g_packed_accepted_pair_id)) {
+            static std::atomic<uint32_t> incomplete_logs{};
+            const auto n=remastered_noaa_diag_sample(incomplete_logs);
+            if (n!=UINT32_MAX)
+                log_line("Remastered NoAA pair incomplete sample=%u left=%d/%llu/%u right=%d/%llu/%u generation=%u accepted=%llu present=%llu",
+                    n,left.initialized?1:0,static_cast<unsigned long long>(left.pair_id),left.generation,
+                    right.initialized?1:0,static_cast<unsigned long long>(right.pair_id),right.generation,generation,
+                    static_cast<unsigned long long>(g_packed_accepted_pair_id),
+                    static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+        }
         return false;
     }
     // [FIX:TAAU-SUBMITTED-PRESENT-AUTHORITY V12049 2/2] Pair promotion must
@@ -51205,11 +51920,62 @@ bool update_packed_eye_cache() {
              left.pair_id))) {
         return false;
     }
+    // The finished eye is the LAST ->PRESENT copy of its tagged scope. A later
+    // copy of this pair may still await Execute (another list); promoting now
+    // would freeze an intermediate backbuffer (e.g. COPY_DEST before overlay).
+    if(modern_noaa){
+        StreamlineCaptureSlot* const latest[2]{&left,&right};
+        for(uint32_t eye=0;eye<2;++eye){
+            std::array<w3vr::modern_eye_capture::RecordedCopy,kStreamlineCaptureRingSize> copies{};
+            for(size_t index=0;index<kStreamlineCaptureRingSize;++index){
+                const auto& slot=g_streamline_capture_ring[eye][index];
+                copies[index]={slot.capture_serial,slot.modern_output.identity.frame.pair,slot.recording_pending};
+            }
+            if(!w3vr::modern_eye_capture::later_copy_pending(latest[eye]->capture_serial,left.pair_id,copies))continue;
+            static std::atomic<uint32_t> deferred_logs{};
+            const auto n=remastered_noaa_diag_sample(deferred_logs);
+            if(n!=UINT32_MAX)
+                log_line("Remastered NoAA pair deferred for later eye copy sample=%u eye=%u pair=%llu published_serial=%llu "
+                    "published_before=0x%X present=%llu",n,eye,static_cast<unsigned long long>(left.pair_id),
+                    static_cast<unsigned long long>(latest[eye]->capture_serial),latest[eye]->modern_transition_before,
+                    static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+            return false;
+        }
+    }
     w3vr::modern_eye_pair::Pair modern_outputs{{left.modern_output,right.modern_output}};
     if(modern_noaa && !w3vr::modern_eye_pair::accepts(modern_outputs,modern_contract,
         g_remastered_core_installed_profile.load(std::memory_order_acquire),modern_noaa_output_ready(modern_contract),
         generation,binding ? reinterpret_cast<uintptr_t>(binding->queue.Get()):0,g_packed_accepted_pair_id,
-        binding ? binding->epoch:0))return false;
+        binding ? binding->epoch:0)){
+        static std::atomic<uint32_t> pair_reject_logs{};
+        const auto n=remastered_noaa_diag_sample(pair_reject_logs);
+        if(n!=UINT32_MAX){
+            const auto& l=modern_outputs[0];const auto& r=modern_outputs[1];
+            const auto consumer=binding ? reinterpret_cast<uintptr_t>(binding->queue.Get()):0;
+            log_line("Remastered NoAA pair rejected sample=%u pair=%llu eyes=%d/%d frames=0x%llX/0x%llX init=%d/%d ordered=%d/%d "
+                "consumer_match=%d/%d fence=%d/%d epoch=%d/%d xr_match=%d time=%lld/%lld renderer_match=%d",
+                n,static_cast<unsigned long long>(left.pair_id),l.identity.frame.eye,r.identity.frame.eye,
+                static_cast<unsigned long long>(l.identity.frame.frame),static_cast<unsigned long long>(r.identity.frame.frame),
+                l.initialized?1:0,r.initialized?1:0,l.ordered?1:0,r.ordered?1:0,
+                l.consumer==consumer?1:0,r.consumer==consumer?1:0,
+                w3vr::modern_eye_pair::finite(l.fence_value)?1:0,w3vr::modern_eye_pair::finite(r.fence_value)?1:0,
+                l.recording_epoch==l.submitted_epoch?1:0,r.recording_epoch==r.submitted_epoch?1:0,
+                l.identity.frame.xr==r.identity.frame.xr?1:0,static_cast<long long>(l.identity.frame.display_time),
+                static_cast<long long>(r.identity.frame.display_time),l.identity.renderer==r.identity.renderer?1:0);
+        }
+        return false;
+    }
+    if(modern_noaa){
+        static std::atomic<uint32_t> pair_complete_logs{};
+        const auto n=remastered_noaa_diag_sample(pair_complete_logs);
+        if(n!=UINT32_MAX)
+            log_line("Remastered NoAA pair complete sample=%u pair=%llu display_time=%lld capture_before=0x%X/0x%X "
+                "serial=%llu/%llu present=%llu",n,
+                static_cast<unsigned long long>(left.pair_id),static_cast<long long>(modern_outputs[0].identity.frame.display_time),
+                left.modern_transition_before,right.modern_transition_before,
+                static_cast<unsigned long long>(left.capture_serial),static_cast<unsigned long long>(right.capture_serial),
+                static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+    }
     const bool had_accepted_pair = g_packed_present_cache_valid;
     uint64_t accepted_pair = left.pair_id;
     uint32_t accepted_slot_indices[2]{
@@ -51324,7 +52090,9 @@ bool update_packed_eye_cache() {
             const uint32_t log_index =
                 g_native_asymmetric_rejected_pair_logs.fetch_add(
                     1, std::memory_order_relaxed);
-            if (g_config.runtime_diagnostics && log_index < 32) {
+            static std::atomic<uint32_t> modern_native_reject_logs{};
+            if ((g_config.runtime_diagnostics && log_index < 32) ||
+                (modern_noaa && remastered_noaa_diag_sample(modern_native_reject_logs) != UINT32_MAX)) {
                 log_line(
                     "V1136 native asymmetric pair rejected sample=%u "
                     "pair=%llu captured=%d,%d slot=%d "
@@ -51561,6 +52329,7 @@ bool reserve_streamline_capture_slot(
         candidate.recording_pending = true;
         candidate.initialized = false;
         candidate.modern_output={};
+        candidate.modern_transition_before=UINT32_MAX;
         candidate.producer_queue = nullptr;
         candidate.producer_queue_fence = nullptr;
         candidate.producer_queue_fence_value = 0;
@@ -51662,22 +52431,37 @@ bool capture_tagged_backbuffer_output(
     uint32_t source_eye,
     bool source_eye_valid,
     const w3vr::modern_eye_capture::Identity* modern_identity,
-    const w3vr::modern_graphics_binding::Snapshot& binding) {
+    const w3vr::modern_graphics_binding::Snapshot& binding,
+    uint32_t modern_transition_before) {
     const auto epoch=modern_identity ? load_command_list_recording_epoch(command_list):0;
     const auto* contract=g_engine_camera_temporal_contract.load(std::memory_order_acquire);
-    if(modern_identity && (!modern_xr_frame_current(modern_identity->frame.xr,generation) ||
-        is_reshade_immediate_command_list(command_list) ||
-        !modern_noaa_output_ready(contract) || !modern_graphics_current(binding) ||
-        !modern_backbuffer_hooks_accept(binding,command_list) ||
-        !w3vr::modern_eye_capture::admits(*modern_identity,contract,
-            g_remastered_core_installed_profile.load(std::memory_order_acquire),true,generation) ||
-        !w3vr::modern_eye_pair::finite(epoch) || modern_identity->frame.eye!=static_cast<int>(eye) ||
-        modern_identity->frame.pair!=pair_id || source_eye!=eye || !source_eye_valid || !render_view_valid))return false;
+    const auto modern_reject=[&](const char* reason){
+        static std::atomic<uint32_t> reject_logs{};
+        const auto n=modern_identity ? remastered_noaa_diag_sample(reject_logs):UINT32_MAX;
+        if(n!=UINT32_MAX)
+            log_line("Remastered NoAA eye copy rejected sample=%u reason=%s eye=%u pair=%llu floor=%llu generation=%u/%u",
+                n,reason,eye,static_cast<unsigned long long>(pair_id),
+                static_cast<unsigned long long>(g_engine_pair_capture_floor.load(std::memory_order_relaxed)),
+                generation,g_streamline_capture_generation.load(std::memory_order_acquire));
+        return false;
+    };
+    if(modern_identity){
+        const char* reason=!modern_xr_frame_current(modern_identity->frame.xr,generation) ? "xr_frame_not_current":
+            is_reshade_immediate_command_list(command_list) ? "reshade_list":
+            !modern_noaa_output_ready(contract) ? "output_not_ready":!modern_graphics_current(binding) ? "graphics_not_current":
+            !modern_backbuffer_hooks_accept(binding,command_list) ? "backbuffer_hooks":
+            !w3vr::modern_eye_capture::admits(*modern_identity,contract,
+                g_remastered_core_installed_profile.load(std::memory_order_acquire),true,generation) ? "identity":
+            !w3vr::modern_eye_pair::finite(epoch) ? "recording_epoch":
+            (modern_identity->frame.eye!=static_cast<int>(eye) || modern_identity->frame.pair!=pair_id ||
+                source_eye!=eye || !source_eye_valid) ? "eye_pair_mismatch":!render_view_valid ? "render_view":nullptr;
+        if(reason)return modern_reject(reason);
+    }
     if (command_list == nullptr || source == nullptr || eye > 1 || pair_id == 0 ||
         pair_id < g_engine_pair_capture_floor.load(std::memory_order_relaxed) ||
         generation != g_streamline_capture_generation.load() ||
         !ensure_streamline_capture_ring(source->GetDesc())) {
-        return false;
+        return modern_reject(pair_id < g_engine_pair_capture_floor.load(std::memory_order_relaxed) ? "below_capture_floor":"ring_or_arguments");
     }
 
     uint32_t slot_index{};
@@ -51686,7 +52470,7 @@ bool capture_tagged_backbuffer_output(
     if (!reserve_streamline_capture_slot(
             eye, slot_index, destination_was_copy_source,
             capture_serial)) {
-        return false;
+        return modern_reject("no_free_ring_slot");
     }
     auto& slot = g_streamline_capture_ring[eye][slot_index];
     auto record_commands=[&]{
@@ -51751,6 +52535,7 @@ bool capture_tagged_backbuffer_output(
             slot.modern_output={*modern_identity,reinterpret_cast<uintptr_t>(slot.resource),
                 reinterpret_cast<uintptr_t>(command_list),0,0,0,epoch,0,capture_serial,0,
                 source_eye,true,render_view_valid,false,true,false,binding->epoch};
+            slot.modern_transition_before=modern_transition_before;
             g_streamline_capture_pending_publications[command_list].push_back({
                 eye,slot_index,generation,pair_id,capture_serial,epoch,modern_identity->frame.xr});
             return true;
@@ -51761,7 +52546,7 @@ bool capture_tagged_backbuffer_output(
                 // A partial/unknown recording cannot regain capture authority.
                 // A fully returned copy still retains its interfaces until the
                 // existing Reset + exact submission-fence proof can retire them.
-                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                W3VR_BLOCK_MODERN_NOAA_CONSUMER();
                 if(source_record && (!commands_returned || source_record->sealed))source_record->quarantined=true;
             }
             if(slot.capture_serial==capture_serial){
@@ -51775,7 +52560,15 @@ bool capture_tagged_backbuffer_output(
             std::scoped_lock lock{g_streamline_capture_mutex};
             if(source_record)g_modern_backbuffer_sources.finish_cpu(source_record);
         };
-        return w3vr::capture_recording::run(g_packed_capture_internal,prepare,record,publish,failed,finish);
+        const bool recorded=w3vr::capture_recording::run(g_packed_capture_internal,prepare,record,publish,failed,finish);
+        static std::atomic<uint32_t> recorded_logs[2]{};
+        const auto n=remastered_noaa_diag_sample(recorded_logs[recorded ? 0:1]);
+        if(n!=UINT32_MAX)
+            log_line("Remastered NoAA eye copy %s sample=%u eye=%u pair=%llu slot=%u serial=%llu command=%p present=%llu",
+                recorded ? "recorded":"recording_failed",n,eye,static_cast<unsigned long long>(pair_id),slot_index,
+                static_cast<unsigned long long>(capture_serial),command_list,
+                static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+        return recorded;
     }
     g_packed_capture_internal=true;
     record_commands();
@@ -51835,6 +52628,41 @@ bool native_stereo_capture_ready() {
         g_streamline_capture_ring[1][right_slot].generation == g_streamline_capture_generation.load();
 }
 
+// D3D12 CopyTextureRegion requires both resources in one format family.
+DXGI_FORMAT dxgi_copy_family(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_SINT:
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16B16A16_SINT:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default: return format;
+    }
+}
+
+// Typed format requested from OpenXR versus the resource the runtime created.
+bool xr_swapchain_format_compatible(DXGI_FORMAT actual, DXGI_FORMAT requested) {
+    if (actual == requested) return true;
+    switch (requested) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return actual == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return actual == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return actual == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return actual == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default: return false;
+    }
+}
+
 // [CORE] Submit projection views during gameplay and head-locked quad layers
 // during menus/cinematics, using only complete stereo resources.
 void render_openxr_test_frame(
@@ -51886,8 +52714,8 @@ void render_openxr_test_frame(
                     [&]{return pfn_xrReleaseSwapchainImage(handle,&release);});
                 if(recovery.state!=w3vr::xr_image::RecoveryState::Pending &&
                     recovery.state!=w3vr::xr_image::RecoveryState::Released)
-                    g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
-            }else g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                    W3VR_BLOCK_MODERN_NOAA_CONSUMER();
+            }else W3VR_BLOCK_MODERN_NOAA_CONSUMER();
         }
     }
 
@@ -52369,6 +53197,25 @@ void render_openxr_test_frame(
         modern_sources=submitted ? acquire_modern_noaa_sources(modern_target):nullptr;
         submitted=submitted && modern_sources!=nullptr;
     }
+    // Diagnostic: which part of the submission gate failed (bounded log).
+    if(!submitted && g_remastered_experimental_active.load(std::memory_order_acquire)){
+        static std::atomic<uint32_t> gate_logs{};
+        const auto n=gate_logs.fetch_add(1,std::memory_order_relaxed);
+        if(n<24 || n%600==0){
+            const bool ticket_generation=!managed_frame ||
+                managed_payload.ticket.generation==g_streamline_capture_generation.load(std::memory_order_acquire);
+            const bool ticket_current=!managed_frame || modern_xr_frame_cycle().current(managed_payload.ticket);
+            log_line("Remastered XR submit gate sample=%u present=%llu cleanup=%d views=%d should_render=%d "
+                "managed=%d ticket_generation=%d ticket_current=%d consumer_blocked=%d noaa_scene=%d sources=%d "
+                "menu=%d menu_state=%d loading_video=%d cinema=%d",
+                n,static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)),
+                image_cleanup_frame?1:0,views_valid?1:0,frame_state.shouldRender?1:0,managed_frame?1:0,
+                ticket_generation?1:0,ticket_current?1:0,
+                g_modern_noaa_consumer_blocked.load(std::memory_order_acquire)?1:0,modern_noaa_scene?1:0,
+                modern_sources?1:0,fullscreen_menu?1:0,g_engine_menu_state.load(),
+                g_engine_loading_screen_video_active.load(std::memory_order_acquire)?1:0,cinema_panel?1:0);
+        }
+    }
     const bool packed_native_asymmetric=modern_sources ? modern_sources->native_asymmetric:g_packed_present_cache_native_asymmetric;
     const auto packed_view=[&](uint32_t eye)->const XrView&{
         return modern_sources ? modern_sources->views[eye]:g_packed_present_cache_views[eye];};
@@ -52527,8 +53374,13 @@ void render_openxr_test_frame(
                 image_protocol->begin({modern_target.xr,reinterpret_cast<uintptr_t>(swapchain.handle),
                     reinterpret_cast<uintptr_t>(image_session->graphics->queue.Get()),managed_payload.ticket.generation,
                     static_cast<uint32_t>(swapchain.images.size())},image_ticket);
-            if(!submitted)g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+            if(!submitted)W3VR_BLOCK_MODERN_NOAA_CONSUMER();
         }
+        // Diagnostic: first stage that cancelled this XR submission.
+        int submit_fail_stage=submitted?0:1;
+        XrResult submit_fail_result=XR_SUCCESS;
+        const auto note_submit_stage=[&](int stage){
+            if(!submitted && submit_fail_stage==0){submit_fail_stage=stage;submit_fail_result=result;}};
         bool command_list_recording{};
         int64_t flight_xr_record_begin{};
         w3vr::pipeline_flight::GpuToken flight_xr_gpu{};
@@ -52577,6 +53429,7 @@ void render_openxr_test_frame(
             } else {
                 acquired = true;
             }
+            note_submit_stage(2);
         }
 
         if (submitted || (managed_frame && acquired)) {
@@ -52590,24 +53443,39 @@ void render_openxr_test_frame(
                 w3vr::pipeline_flight::Phase::XrWaitSwapchain,
                 flight_swapchain_wait_begin);
             if (XR_FAILED(result) || (managed_frame && !w3vr::xr_image::succeeded(result)))submitted=false;
+            note_submit_stage(3);
         }
+        bool submit_layout_ok=true;
+        // 0=ok 1=index/rtv/array 2=image type/next/texture 3=device ownership 4=resource shape 5=format
+        int submit_layout_reason=0;uint32_t submit_layout_format=0;
         if(managed_frame && submitted){
             bool layout_ok=image_index<swapchain.images.size() &&
                 static_cast<uint64_t>(image_index)*2+1<swapchain.rtvs.size() &&
                 swapchain.stereo_array && swapchain.width && swapchain.height;
+            if(!layout_ok)submit_layout_reason=1;
             if(layout_ok){
                 const auto& image=swapchain.images[image_index];
-                layout_ok=image.type==XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR && !image.next && image.texture &&
-                    modern_graphics_registry()->owns_child(image_binding,image.texture);
+                layout_ok=image.type==XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR && !image.next && image.texture;
+                if(!layout_ok)submit_layout_reason=2;
+                else if(!(layout_ok=modern_graphics_registry()->owns_child(image_binding,image.texture)))submit_layout_reason=3;
                 if(layout_ok){
                     const auto desc=image.texture->GetDesc();
+                    submit_layout_format=static_cast<uint32_t>(desc.Format);
                     layout_ok=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.MipLevels==1 &&
                         desc.DepthOrArraySize==2 && desc.SampleDesc.Count==1 && desc.Width==swapchain.width &&
-                        desc.Height==swapchain.height && desc.Format==swapchain.format;
+                        desc.Height==swapchain.height;
+                    if(!layout_ok)submit_layout_reason=4;
+                    // OpenXR runtimes may allocate a TYPELESS resource for a
+                    // requested typed format; every RTV here names the exact
+                    // selected format explicitly, so the family is enough.
+                    else if(!(layout_ok=xr_swapchain_format_compatible(desc.Format,
+                        static_cast<DXGI_FORMAT>(swapchain.format))))submit_layout_reason=5;
                 }
             }
+            submit_layout_ok=layout_ok;
             submitted=layout_ok && modern_xr_frame_current(modern_target.xr,managed_payload.ticket.generation) &&
                 image_protocol->writable(image_ticket,image_index,layout_ok);
+            note_submit_stage(layout_ok?5:4);
         }
 
         // Open the XR command list only after the complete AFW transaction.
@@ -52617,17 +53485,40 @@ void render_openxr_test_frame(
             auto* xr_command_allocator =
                 g_xr_command_allocators[g_xr_command_allocator_index];
             HRESULT xr_reset_result=E_FAIL;
+            bool stage6_wait_ok=false;HRESULT stage6_alloc_hr=E_FAIL;
             if (xr_command_allocator == nullptr ||
-                !wait_for_xr_command_allocator(g_xr_command_allocator_index,managed_frame) ||
-                FAILED(xr_command_allocator->Reset()) ||
+                !(stage6_wait_ok=wait_for_xr_command_allocator(g_xr_command_allocator_index,managed_frame)) ||
+                FAILED(stage6_alloc_hr=xr_command_allocator->Reset()) ||
                 FAILED(xr_reset_result=g_xr_command_list->Reset(
                     xr_command_allocator, nullptr))) {
                 submitted = false;
+                note_submit_stage(6);
+                if(g_remastered_experimental_active.load(std::memory_order_acquire)){
+                    static std::atomic<uint32_t> stage6_logs{};
+                    const auto n=stage6_logs.fetch_add(1,std::memory_order_relaxed);
+                    if(n<16 || n%600==0){
+                        const auto index=g_xr_command_allocator_index;
+                        const HRESULT removed=g_d3d12_device?g_d3d12_device->GetDeviceRemovedReason():E_POINTER;
+                        const HRESULT session_removed=(image_session && image_session->graphics && image_session->graphics->device)?
+                            image_session->graphics->device->GetDeviceRemovedReason():E_POINTER;
+                        log_line("Remastered XR stage6 detail sample=%u present=%llu index=%zu allocator=%p wait_ok=%d "
+                            "alloc_hr=0x%08X list_hr=0x%08X fence_value=%llu ledger=%d known=%d blocked=%d "
+                            "device_removed=0x%08X session_device_removed=0x%08X",
+                            n,static_cast<unsigned long long>(current_present),static_cast<size_t>(index),
+                            xr_command_allocator,stage6_wait_ok?1:0,static_cast<unsigned>(stage6_alloc_hr),
+                            static_cast<unsigned>(xr_reset_result),
+                            static_cast<unsigned long long>(g_xr_command_allocator_fences[index]),
+                            allocator_submissions?1:0,allocator_submissions&&allocator_submissions->known_slot(index)?1:0,
+                            allocator_submissions&&allocator_submissions->blocked()?1:0,
+                            static_cast<unsigned>(removed),static_cast<unsigned>(session_removed));
+                    }
+                }
             } else {
                 discard_modern_noaa_xr_recordings(g_xr_command_list);
                 command_list_recording = true;
                 if(managed_frame && (!allocator_submissions ||
                     !allocator_submissions->observe_reset(g_xr_command_list,xr_reset_result)))submitted=false;
+                note_submit_stage(7);
                 if(modern_sources){
                     std::scoped_lock lock{g_streamline_capture_mutex};
                     modern_sources->recording=g_xr_command_list;
@@ -52641,6 +53532,20 @@ void render_openxr_test_frame(
             }
         }
 
+        if(submit_fail_stage!=0 && g_remastered_experimental_active.load(std::memory_order_acquire)){
+            // 1=image protocol begin 2=acquire 3=wait 4=layout 5=frame/writable 6=allocator 7=allocator ledger
+            static std::atomic<uint32_t> stage_logs{};
+            const auto n=stage_logs.fetch_add(1,std::memory_order_relaxed);
+            if(n<24 || n%600==0)
+                log_line("Remastered XR submit cancelled sample=%u present=%llu stage=%d xr_result=%s (%d) managed=%d "
+                    "acquired=%d image=%u images=%zu rtvs=%zu stereo_array=%d size=%ux%u layout=%d "
+                    "layout_reason=%d resource_format=%u requested_format=%u",
+                    n,static_cast<unsigned long long>(current_present),submit_fail_stage,
+                    xr_result_name(submit_fail_result),submit_fail_result,managed_frame?1:0,acquired?1:0,image_index,
+                    swapchain.images.size(),swapchain.rtvs.size(),swapchain.stereo_array?1:0,
+                    swapchain.width,swapchain.height,submit_layout_ok?1:0,
+                    submit_layout_reason,submit_layout_format,static_cast<uint32_t>(swapchain.format));
+        }
         if(managed_frame && submitted){
             auto* resource=swapchain.images[image_index].texture;
             image_resource_identity=w3vr::modern_graphics_binding::identity(resource);
@@ -53927,15 +54832,10 @@ void render_openxr_test_frame(
                     if (source_format == target_format) {
                         return true;
                     }
-                    const bool source_rgba8 =
-                        source_format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                        source_format ==
-                            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-                    const bool target_rgba8 =
-                        target_format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                        target_format ==
-                            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-                    return source_rgba8 && target_rgba8;
+                    // Same copy family, including the TYPELESS resource an
+                    // OpenXR runtime (VDXR) allocates for a typed request.
+                    return dxgi_copy_family(source_format) ==
+                        dxgi_copy_family(target_format);
                 };
 
                 // [TRIAL:NATIVE-ASYMMETRIC-NOAA V1046 4/5] Preflight the
@@ -54485,6 +55385,27 @@ void render_openxr_test_frame(
                         w3vr::mode3_transport::FinalTransport::IdentityShader;
                     mode3_unified_black_frame = decision.transport ==
                         w3vr::mode3_transport::FinalTransport::Unavailable;
+                    if (mode3_unified_black_frame &&
+                        g_remastered_experimental_active.load(std::memory_order_acquire)) {
+                        static std::atomic<uint32_t> black_logs{};
+                        const auto n = black_logs.fetch_add(1, std::memory_order_relaxed);
+                        if (n < 16 || n % 600 == 0) {
+                            const auto d0 = fit_projection_sources[0] ? fit_projection_sources[0]->GetDesc() : D3D12_RESOURCE_DESC{};
+                            const auto d1 = fit_projection_sources[1] ? fit_projection_sources[1]->GetDesc() : D3D12_RESOURCE_DESC{};
+                            log_line("Remastered final transport black sample=%u present=%llu projection_ready=%d target_needed=%d "
+                                "target=%llux%u fmt=%u src0=%d %llux%u fmt=%u flags=0x%X src1=%d %llux%u fmt=%u pair_ready=%d "
+                                "copy_ok=%d shader_ok=%d copy=%ux%u swapchain=%ux%u",
+                                n, static_cast<unsigned long long>(current_present), mode3_source_projection_ready ? 1 : 0,
+                                target_desc_needed ? 1 : 0, static_cast<unsigned long long>(target_desc.Width),
+                                target_desc.Height, static_cast<unsigned>(target_desc.Format),
+                                fit_projection_sources[0] ? 1 : 0, static_cast<unsigned long long>(d0.Width), d0.Height,
+                                static_cast<unsigned>(d0.Format), static_cast<unsigned>(d0.Flags),
+                                fit_projection_sources[1] ? 1 : 0, static_cast<unsigned long long>(d1.Width), d1.Height,
+                                static_cast<unsigned>(d1.Format), full_source_pair_ready ? 1 : 0,
+                                full_source_copy_compatible ? 1 : 0, identity_shader_ready ? 1 : 0,
+                                copy_width, copy_height, swapchain.width, swapchain.height);
+                        }
+                    }
                     projection_image_rect.offset = {
                         0, 0};
                     projection_image_rect.extent = {
@@ -54765,7 +55686,41 @@ void render_openxr_test_frame(
                     // copy the complete post-temporal source without filtering.
                     // The per-eye OpenXR imageRect selects the useful tangent
                     // crop from this shared 1:1 placement below.
-                    if (projection_direct_copy &&
+                    // A copy between format families (e.g. a 10-bit HDR
+                    // backbuffer into an 8-bit OpenXR image) is invalid and
+                    // makes Close fail, poisoning the XR command list for
+                    // every later frame. Skip it and report; a converting
+                    // shader route is still pending for that case.
+                    bool copy_family_ok = true;
+                    if (projection_direct_copy && fit_projection_sources[eye] != nullptr) {
+                        const auto src_format = fit_projection_sources[eye]->GetDesc().Format;
+                        const auto dst_format = texture->GetDesc().Format;
+                        copy_family_ok = dxgi_copy_family(src_format) == dxgi_copy_family(dst_format);
+                        if (!copy_family_ok) {
+                            static std::atomic<uint32_t> family_logs{};
+                            const auto n = family_logs.fetch_add(1, std::memory_order_relaxed);
+                            if (n < 8 || n % 600 == 0)
+                                log_line("OpenXR copy skipped: source format %u and XR format %u are different "
+                                    "families (HDR/10-bit backbuffer?) sample=%u present=%llu",
+                                    static_cast<unsigned>(src_format), static_cast<unsigned>(dst_format), n,
+                                    static_cast<unsigned long long>(current_present));
+                        }
+                    }
+                    if (g_remastered_experimental_active.load(std::memory_order_acquire) &&
+                        !spatial_panel_active) {
+                        static std::atomic<uint32_t> copy_logs{};
+                        const auto cn = copy_logs.fetch_add(1, std::memory_order_relaxed);
+                        if (cn < 16 || cn % 1200 == 0)
+                            log_line("Remastered XR eye copy sample=%u eye=%u present=%llu direct=%d family_ok=%d black=%d "
+                                "identity=%d src=%p box=%d,%d %dx%d dst=%p dst_xy=%d,%d image=%u",
+                                cn, eye, static_cast<unsigned long long>(current_present),
+                                projection_direct_copy ? 1 : 0, copy_family_ok ? 1 : 0,
+                                projection_black_frame ? 1 : 0, projection_identity_shader ? 1 : 0,
+                                fit_projection_sources[eye], static_cast<int>(src_x), static_cast<int>(src_y),
+                                static_cast<int>(shifted_width), static_cast<int>(shifted_height), texture,
+                                static_cast<int>(dst_x), static_cast<int>(dst_y), image_index);
+                    }
+                    if (projection_direct_copy && copy_family_ok &&
                         shifted_width > 0 && shifted_height > 0) {
                         g_xr_command_list->CopyTextureRegion(
                             &dst,
@@ -55215,6 +56170,23 @@ void render_openxr_test_frame(
                         g_game_render_width, g_game_render_height,
                         swapchain.width, swapchain.height);
                 }
+                if (g_remastered_experimental_active.load(std::memory_order_acquire) &&
+                    !spatial_panel_active) {
+                    static std::atomic<uint32_t> view_logs{};
+                    const auto vn = view_logs.fetch_add(1, std::memory_order_relaxed);
+                    if (vn < 16 || vn % 1200 == 0) {
+                        const auto& v = projection_views[eye];
+                        log_line("Remastered XR projection view sample=%u eye=%u present=%llu fov=%.4f,%.4f,%.4f,%.4f "
+                            "pos=%.4f,%.4f,%.4f ori=%.4f,%.4f,%.4f,%.4f rect=%d,%d %dx%d array=%u swapchain=%p",
+                            vn, eye, static_cast<unsigned long long>(current_present),
+                            v.fov.angleLeft, v.fov.angleRight, v.fov.angleUp, v.fov.angleDown,
+                            v.pose.position.x, v.pose.position.y, v.pose.position.z,
+                            v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w,
+                            v.subImage.imageRect.offset.x, v.subImage.imageRect.offset.y,
+                            v.subImage.imageRect.extent.width, v.subImage.imageRect.extent.height,
+                            v.subImage.imageArrayIndex, v.subImage.swapchain);
+                    }
+                }
                 if (asymmetric_authority_audit_active() &&
                     mode == 3 &&
                     g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
@@ -55470,7 +56442,7 @@ void render_openxr_test_frame(
                         g_modern_noaa_source_store.before_execute(modern_sources,submit_queue,1,lists);
                 }
                 if(!execute_admitted){
-                    g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                    W3VR_BLOCK_MODERN_NOAA_CONSUMER();
                     submitted=false;
                 }else{
                     submit_queue->ExecuteCommandLists(1, lists);
@@ -55514,7 +56486,7 @@ void render_openxr_test_frame(
                             if(managed_frame)modern_sources->fence=private_receipt.fence;
                             const auto retirement_value=managed_frame?private_receipt.value:submission;
                             if(!g_modern_noaa_source_store.after_signal(modern_sources,consumer_signal,retirement_value)){
-                                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                                W3VR_BLOCK_MODERN_NOAA_CONSUMER();
                                 submitted=false;
                             }
                         }
@@ -55538,7 +56510,7 @@ void render_openxr_test_frame(
                         // Without a usable fence value the next reuse of this
                         // allocator must not assume the GPU is done with it.
                         if(managed_frame || modern_noaa_output_requested()){
-                            g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                            W3VR_BLOCK_MODERN_NOAA_CONSUMER();
                             g_xr_command_allocator_fences[g_xr_command_allocator_index]=UINT64_MAX;
                             submitted=false;
                             // Keep possibly submitted COM references quarantined.
@@ -55551,9 +56523,10 @@ void render_openxr_test_frame(
                 } // Only an admitted own recording reaches Execute/Signal.
             } else {
                 submitted = false;
-                log_taau_trace_line(
-                    "OpenXR command list close failed image=%u hr=0x%08X",
-                    image_index, static_cast<unsigned>(close_result));
+                log_line(
+                    "OpenXR command list close failed image=%u hr=0x%08X device_removed=0x%08X",
+                    image_index, static_cast<unsigned>(close_result),
+                    static_cast<unsigned>(g_d3d12_device ? g_d3d12_device->GetDeviceRemovedReason() : E_POINTER));
             }
         }
 
@@ -55590,7 +56563,7 @@ void render_openxr_test_frame(
         if(managed_frame){
             submitted=submitted && image_protocol->layer_allowed(image_ticket);
             if(image_protocol && image_protocol->pending() && !image_protocol->retryable_pending())
-                g_modern_noaa_consumer_blocked.store(true,std::memory_order_release);
+                W3VR_BLOCK_MODERN_NOAA_CONSUMER();
         }
     }
 
@@ -55762,8 +56735,19 @@ void render_openxr_test_frame(
     if(modern_noaa_scene && (!modern_sources || !modern_noaa_sources_current(modern_sources,modern_target) ||
         modern_sources->phase!=w3vr::modern_eye_pair::UsePhase::Pending ||
         !w3vr::modern_eye_pair::finite(modern_sources->fence_value)))submitted=false;
-    if(managed_frame && (!modern_xr_frame_cycle().current(managed_payload.ticket) ||
-        managed_payload.ticket.generation!=g_streamline_capture_generation.load(std::memory_order_acquire)))submitted=false;
+    if(managed_frame && submitted && (!modern_xr_frame_cycle().current(managed_payload.ticket) ||
+        managed_payload.ticket.generation!=g_streamline_capture_generation.load(std::memory_order_acquire))){
+        submitted=false;
+        if(g_remastered_experimental_active.load(std::memory_order_acquire)){
+            static std::atomic<uint32_t> late_logs{};
+            const auto n=late_logs.fetch_add(1,std::memory_order_relaxed);
+            if(n<16 || n%600==0)
+                log_line("Remastered XR late frame check cancelled sample=%u present=%llu cycle_current=%d "
+                    "ticket_generation=%u generation=%u",n,static_cast<unsigned long long>(current_present),
+                    modern_xr_frame_cycle().current(managed_payload.ticket)?1:0,managed_payload.ticket.generation,
+                    g_streamline_capture_generation.load(std::memory_order_acquire));
+        }
+    }
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
     end_info.displayTime = frame_state.predictedDisplayTime;
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -56924,9 +57908,41 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
         const bool managed_ready=modern_xr_prepared_snapshot(prepared_payload);
         const bool managed_empty=managed_ready && (!prepared_payload.renderable() ||
             prepared_payload.ticket.generation!=g_streamline_capture_generation.load(std::memory_order_acquire));
+        // [FIX:REMASTERED-XR-PREPARED-HOLD-BOUND 1/1] A Ready runtime frame is
+        // held only while its reserved pair can still arrive. If no complete
+        // pair was accepted for this same frame within a few Presents, end it
+        // through the normal xrEndFrame path (zero layers unless real sources
+        // are current by then). That retires the CPU prepared-frame binding via
+        // its existing end(); no source, fence or native resource is touched.
+        constexpr uint64_t kModernPreparedFrameHoldPresents = 3;
+        static std::atomic<uint64_t> held_xr_epoch{}, held_xr_nonce{}, held_since_present{};
+        bool modern_prepared_frame_stale{};
+        if (modern_noaa_scene && managed_ready && !managed_empty && !accepted_new_publication) {
+            const auto held=prepared_payload.ticket.identity();
+            if (held_xr_nonce.load(std::memory_order_relaxed)!=held.nonce ||
+                held_xr_epoch.load(std::memory_order_relaxed)!=held.epoch) {
+                held_xr_nonce.store(held.nonce,std::memory_order_relaxed);
+                held_xr_epoch.store(held.epoch,std::memory_order_relaxed);
+                held_since_present.store(frame,std::memory_order_relaxed);
+            } else {
+                const auto since=held_since_present.load(std::memory_order_relaxed);
+                modern_prepared_frame_stale=frame>=since && frame-since>=kModernPreparedFrameHoldPresents;
+            }
+            if (modern_prepared_frame_stale) {
+                static std::atomic<uint32_t> stale_logs{};
+                const auto n=remastered_noaa_diag_sample(stale_logs);
+                if (n!=UINT32_MAX)
+                    log_line("Remastered XR prepared frame retired without sources sample=%u present=%llu held_since=%llu "
+                        "display_time=%lld xr_nonce=%llu accepted_pair=%llu",
+                        n,static_cast<unsigned long long>(frame),
+                        static_cast<unsigned long long>(held_since_present.load(std::memory_order_relaxed)),
+                        static_cast<long long>(prepared_payload.state.predictedDisplayTime),
+                        static_cast<unsigned long long>(held.nonce),static_cast<unsigned long long>(g_packed_accepted_pair_id));
+            }
+        }
         const bool submit_openxr_frame = modern_noaa_scene
             ? (accepted_new_publication || !managed_ready || managed_empty ||
-                modern_prepared_frame_cancelled(prepared_payload) ||
+                modern_prepared_frame_cancelled(prepared_payload) || modern_prepared_frame_stale ||
                 g_modern_noaa_consumer_blocked.load(std::memory_order_acquire))
             : (cinema_detector_due || accepted_new_publication || !g_packed_present_cache_valid || projection_rescue_due);
         if (submit_openxr_frame) {

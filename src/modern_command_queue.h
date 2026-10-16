@@ -94,9 +94,11 @@ inline bool read_identity(std::uintptr_t module,std::uintptr_t renderer,
  std::span<const std::uint8_t> queue_prefix,Identity& result){
  return read_identity(&remastered_500c,module,renderer,renderer_prefix,queue,queue_prefix,result);
 }
+// auxiliary: payload+16. Zero for the no-world producer; the exact borrowed
+// scene pointer for the WORLD producer (constructor 0229FD80 stores R8 there).
 inline bool primary_command_matches(const Identity& identity,std::uintptr_t command,
  std::uintptr_t frame,std::span<const std::uint8_t> header,
- std::span<const std::uint8_t> payload){
+ std::span<const std::uint8_t> payload,std::uintptr_t auxiliary=0){
  if(!valid(identity) || command<16 || !frame || header.size()<16 || payload.size()<payload_bytes)return false;
  const auto start=command-16;
  if(start<identity.buffer || ((start-identity.buffer)&15) ||
@@ -106,7 +108,7 @@ inline bool primary_command_matches(const Identity& identity,std::uintptr_t comm
  return field<std::uint32_t>(header,0)==unpublished_marker &&
   field<std::uint32_t>(header,4)==aligned_payload_bytes &&
   field<std::uintptr_t>(payload,0)==identity.module+identity.profile->scene_command_vtable &&
-  field<std::uintptr_t>(payload,8)==frame && field<std::uintptr_t>(payload,16)==0;
+  field<std::uintptr_t>(payload,8)==frame && field<std::uintptr_t>(payload,16)==auxiliary;
 }
 #if defined(_MSC_VER)
 using AllocatePayload=void*(__fastcall*)(void*,std::uint32_t);

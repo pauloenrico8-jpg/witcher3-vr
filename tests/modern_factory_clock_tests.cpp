@@ -208,7 +208,73 @@ void producer_reset_receipt_checks(){
     }
     require(own_builder_calls==before,"early reset/binding called a constructor");
 }
+template<std::size_t N> std::uint32_t read32(const std::array<std::uint8_t,N>& bytes,std::size_t at){
+    std::uint32_t v{};std::memcpy(&v,bytes.data()+at,4);return v;
+}
+// WORLD branch: factory is entered from builder 022C0820, captured at the
+// producer frame. These fixtures are CPU only; pins come from the examined exe.
+void world_site_checks(){
+    const auto& w=current.world;
+    std::uintptr_t pc{},fragment{};CallSite site{};
+    require(factory_site(&current,module,module+current.factory_return,site) && site==CallSite::factory &&
+        factory_site(&current,module,module+w.factory_return,site) && site==CallSite::world_factory,"factory immediate callers not classified");
+    require(!factory_site(&current,module,module+w.factory_anchor,site) && !factory_site(&current,module,module+w.factory_return+1,site) &&
+        !factory_site(nullptr,module,module+w.factory_return,site) && !factory_site(&current,module,module-1,site),"foreign factory caller classified");
+    require(site_entry(&current,CallSite::world_factory,pc) && pc==w.factory_return &&
+        site_anchor(&current,CallSite::world_factory,pc,fragment) && pc==w.factory_anchor && fragment==w.fragment &&
+        site_entry(&current,CallSite::world_descriptor_constructor,pc) && pc==w.descriptor_anchor &&
+        site_entry(&current,CallSite::factory,pc) && pc==current.factory_return &&
+        site_entry(&current,CallSite::descriptor_constructor,pc) && pc==descriptor_constructor_return &&
+        !site_anchor(&current,static_cast<CallSite>(99),pc,fragment),"site entry/anchor table wrong");
+    require(world_site(CallSite::world_factory) && world_site(CallSite::world_descriptor_constructor) &&
+        !world_site(CallSite::factory) && !world_site(CallSite::descriptor_constructor),"world site classification wrong");
+    // Static consistency of the examined code/xdata pins with the anchors.
+    require(w.pins[5].rva+world_builder_call_pin.size()==w.factory_anchor &&
+        w.factory_anchor+read32(world_builder_call_pin,world_builder_call_pin.size()-4)==w.builder_unwind[1].begin,
+        "builder call pin does not return to the producer anchor or target the builder");
+    require(w.pins[6].rva+31==w.factory_return && world_factory_call_pin[28]==0x41 && world_factory_call_pin[29]==0xFF &&
+        world_factory_call_pin[30]==0xD1,"factory call pin does not end at the immediate return");
+    require(w.pins[3].rva+world_descriptor_pin.size()==w.descriptor_anchor,"descriptor vt[0x170] pin not at its anchor");
+    require(w.anchor_unwind[0].begin==w.fragment && w.anchor_unwind[0].data==w.pins[0].rva &&
+        read32(world_fragment_unwind_pin,8)==w.anchor_unwind[1].begin && read32(world_fragment_unwind_pin,12)==w.anchor_unwind[1].end &&
+        read32(world_fragment_unwind_pin,16)==w.anchor_unwind[1].data,"world fragment xdata does not chain to the producer");
+    for(std::size_t i=1;i<w.anchor_unwind.size();++i){
+        const auto& a=w.anchor_unwind[i];const auto& b=current.unwind[i];
+        require(a.begin==b.begin && a.end==b.end && a.data==b.data && a.slots==b.slots && a.flags==b.flags,"world chain diverged from the no-world producer chain");
+    }
+    require(w.builder_unwind[0].begin<=w.factory_return && w.factory_return<w.builder_unwind[0].end &&
+        read32(world_builder_fragment_unwind_pin,4)==w.builder_unwind[1].begin && read32(world_builder_fragment_unwind_pin,12)==w.builder_unwind[1].data,
+        "immediate return outside the builder fragment or chain broken");
+    require(w.fragment<=w.factory_anchor && w.factory_anchor<w.anchor_unwind[0].end &&
+        w.fragment<=w.descriptor_anchor && w.descriptor_anchor<w.anchor_unwind[0].end,"world anchors outside the producer fragment");
+    // Caller semantics: same RBP-0x80 descriptor and CGame RDI as no-world.
+    auto world=correct();world.pc=module+w.factory_anchor;world.fragment=module+w.fragment;
+    auto ctor=world;ctor.pc=module+w.descriptor_anchor;
+    require(caller_matches(&current,world,desc,77,CallSite::world_factory) && !caller_matches(&current,world,desc,77) &&
+        !caller_matches(&current,correct(),desc,77,CallSite::world_factory) &&
+        caller_matches(&current,ctor,desc,77,CallSite::world_descriptor_constructor) &&
+        !caller_matches(&current,ctor,desc,77,CallSite::world_factory) &&
+        !caller_matches(&current,world,desc,77,CallSite::world_descriptor_constructor),"world call sites mixed with each other or no-world");
+    for(unsigned kind=0;kind<8;++kind){
+        auto bad=world;auto d=desc;auto tid=77u;
+        if(kind==0)bad.pc=module+w.factory_return;if(kind==1)bad.fragment=module+current.fragment;if(kind==2)d+=8;
+        if(kind==3)bad.rdi=0;if(kind==4)bad.rbp=0x7F;if(kind==5)tid=78;if(kind==6)bad.sp=high;if(kind==7)bad.rdi++;
+        require(!caller_matches(&current,bad,d,tid,CallSite::world_factory),"bad world caller admitted");
+    }
+    BorrowedScope scope;require(scope.begin(contract,&current,world,desc,values(),true,77,CallSite::world_factory) &&
+        scope.site()==CallSite::world_factory && scope.borrowed_descriptor()==desc,"world factory scope rejected or lost its site");
+    Sample s{};require(scope.sample(77,s) && scope.revalidate(contract,values(),true,77),"world scope sample/revalidate failed");
+    BorrowedScope wrong;require(!wrong.begin(contract,&current,world,desc,values(),true,77),"world caller admitted as no-world factory");
+    BorrowedScope ctor_scope;require(ctor_scope.begin(contract,&current,ctor,desc,values(),true,77,CallSite::world_descriptor_constructor) &&
+        ctor_scope.site()==CallSite::world_descriptor_constructor,"world constructor scope rejected");
+    auto copied=current;BorrowedScope copied_scope;
+    require(!copied_scope.begin(contract,&copied,world,desc,values(),true,77,CallSite::world_factory),"copied profile admitted world site");
+    require(!clock_route::windows::world_matches(&current,reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))) &&
+        !clock_route::windows::site_matches(&current,reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)),CallSite::world_factory),
+        "own module got world Game proof");
+}
 int main(){
+    world_site_checks();
     source_receipt_checks();
     producer_source_receipt_checks();
     reset_receipt_checks();

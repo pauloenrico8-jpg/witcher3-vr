@@ -50,6 +50,10 @@ struct NativeCommandRoute {
     void* unavailable_command{};
     bool renderer_ready{};
     const Profile* profile{};
+    // Third constructor argument. Null for the no-world producer; the WORLD
+    // producer's exact borrowed scene [[[game+F0]+8]+5440], which the native
+    // constructor add-refs and the native command destructor releases.
+    void* auxiliary{};
 };
 
 enum class Result { dispatched, invalid_frame, unavailable, allocation_failed, publication_unconfirmed };
@@ -77,7 +81,7 @@ inline Result submit_owned_frame(const NativeCommandRoute& route, void* frame,
         release(frame);
         return Result::allocation_failed;
     }
-    (void)route.construct(command, frame, nullptr);
+    (void)route.construct(command, frame, route.auxiliary);
     const bool confirmed=route.dispatch(command,frame);
     // Native construction retained a separate reference. Uncertain command
     // storage is never freed/retried here; release only our factory reference.

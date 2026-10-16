@@ -4,6 +4,30 @@
 #include <cstring>
 
 namespace w3vr::factory_clock::windows {
+// Caller guards both helpers with SEH; they read loaded image bytes only.
+template<std::size_t N> inline bool pins_match(const Profile* profile,std::uintptr_t module,const std::array<CodePin,N>& pins) noexcept {
+    for(const auto& pin:pins){
+        if(pin.rva>=profile->image_bytes || pin.bytes.size()>profile->image_bytes-pin.rva ||
+            std::memcmp(reinterpret_cast<const void*>(module+pin.rva),pin.bytes.data(),pin.bytes.size()))return false;
+    }
+    return true;
+}
+template<std::size_t N> inline bool chain_matches(std::uintptr_t module,const std::array<UnwindNode,N>& unwind) noexcept {
+    for(std::size_t i=0;i<unwind.size();++i){
+        const auto& node=unwind[i];DWORD64 base{};
+        auto* entry=RtlLookupFunctionEntry(module+node.begin,&base,nullptr);
+        if(!entry || base!=module || entry->BeginAddress!=node.begin || entry->EndAddress!=node.end ||
+            entry->UnwindData!=node.data)return false;
+        const auto* info=reinterpret_cast<const std::uint8_t*>(module+node.data);
+        if(info[0]!=(1u | (node.flags<<3)) || info[2]!=node.slots || info[3]!=0)return false;
+        if(i+1<unwind.size()){
+            RUNTIME_FUNCTION next{};std::memcpy(&next,info+4+((node.slots+1)&~1u)*2,sizeof(next));
+            const auto& expected=unwind[i+1];
+            if(next.BeginAddress!=expected.begin || next.EndAddress!=expected.end || next.UnwindData!=expected.data)return false;
+        }
+    }
+    return true;
+}
 // Exact loaded code/PE identity and five runtime entries. No language handlers
 // are called, and no unregistered frame or private object layout is guessed.
 inline bool module_matches(const Profile* profile,std::uintptr_t module) noexcept {
@@ -16,25 +40,20 @@ inline bool module_matches(const Profile* profile,std::uintptr_t module) noexcep
         if(nt->Signature!=IMAGE_NT_SIGNATURE || nt->FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64 ||
             nt->OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC || nt->FileHeader.TimeDateStamp!=profile->timestamp ||
             nt->OptionalHeader.SizeOfImage!=profile->image_bytes)return false;
-        for(const auto& pin:profile->pins){
-            if(pin.rva>=profile->image_bytes || pin.bytes.size()>profile->image_bytes-pin.rva ||
-                std::memcmp(reinterpret_cast<const void*>(module+pin.rva),pin.bytes.data(),pin.bytes.size()))return false;
-        }
-        for(std::size_t i=0;i<profile->unwind.size();++i){
-            const auto& node=profile->unwind[i];DWORD64 base{};
-            auto* entry=RtlLookupFunctionEntry(module+node.begin,&base,nullptr);
-            if(!entry || base!=module || entry->BeginAddress!=node.begin || entry->EndAddress!=node.end ||
-                entry->UnwindData!=node.data)return false;
-            const auto* info=reinterpret_cast<const std::uint8_t*>(module+node.data);
-            if(info[0]!=(1u | (node.flags<<3)) || info[2]!=node.slots || info[3]!=0)return false;
-            if(i+1<profile->unwind.size()){
-                RUNTIME_FUNCTION next{};std::memcpy(&next,info+4+((node.slots+1)&~1u)*2,sizeof(next));
-                const auto& expected=profile->unwind[i+1];
-                if(next.BeginAddress!=expected.begin || next.EndAddress!=expected.end || next.UnwindData!=expected.data)return false;
-            }
-        }
-        return true;
+        return pins_match(profile,module,profile->pins) && chain_matches(module,profile->unwind);
     }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+// World branch only: builder/vtable call code and both registered unwind
+// chains crossed by the producer-frame capture. Never widens the no-world site.
+inline bool world_matches(const Profile* profile,std::uintptr_t module) noexcept {
+    if(!module_matches(profile,module))return false;
+    __try {
+        return pins_match(profile,module,profile->world.pins) && chain_matches(module,profile->world.anchor_unwind) &&
+            chain_matches(module,profile->world.builder_unwind);
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+inline bool site_matches(const Profile* profile,std::uintptr_t module,CallSite site) noexcept {
+    return world_site(site) ? world_matches(profile,module) : module_matches(profile,module);
 }
 // No descriptor exists during the earlier world-camera update. These are only
 // owner/interface/clock observations; no descriptor binding or lifetime claim.
@@ -122,28 +141,37 @@ inline bool read_values(const Profile* profile,std::uintptr_t module,std::uintpt
         repeat.camera!=candidate.camera)return false;
     out=candidate;return true;
 }
+// Diagnostic only: first failed observation step, for bounded host logging.
+enum class ObserveStage {admitted,entry,code,capture,caller,values,scope};
 inline bool observe(const engine_camera::TemporalContract* contract,std::uintptr_t module,
     std::uintptr_t return_pc,std::uintptr_t descriptor,BorrowedScope& scope,
-    CallSite site=CallSite::factory) noexcept {
-    const auto* profile=selected(contract);std::uintptr_t expected_pc{},fragment{};
-    if((site!=CallSite::factory && site!=CallSite::descriptor_constructor) || !profile ||
-        !offset(module,site==CallSite::factory ? profile->factory_return : descriptor_constructor_return,expected_pc) || return_pc!=expected_pc ||
-        !offset(module,profile->fragment,fragment) || !module_matches(profile,module)){scope.revoke();return false;}
+    CallSite site=CallSite::factory,ObserveStage* stage=nullptr) noexcept {
+    auto fail=[&](ObserveStage reached){if(stage)*stage=reached;scope.revoke();return false;};
+    const auto* profile=selected(contract);
+    std::uintptr_t entry_rva{},anchor_rva{},fragment_rva{},expected_pc{},anchor{},fragment{};
+    if(!profile || !site_entry(profile,site,entry_rva) || !site_anchor(profile,site,anchor_rva,fragment_rva) ||
+        !offset(module,entry_rva,expected_pc) || return_pc!=expected_pc || !offset(module,anchor_rva,anchor) ||
+        !offset(module,fragment_rva,fragment))return fail(ObserveStage::entry);
+    if(!site_matches(profile,module,site))return fail(ObserveStage::code);
+    // World: the hook's return is inside builder 022C0820; capture unwinds its
+    // registered frame up to the PRODUCER return, restoring producer RDI/RBP.
     native_caller_context::Snapshot snapshot{};
-    if(!native_caller_context::capture({return_pc,module,fragment,24},snapshot)){scope.revoke();return false;}
+    if(!native_caller_context::capture({anchor,module,fragment,24},snapshot))return fail(ObserveStage::capture);
     const auto thread=GetCurrentThreadId();
     const Caller caller{snapshot.pc,snapshot.image_base,snapshot.unwind_entry,snapshot.sp,
         snapshot.rbp,snapshot.rdi,snapshot.stack_low,snapshot.stack_high,thread};
     // Reject a different stack argument BEFORE dereferencing a clock owner.
-    if(!caller_matches(profile,caller,descriptor,thread,site)){scope.revoke();return false;}
+    if(!caller_matches(profile,caller,descriptor,thread,site))return fail(ObserveStage::caller);
     Values values{};
-    if(!read_values(profile,module,caller.rdi,descriptor,values)){scope.revoke();return false;}
-    return scope.begin(contract,profile,caller,descriptor,values,module_matches(profile,module),thread,site);
+    if(!read_values(profile,module,caller.rdi,descriptor,values))return fail(ObserveStage::values);
+    const bool begun=scope.begin(contract,profile,caller,descriptor,values,site_matches(profile,module,site),thread,site);
+    if(stage)*stage=begun ? ObserveStage::admitted : ObserveStage::scope;
+    return begun;
 }
 inline bool revalidate(const engine_camera::TemporalContract* contract,BorrowedScope& scope) noexcept {
     const auto* profile=scope.profile();const auto& caller=scope.borrowed_caller();Values values{};
     if(!profile || selected(contract)!=profile || GetCurrentThreadId()!=caller.thread ||
-        !module_matches(profile,caller.module) || !read_values(profile,caller.module,caller.rdi,scope.borrowed_descriptor(),values)){
+        !site_matches(profile,caller.module,scope.site()) || !read_values(profile,caller.module,caller.rdi,scope.borrowed_descriptor(),values)){
         scope.revoke();return false;
     }
     return scope.revalidate(contract,values,true,GetCurrentThreadId());

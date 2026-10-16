@@ -1,6 +1,7 @@
 #pragma once
 #include "engine_render_core.h"
 #include <cstdint>
+#include <span>
 
 namespace w3vr::modern_eye_capture {
 // Synchronous native core/task metadata. Not retained engine/COM ownership or
@@ -30,6 +31,23 @@ inline bool finished_backbuffer(const Transition& transition) {
     return transition.flags == 0 && transition.after == 0 &&
         (transition.before == 0x4 || transition.before == 0x400) &&
         (transition.subresource == 0 || transition.subresource == UINT32_MAX);
+}
+// One tagged eye scope may write the backbuffer more than once before PRESENT
+// (e.g. COPY_DEST(0x400)->PRESENT for a copied scene, then RENDER_TARGET(0x4)
+// ->PRESENT after an overlay pass). Each finished transition records its own
+// copy; actual Execute (GPU) order publishes the latest one. The finished eye
+// is therefore the LAST copy of that eye/pair: never promote an earlier copy
+// while a later copy of the same pair is recorded but not yet submitted.
+struct RecordedCopy {
+    std::uint64_t serial{}, pair{};
+    bool pending{};
+};
+inline bool later_copy_pending(std::uint64_t published_serial, std::uint64_t pair,
+    std::span<const RecordedCopy> copies) {
+    if (pair == 0 || pair == UINT64_MAX) return false;
+    for (const auto& copy : copies)
+        if (copy.pending && copy.pair == pair && copy.serial > published_serial) return true;
+    return false;
 }
 struct Request {
     std::uintptr_t command{}, source{};

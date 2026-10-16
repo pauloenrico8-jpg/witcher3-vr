@@ -122,6 +122,8 @@ public:
         record_=copied;valid_=true;reset_=true;bound_=c.site==SourceSite::descriptor_getter;return true;
     }
     bool reset_observed() const noexcept {return valid_ && reset_;}
+    // One observation per producer. A later site must not revoke an earlier one.
+    bool attempted() const noexcept {return attempted_;}
     bool matches(const engine_camera::TemporalContract* contract,std::uintptr_t descriptor,
         std::uintptr_t owner,std::uint32_t thread,const factory_clock::Sample& clock,
         std::span<const std::uint8_t> native_previous,bool still_current) noexcept {
